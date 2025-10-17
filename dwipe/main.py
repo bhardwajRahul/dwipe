@@ -22,7 +22,7 @@ import shutil
 import traceback
 import curses as cs
 from types import SimpleNamespace
-from dwipe.PowerWindow import Window, OptionSpinner
+from console_window import ConsoleWindow, OptionSpinner
 
 def human(number):
     """ Return a concise number description."""
@@ -766,7 +766,7 @@ class DiskWipe:
         other_keys.add(10) # another form of ENTER
         other_keys.add(27) # ESCAPE
 
-        self.win = Window(head_line=True, body_rows=200, head_rows=4,
+        self.win = ConsoleWindow(head_line=True, body_rows=200, head_rows=4,
                           keys=spin.keys ^ other_keys, mod_pick=self.mod_pick)
         self.opts.name = "[hit 'n' to enter name]"
         check_devices_mono = time.monotonic()

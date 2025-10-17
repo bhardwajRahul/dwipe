@@ -4,7 +4,7 @@ build-backend = "flit_core.buildapi"
 
 [project]
 name = "dwipe"
-version = "1.0.5"
+version = "1.0.7"
 description = "A tool to wipe disks and partitions for Linux"
 authors = [
     { name = "Joe Defen", email = "joedef@google.com" }
@@ -19,7 +19,7 @@ classifiers = [
     "Operating System :: POSIX :: Linux"
 ]
 dependencies = [
-    'importlib-metadata; python_version<"3.8"',
+    'console-window >= 1.0.0',
 ]
 
 [project.urls]
