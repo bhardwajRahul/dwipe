@@ -30,7 +30,7 @@
 * **Configurable confirmation modes** - Choose your safety level: single keypress (Y/y), typed confirmation (YES/yes), or device name (cycle with **c** key)
 * **Enhanced wipe history** - Detailed log viewer (**h** key) shows wipe history with UUIDs, filesystems, labels, and percentages for stopped wipes
 * **Active wipe highlighting** - In-progress wipes displayed in bright cyan/blue with elapsed time, remaining time, and transfer speed (0-100% write, 101-200% verify)
-* **Persistent user preferences** - Theme, wipe mode (random/zeros), confirmation mode, verification %, and locked devices persist across sessions (saved to `~/.config/dwipe/state.json`)
+* **Persistent user preferences** - Theme, wipe mode (Rand/Zero/Rand+V/Zero+V), confirmation mode, verification %, and locked devices persist across sessions (saved to `~/.config/dwipe/state.json`)
 * **Individual partition locking** - Lock individual partitions to prevent accidental wiping (previously only whole disks could be locked)
 * **Full terminal color themes** - Complete themed color schemes with backgrounds, not just highlights (cycle with **t** key)
 * **Visual feedback improvements** - Mounted and locked devices appear dimmed; active wipes are bright and prominent
@@ -86,7 +86,7 @@ pipx uninstall dwipe  # or: pip uninstall dwipe
 * **Safety protections** - Prevents wiping mounted devices, detects overlapping wipes, supports manual disk locking
 * **Hot-swap detection** - Updates the device list when storage changes; newly added devices are marked with **^** to make them easy to spot
 * **Multiple simultaneous wipes** - Start wipes on multiple devices at once, with individual progress tracking and completion states
-* **Flexible wipe modes** - Choose between filling with random data or zeroing devices (Random mode writes random data then zeros the first 16KB)
+* **Flexible wipe modes** - Choose between Rand, Zero, Rand+V (with auto-verify), or Zero+V (with auto-verify). Random modes write random data then zeros the first 16KB
 * **Persistent state tracking** - Wipe status survives reboots; partially wiped (**s**) and completed (**W**) states are stored on the device
 * **Device filtering** - Filter devices by name/pattern using regex in case of too many for one screen
 * **Stop capability** - Stop individual wipes or all wipes in progress
@@ -193,7 +193,7 @@ The top line shows available actions. Some are context-sensitive (only available
 | **h** | history | Show wipe history log |
 | **/** | filter | Filter devices by regex pattern (shows matching devices + all active wipes) |
 | **ESC** | clear filter | Clear the filter and jump to top of list |
-| **m** | mode | Toggle between Rand and Zero wipe modes (saved as preference) |
+| **m** | mode | Cycle wipe mode: Rand, Zero, Rand+V, Zero+V (saved as preference) |
 | **P** | passes | Cycle wipe passes: 1, 2, or 4 (saved as preference) |
 | **V** | verify % | Cycle verification percentage: 0%, 2%, 5%, 10%, 25%, 50%, 100% (saved as preference) |
 | **c** | confirmation | Cycle confirmation mode: Y, y, YES, yes, device name (saved as preference) |
@@ -202,10 +202,14 @@ The top line shows available actions. Some are context-sensitive (only available
 
 ### Wipe Modes
 
-`dwipe` supports two wipe modes (toggle with **m** key):
+`dwipe` supports four wipe modes (cycle with **m** key):
 
 - **Rand** - Fills the device with random data, then zeros the first 16KB (which contains the wipe metadata)
 - **Zero** - Fills the device with zeros (may be faster on some devices due to optimization)
+- **Rand+V** - Same as Rand, but automatically verifies after wipe completes (if verify % > 0)
+- **Zero+V** - Same as Zero, but automatically verifies after wipe completes (if verify % > 0)
+
+The `+V` suffix indicates automatic verification after wipe completion. Without `+V`, you can still manually verify by pressing **v** on a wiped device.
 
 ### Verification Strategy
 
@@ -225,8 +229,8 @@ The top line shows available actions. Some are context-sensitive (only available
   - Checks for evidence of randomness to distinguish from structured data
 
 **Verification Modes:**
-1. **Automatic verification** (after wipe): Set verify % > 0, verification runs after wipe completes
-2. **Manual verification** (press **v**): Verify previously wiped devices or detect pattern on unmarked disks
+1. **Automatic verification** (after wipe): Use a mode with `+V` suffix (Rand+V or Zero+V) and set verify % > 0
+2. **Manual verification** (press **v**): Verify previously wiped devices or detect pattern on unmarked disks (requires verify % > 0)
 3. **Unmarked disk detection**: Can verify disks with no filesystem to detect if all zeros or random
    - If passes, writes marker as if disk had been wiped
    - Useful for detecting pre-wiped drives or verifying manufacturer erasure
@@ -275,9 +279,21 @@ You can navigate the device list using:
 - **Vi-like keys** - j (down), k (up), g (top), G (bottom)
 - **Page Up/Down** - Quick navigation through long lists
 
-## Filter Examples
+## Device Filtering
 
-The **/** filter supports regex patterns. Here are some useful examples:
+The **/** key activates incremental search filtering with vim-style behavior:
+
+**How it works:**
+- Press **/** to start filtering
+- Type your regex pattern - the device list updates **as you type** (real-time filtering)
+- Your cursor position is shown with **|** in the header
+- **Arrow keys**, **Home**/**End**, and **Backspace** work for editing
+- **ENTER** to accept the filter
+- **ESC** to cancel and restore the previous filter
+
+**Filter Examples:**
+
+The filter supports regex patterns. Here are some useful examples:
 
 ```
 /sda           # Show only sda and its partitions
@@ -287,7 +303,9 @@ The **/** filter supports regex patterns. Here are some useful examples:
 /usb           # Show devices with "usb" in their labels
 ```
 
-Press **ESC** to clear the filter and return to showing all devices.
+Press **ESC** from the main screen to clear the filter and return to showing all devices.
+
+**Note:** Invalid regex patterns are ignored - the filter stays at the last valid pattern while you type.
 
 ## Security Considerations
 
