@@ -32,7 +32,7 @@ def main():
             # Re-run the script with sudo needed and opted
             Utils.rerun_module_as_root('dwipe.main')
 
-        dwipe = DiskWipe(opts=opts)
+        dwipe = DiskWipe()  # opts=opts)
         dwipe.dev_info = info = DeviceInfo(opts=opts)
         dwipe.partitions = info.assemble_partitions()
         if dwipe.DB:
