@@ -21,7 +21,7 @@
 
 * **Advanced statistical verification** - Automatic or on-demand verification with intelligent pattern detection:
   - Fast-fail for zeros (fails on first non-zero byte)
-  - Chi-squared test for random data at 99% confidence level
+  - Statistical analysis for random data to check for evidence of randomness
   - Smart sampling: divides disk into 100 sections, randomly samples each section for complete coverage
   - Unmarked disk detection: can verify disks without filesystems and auto-detect if zeros/random
 * **Configurable verification percentage** - Choose thoroughness: 0% (skip), 2%, 5%, 10%, 25%, 50%, or 100% (cycle with **V** key, persistent preference)
@@ -219,11 +219,10 @@ The top line shows available actions. Some are context-sensitive (only available
 
 **Pattern Detection:**
 - **Zero verification**: Fails immediately on first non-zero byte (fast!)
-- **Random verification**: Uses chi-squared statistical test at 99% confidence level
-  - Tests if byte distribution is truly uniform (all byte values 0-255 appear equally)
-  - Fast-fails every 1MB if non-random pattern detected
-  - Critical value: χ² > 310 = not random (rejects null hypothesis)
-  - Critical value: χ² < 310 = random (accepts null hypothesis)
+- **Random verification**: Statistical analysis of byte distribution
+  - Tests if byte distribution is uniform (all byte values 0-255 appear fairly equally)
+  - Fast-fails periodically if non-random pattern detected
+  - Checks for evidence of randomness to distinguish from structured data
 
 **Verification Modes:**
 1. **Automatic verification** (after wipe): Set verify % > 0, verification runs after wipe completes
@@ -383,8 +382,8 @@ MIT License - see [LICENSE](LICENSE) file for details.
 3. Statistical verification - Smarter than full sequential reads:
 * 2% verification samples the ENTIRE disk (100 sections)
 * Finds problems faster than sequential (could hit bad sector early)
-* Fast-fail optimizations: zeros fail on first non-zero byte, random fails every 1MB if pattern detected
-* Chi-squared test at 99% confidence actually validates true randomness
+* Fast-fail optimizations: zeros fail on first non-zero byte, random checks for evidence of randomness
+* Statistical analysis validates byte distribution uniformity
 * Can detect pattern on unmarked disks (auto-detect zeros/random, writes marker if passes)
 * Way faster than 100% sequential
 4. Safety without sacrificing speed:
