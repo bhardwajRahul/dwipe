@@ -100,7 +100,7 @@ class DeviceInfo:
         return ''
 
     @staticmethod
-    def get_device_vendor_model(device_name):
+    def _get_device_vendor_model(device_name):
         """Gets the vendor and model for a given device from the /sys/class/block directory.
         - Args: - device_name: The device name, such as 'sda', 'sdb', etc.
         - Returns: A string containing the vendor and model information.
@@ -228,7 +228,7 @@ class DeviceInfo:
             # Only process top-level physical disks
             if entry.parent is None:
                 # Hardware Info Gathering
-                entry.model = self.get_device_vendor_model(entry.name)
+                entry.model = self._get_device_vendor_model(entry.name)
                 entry.port = self._get_port_from_sysfs(entry.name)
                 
                 # The Split (Superfloppy Case)
@@ -242,14 +242,14 @@ class DeviceInfo:
                     v_child.label = entry.label
                     v_child.mounts = entry.mounts
                     v_child.parent = name
-                    
-                    # Clean the hardware row of data-specific strings
-                    entry.fstype = entry.model if entry.model else 'DISK'
-                    entry.label = ''
-                    entry.mounts = []
 
                     final_entries[v_key] = v_child
                     entry.minors.append(v_key)
+                    
+                # Clean the hardware row of data-specific strings
+                entry.fstype = entry.model if entry.model else 'DISK'
+                entry.label = ''
+                entry.mounts = []
 
         entries = final_entries
 
