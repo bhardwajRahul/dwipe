@@ -10,6 +10,7 @@ import sys
 import re
 import time
 import shutil
+import json
 import curses as cs
 from types import SimpleNamespace
 from console_window import (ConsoleWindow, ConsoleWindowOpts, OptionSpinner,
@@ -272,6 +273,7 @@ class DiskWipe:
         """Main event loop"""
 
         # Create screen instances
+        ThemeScreen = Theme.create_picker_screen(DiskWipeScreen)
         self.screens = {
             MAIN_ST: MainScreen(self),
             HELP_ST: HelpScreen(self),
@@ -284,6 +286,7 @@ class DiskWipe:
             head_line=True,
             body_rows=200,
             head_rows=4,
+            min_cols_rows=(60,10),
             # keys=self.spin.keys ^ other_keys,
             pick_attr=cs.A_REVERSE,  # Use reverse video for pick highlighting
             ctrl_c_terminates=False,
@@ -474,6 +477,9 @@ class MainScreen(DiskWipeScreen):
                                     else:
                                         verify_detail = verify_result
 
+                                # Structured logging
+                                Utils.log_wipe_structured(partition, partition.job)
+                                # Legacy text log (keep for compatibility)
                                 Utils.log_wipe(partition.name, partition.size_bytes, 'Vrfy', result, elapsed,
                                               uuid=partition.uuid, verify_result=verify_detail)
                         app.job_cnt -= 1
@@ -521,6 +527,9 @@ class MainScreen(DiskWipeScreen):
                         pct = None
                         if partition.job.do_abort and partition.job.total_size > 0:
                             pct = int((partition.job.total_written / partition.job.total_size) * 100)
+                        # Structured logging
+                        Utils.log_wipe_structured(partition, partition.job, mode=mode)
+                        # Legacy text log (keep for compatibility)
                         # Only pass label/fstype for stopped wipes (not completed)
                         if result == 'stopped':
                             Utils.log_wipe(partition.name, partition.size_bytes, mode, result, elapsed,
@@ -553,6 +562,8 @@ class MainScreen(DiskWipeScreen):
                                 else:
                                     verify_detail = verify_result
 
+                            # Note: Structured logging for verify was already logged above as part of the wipe
+                            # This is just logging the separate verify phase stats to the legacy log
                             Utils.log_wipe(partition.name, partition.size_bytes, 'Vrfy', result, verify_elapsed,
                                           uuid=partition.uuid, verify_result=verify_detail)
 
@@ -810,81 +821,178 @@ class HelpScreen(DiskWipeScreen):
 
 
 class HistoryScreen(DiskWipeScreen):
-    """History/log screen showing wipe history"""
+    """History/log screen showing structured log entries with expand/collapse functionality"""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.expands = {}  # Maps timestamp -> True (expanded) or False (collapsed)
+        self.entries = []  # Cached log entries (all entries before filtering)
+        self.filtered_entries = []  # Entries after search filtering
+        self.window_of_logs = None  # Window of log entries (OrderedDict)
+        self.window_state = None  # Window state for incremental reads
+        self.search_matches = set()  # Set of timestamps with deep-only matches in JSON
+        self.prev_filter = ''
+
+        # Setup search bar
+        self.search_bar = IncrementalSearchBar(
+            on_change=self._on_search_change,
+            on_accept=self._on_search_accept,
+            on_cancel=self._on_search_cancel
+        )
+
+    def _on_search_change(self, text):
+        """Called when search text changes - filter entries incrementally."""
+        self._filter_entries(text)
+
+    def _on_search_accept(self, text):
+        """Called when ENTER pressed in search - keep filter active, exit input mode."""
+        self.app.win.passthrough_mode = False
+        self.prev_filter = text
+
+    def _on_search_cancel(self, original_text):
+        """Called when ESC pressed in search - restore and exit search mode."""
+        self._filter_entries(original_text)
+        self.app.win.passthrough_mode = False
+
+    def _filter_entries(self, search_text):
+        """Filter entries based on search text (shallow or deep)."""
+        if not search_text:
+            self.filtered_entries = self.entries
+            self.search_matches = set()
+            return
+
+        # Deep search mode if starts with /
+        deep_search = search_text.startswith('/')
+        pattern = search_text[1:] if deep_search else search_text
+
+        if not pattern:
+            self.filtered_entries = self.entries
+            self.search_matches = set()
+            return
+
+        # Use StructuredLogger's filter method
+        logger = Utils.get_logger()
+        from .StructuredLogger import StructuredLogger
+        self.filtered_entries, self.search_matches = StructuredLogger.filter_entries(
+            self.entries, pattern, deep=deep_search
+        )
 
     def draw_screen(self):
-        """Draw the history screen"""
+        """Draw the history screen with structured log entries"""
         app = self.app
-        # spinner = self.get_spinner()
+        win = app.win
+        win.set_pick_mode(True)
 
-        app.win.set_pick_mode(False)
-
-        # Add header
-        app.win.add_header('WIPE HISTORY (newest first)', attr=cs.A_BOLD)
-        app.win.add_header('    Press ESC to return', resume=True)
-
-        # Read and display log file in reverse order
-        log_path = Utils.get_log_path()
-        if log_path.exists():
-            try:
-                with open(log_path, 'r', encoding='utf-8') as f:
-                    lines = f.readlines()
-
-                # Show in reverse order (newest first)
-                for line in reversed(lines):
-                    app.win.put_body(line.rstrip())
-            except Exception as e:
-                app.win.put_body(f'Error reading log: {e}')
+        # Get window of log entries (chronological order - eldest to youngest)
+        logger = Utils.get_logger()
+        if self.window_of_logs is None:
+            self.window_of_logs, self.window_state = logger.get_window_of_entries(window_size=1000)
         else:
-            app.win.put_body('No wipe history found.')
-            app.win.put_body('')
-            app.win.put_body(f'Log file will be created at: {log_path}')
+            # Refresh window with any new entries
+            self.window_of_logs, self.window_state = logger.refresh_window(
+                self.window_of_logs, self.window_state, window_size=1000
+            )
 
+        # Convert to list in reverse order (newest first for display)
+        self.entries = list(reversed(list(self.window_of_logs.values())))
 
-class ThemeScreen(DiskWipeScreen):
-    """Theme preview screen showing all available themes with color examples"""
-    prev_theme = ""
+        # Clean up self.expands: remove any timestamps that are no longer in entries
+        valid_timestamps = {entry.timestamp for entry in self.entries}
+        self.expands = {ts: state for ts, state in self.expands.items() if ts in valid_timestamps}
 
-    def draw_screen(self):
-        """Draw the theme screen with color examples for all themes"""
+        # Apply search filter if active
+        if not self.search_bar.text:
+            self.filtered_entries = self.entries
+            self.search_matches = set()
+
+        # Count by level in filtered results
+        level_counts = {}
+        for e in self.filtered_entries:
+            level_counts[e.level] = level_counts.get(e.level, 0) + 1
+
+        # Build search display string
+        search_display = self.search_bar.get_display_string(prefix='', suffix='')
+
+        # Build level summary for header
+        level_summary = ' '.join(f'{lvl}:{cnt}' for lvl, cnt in sorted(level_counts.items()))
+
+        # Header
+        header_line = f'ESC:back [e]xpand [/]search {len(self.filtered_entries)}/{len(self.entries)} ({level_summary}) '
+        if search_display:
+            header_line += f'/ {search_display}'
+        else:
+            header_line += '/'
+        win.add_header(header_line)
+        win.add_header(f'Log: {logger.log_file}')
+
+        # Build display
+        for entry in self.filtered_entries:
+            timestamp = entry.timestamp
+
+            # Get display summary from entry
+            summary = entry.display_summary
+
+            # Format timestamp (just date and time)
+            timestamp_display = timestamp[:19]  # YYYY-MM-DD HH:MM:SS
+
+            level = entry.level
+
+            # Add deep match indicator if this entry matched only in JSON
+            deep_indicator = " *" if timestamp in self.search_matches else ""
+
+            # Choose color based on log level
+            if level == 'ERR':
+                level_attr = cs.color_pair(Theme.ERROR) | cs.A_BOLD
+            elif level in ('WIPE_STOPPED', 'VERIFY_STOPPED'):
+                level_attr = cs.color_pair(Theme.WARNING) | cs.A_BOLD
+            elif level in ('WIPE_COMPLETE', 'VERIFY_COMPLETE'):
+                level_attr = cs.color_pair(Theme.SUCCESS) | cs.A_BOLD
+            elif level == 'SESSION':
+                level_attr = cs.color_pair(Theme.PROGRESS) | cs.A_BOLD
+            else:
+                level_attr = cs.A_BOLD
+
+            line = f"{timestamp_display} [{level:>15}] {summary}{deep_indicator}"
+            win.add_body(line, attr=level_attr, context=Context("header", timestamp=timestamp))
+
+            # Handle expansion - show the structured data
+            if self.expands.get(timestamp, False):
+                # Show the full entry data as formatted JSON
+                try:
+                    data_dict = entry.to_dict()
+                    # Format just the 'data' field if it exists, otherwise show all
+                    if 'data' in data_dict and data_dict['data']:
+                        formatted = json.dumps(data_dict['data'], indent=2)
+                    else:
+                        formatted = json.dumps(data_dict, indent=2)
+
+                    lines = formatted.split('\n')
+                    for line in lines:
+                        win.add_body(f"  {line}", attr=cs.A_DIM, context=Context("body", timestamp=timestamp))
+
+                except Exception as e:
+                    win.add_body(f"  (error formatting: {e})", attr=cs.A_DIM)
+
+            # Empty line between entries
+            win.add_body("", context=Context("DECOR"))
+
+    def expand_ACTION(self):
+        """'e' key - Expand/collapse current entry"""
         app = self.app
+        win = app.win
+        ctx = win.get_picked_context()
 
-        app.win.set_pick_mode(False)
+        if ctx and hasattr(ctx, 'timestamp'):
+            timestamp = ctx.timestamp
+            # Toggle between collapsed and expanded
+            current = self.expands.get(timestamp, False)
+            if current:
+                del self.expands[timestamp]  # Collapse
+            else:
+                self.expands[timestamp] = True  # Expand
 
-        # Add header showing current theme
-
-        app.win.add_header(f'COLOR THEME:  {app.opts.theme:^18}', attr=cs.A_BOLD)
-        app.win.add_header('   Press [t] to cycle themes, ESC to return', resume=True)
-
-        # Color purpose labels
-        color_labels = [
-            (Theme.DANGER, 'DANGER', 'Destructive operations (wipe prompts)'),
-            (Theme.SUCCESS, 'SUCCESS', 'Completed operations'),
-            (Theme.OLD_SUCCESS, 'OLD_SUCCESS', 'Older Completed operations'),
-            (Theme.WARNING, 'WARNING', 'Caution/stopped states'),
-            (Theme.INFO, 'INFO', 'Informational states'),
-            (Theme.EMPHASIS, 'EMPHASIS', 'Emphasized text'),
-            (Theme.ERROR, 'ERROR', 'Errors'),
-            (Theme.PROGRESS, 'PROGRESS', 'Progress indicators'),
-            (Theme.HOTSWAP, 'HOTSWAP', 'Newly inserted devices'),
-        ]
-
-        # Display color examples for current theme
-        theme_info = Theme.THEMES[app.opts.theme]
-        _ = theme_info.get('name', app.opts.theme)
-
-        # Show color examples for this theme
-        for color_id, label, description in color_labels:
-            # Create line with colored block and description
-            line = f'{label:12} ████████  {description}'
-            attr = cs.color_pair(color_id)
-            app.win.add_body(line, attr=attr)
-            
-    def spin_theme_ACTION(self):
-        """ TBD """
-        vals = Theme.list_all()
-        value = Theme.get_current()
-        idx = vals.index(value) if value in vals else -1
-        value = vals[(idx+1) % len(vals)] # choose next
-        Theme.set(value)
-        self.app.opts.theme = value
+    def filter_ACTION(self):
+        """'/' key - Start incremental search"""
+        app = self.app
+        self.search_bar.start(self.prev_filter)
+        app.win.passthrough_mode = True

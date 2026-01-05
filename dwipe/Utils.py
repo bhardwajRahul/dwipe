@@ -5,10 +5,24 @@ import os
 import sys
 import datetime
 from pathlib import Path
+from .StructuredLogger import StructuredLogger
 
 
 class Utils:
     """Utility functions encapsulated as a family"""
+
+    # Singleton logger instance
+    _logger = None
+
+    @staticmethod
+    def get_logger():
+        """Get or create the singleton StructuredLogger instance"""
+        if Utils._logger is None:
+            Utils._logger = StructuredLogger(
+                app_name='dwipe',
+                log_dir=Utils.get_config_dir()
+            )
+        return Utils._logger
 
     @staticmethod
     def human(number):
@@ -128,6 +142,87 @@ class Utils:
                     f.writelines(lines[-keep_count:])
         except Exception:
             pass  # Don't fail if log trimming fails
+
+    @staticmethod
+    def get_device_dict(partition):
+        """Extract device information from partition namespace as dict
+
+        Args:
+            partition: Partition namespace object with device attributes
+
+        Returns:
+            dict: Device information for structured logging
+        """
+        device_dict = {
+            "name": partition.name,
+            "path": f"/dev/{partition.name}",
+            "size_bytes": partition.size_bytes,
+            "size_human": partition.size,
+        }
+
+        # Add optional fields if they exist
+        if hasattr(partition, 'uuid') and partition.uuid:
+            device_dict["uuid"] = partition.uuid
+        if hasattr(partition, 'serial') and partition.serial:
+            device_dict["serial"] = partition.serial
+        if hasattr(partition, 'port') and partition.port:
+            device_dict["port"] = partition.port
+        if hasattr(partition, 'model') and partition.model:
+            device_dict["model"] = partition.model
+        if hasattr(partition, 'parent') and partition.parent:
+            device_dict["parent"] = partition.parent
+        if hasattr(partition, 'type') and partition.type:
+            device_dict["type"] = partition.type
+        if hasattr(partition, 'fstype') and partition.fstype:
+            device_dict["fstype"] = partition.fstype
+        if hasattr(partition, 'label') and partition.label:
+            device_dict["label"] = partition.label
+
+        return device_dict
+
+    @staticmethod
+    def log_wipe_structured(partition, job, mode=None):
+        """Log a wipe or verify operation using structured logging
+
+        Args:
+            partition: Partition namespace object with device info
+            job: WipeJob object with job statistics
+            mode: Optional mode override (defaults to job.opts.wipe_mode)
+        """
+        logger = Utils.get_logger()
+
+        # Determine log level based on result
+        is_verify_only = getattr(job, 'is_verify_only', False)
+        is_stopped = job.do_abort
+
+        if is_verify_only:
+            level = "VERIFY_STOPPED" if is_stopped else "VERIFY_COMPLETE"
+        else:
+            level = "WIPE_STOPPED" if is_stopped else "WIPE_COMPLETE"
+
+        # Get the three sections
+        plan = job.get_plan_dict(mode)
+        device = Utils.get_device_dict(partition)
+        summary = job.get_summary_dict()
+
+        # Create summary message
+        result_str = summary['result']
+        size_str = device['size_human']
+        time_str = summary['total_elapsed_human']
+        rate_str = summary['write_rate_human']
+
+        message = f"{plan['operation'].capitalize()} {result_str}: {device['name']} {size_str} in {time_str} @ {rate_str}"
+
+        # Log the structured event
+        logger.put(
+            level,
+            message,
+            data={
+                "plan": plan,
+                "device": device,
+                "summary": summary
+            }
+        )
 
     @staticmethod
     def log_wipe(device_name, size_bytes, mode, result, elapsed_time=None, uuid=None, label=None, fstype=None, pct=None, verify_result=None):

@@ -33,6 +33,25 @@ def main():
             # Re-run the script with sudo needed and opted
             Utils.rerun_module_as_root('dwipe.main')
 
+        # Log SESSION marker at startup
+        logger = Utils.get_logger()
+        hostname = "unknown"
+        try:
+            with open('/etc/hostname', 'r', encoding='utf-8') as f:
+                hostname = f.read().strip()
+        except Exception:
+            pass
+
+        logger.put(
+            "SESSION",
+            "dwipe session started",
+            data={
+                "version": "1.0",
+                "user": os.environ.get('SUDO_USER', os.environ.get('USER', 'unknown')),
+                "hostname": hostname
+            }
+        )
+
         dwipe = DiskWipe()  # opts=opts)
         dwipe.dev_info = info = DeviceInfo(opts=opts)
         dwipe.partitions = info.assemble_partitions()
