@@ -144,7 +144,7 @@ class Utils:
             pass  # Don't fail if log trimming fails
 
     @staticmethod
-    def get_device_dict(partition):
+    def get_device_dict(partitions, partition):
         """Extract device information from partition namespace as dict
 
         Args:
@@ -153,35 +153,33 @@ class Utils:
         Returns:
             dict: Device information for structured logging
         """
+        if partition.name in partitions:
+            disk = partitions[partition.name]
+            while disk.parent:
+                disk = partitions[disk.parent]
+        else:
+            disk = partition
         device_dict = {
             "name": partition.name,
             "path": f"/dev/{partition.name}",
-            "size_bytes": partition.size_bytes,
-            "size_human": partition.size,
+            "size": Utils.human(partition.size_bytes),
         }
-
-        # Add optional fields if they exist
-        if hasattr(partition, 'uuid') and partition.uuid:
-            device_dict["uuid"] = partition.uuid
-        if hasattr(partition, 'serial') and partition.serial:
-            device_dict["serial"] = partition.serial
-        if hasattr(partition, 'port') and partition.port:
-            device_dict["port"] = partition.port
-        if hasattr(partition, 'model') and partition.model:
-            device_dict["model"] = partition.model
-        if hasattr(partition, 'parent') and partition.parent:
-            device_dict["parent"] = partition.parent
-        if hasattr(partition, 'type') and partition.type:
+        device_dict["uuid"] = partition.uuid
+        if partition.type:
             device_dict["type"] = partition.type
-        if hasattr(partition, 'fstype') and partition.fstype:
+        if partition.fstype:
             device_dict["fstype"] = partition.fstype
-        if hasattr(partition, 'label') and partition.label:
+        if partition.label:
             device_dict["label"] = partition.label
+
+        device_dict["model"] = disk.model
+        device_dict["serial"] = disk.serial
+        device_dict["port"] = disk.port
 
         return device_dict
 
     @staticmethod
-    def log_wipe_structured(partition, job, mode=None):
+    def log_wipe_structured(partitions, partition, job, mode=None):
         """Log a wipe or verify operation using structured logging
 
         Args:
@@ -202,14 +200,15 @@ class Utils:
 
         # Get the three sections
         plan = job.get_plan_dict(mode)
-        device = Utils.get_device_dict(partition)
+        device = Utils.get_device_dict(partitions, partition)
         summary = job.get_summary_dict()
 
         # Create summary message
         result_str = summary['result']
-        size_str = device['size_human']
-        time_str = summary['total_elapsed_human']
-        rate_str = summary['write_rate_human']
+        size_str = device['size']
+        time_str = summary['total_elapsed']
+        # Get rate from first step (wipe step)
+        rate_str = summary['steps'][0]['rate'] if summary['steps'] else 'N/A'
 
         message = f"{plan['operation'].capitalize()} {result_str}: {device['name']} {size_str} in {time_str} @ {rate_str}"
 

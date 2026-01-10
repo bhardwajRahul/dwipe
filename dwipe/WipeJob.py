@@ -507,67 +507,52 @@ class WipeJob:
             "verify_enabled": verify_in_mode or verify_pct > 0,
             "verify_pct": verify_pct,
             "passes": self.passes,
+            "slowdown_stop_threshold": self.slowdown_stop,
+            "stall_timeout_threshold": self.stall_timeout,
         }
 
     def get_summary_dict(self):
         """Generate complete summary dictionary for structured logging
 
         Returns:
-            dict: Complete job summary with all metrics (generous!)
+            dict: Summary with top-level aggregates and per-step details
         """
         mono = time.monotonic()
         write_elapsed = mono - self.start_mono
 
         # Calculate write rates
         write_rate_bps = self.total_written / write_elapsed if write_elapsed > 0 else 0
-        write_rate_mbps = (write_rate_bps * 8) / (1024 * 1024)
 
         # Calculate completion percentage
         total_work = self.total_size * self.passes
         pct_complete = min(100, (self.total_written / total_work) * 100 if total_work > 0 else 0)
 
-        summary = {
-            "result": "stopped" if self.do_abort else "completed",
-            "pct_complete": round(pct_complete, 1),
-
-            # Write phase statistics
+        # Build wipe step
+        mode = getattr(self.opts, 'wipe_mode', 'Unknown').replace('+V', '')
+        wipe_step = {
+            "step": f"wipe {mode} {self.device_path}",
+            "elapsed": Utils.ago_str(int(write_elapsed)),
+            "rate": f"{Utils.human(int(write_rate_bps))}/s",
             "bytes_written": self.total_written,
             "bytes_total": total_work,
-            "write_elapsed_seconds": round(write_elapsed, 1),
-            "write_elapsed_human": Utils.ago_str(int(write_elapsed)),
-            "write_rate_bytes_per_sec": int(write_rate_bps),
-            "write_rate_human": f"{Utils.human(int(write_rate_bps))}/s",
-            "write_rate_mbps": round(write_rate_mbps, 1),
-
-            # Multi-pass tracking
             "passes_total": self.passes,
             "passes_completed": min(self.total_written // self.total_size, self.passes),
             "current_pass": self.current_pass,
-
-            # Performance tracking
-            "baseline_speed_mbps": round((self.baseline_speed * 8) / (1024 * 1024), 1) if self.baseline_speed else None,
-            "average_speed_mbps": round(write_rate_mbps, 1),
-            # TODO: Add min/max speed tracking in future enhancement
-
-            # Slowdown and stall detection
-            "worst_stall_seconds": round(self.max_stall_secs, 1),
-            "worst_stall_human": Utils.ago_str(int(self.max_stall_secs)),
+            "peak_write_rate": f"{Utils.human(int(self.baseline_speed))}/s" if self.baseline_speed else None,
+            "worst_stall": Utils.ago_str(int(self.max_stall_secs)),
             "worst_slowdown_ratio": round(self.max_slowdown_ratio, 1),
-            "slowdown_stop_threshold": self.slowdown_stop,
-            "stall_timeout_threshold": self.stall_timeout,
-
-            # Error tracking
-            "total_errors": self.total_errors,
+            "errors": self.total_errors,
             "reopen_count": self.reopen_count,
-
-            # Resume tracking
-            "resumed_from_bytes": self.resume_from,
-            "resume_mode": self.resume_mode,
         }
 
-        # Add verification statistics if verify was done
+        # Build steps array
+        steps = [wipe_step]
+
+        # Add verification step if verify was done
+        total_elapsed = write_elapsed
         if self.verify_start_mono:
             verify_elapsed = mono - self.verify_start_mono
+            total_elapsed = write_elapsed + verify_elapsed
             verify_rate_bps = self.verify_progress / verify_elapsed if verify_elapsed > 0 else 0
 
             # Extract verify detail from verify_result if it contains extra info
@@ -576,23 +561,32 @@ class WipeJob:
                 # Extract detail from results like "not-wiped (non-zero at 22K)"
                 verify_detail = str(self.verify_result).split('(')[1].rstrip(')')
 
-            summary.update({
-                "verify_enabled": True,
-                "verify_pct": self.verify_pct,
-                "verify_result": self.verify_result,
-                "verify_detail": verify_detail,
-                "verify_elapsed_seconds": round(verify_elapsed, 1),
-                "verify_elapsed_human": Utils.ago_str(int(verify_elapsed)),
-                "verify_rate_bytes_per_sec": int(verify_rate_bps),
-                "verify_rate_human": f"{Utils.human(int(verify_rate_bps))}/s",
-                "verify_bytes_checked": self.verify_progress,
-            })
-        else:
-            summary["verify_enabled"] = False
+            verify_pct = getattr(self.opts, 'verify_pct', 0)
+            verify_label = f"verify {mode}"
+            if verify_pct > 0 and verify_pct < 100:
+                verify_label += f" ({verify_pct}% sample)"
 
-        # Total elapsed (write + verify if applicable)
-        summary["total_elapsed_seconds"] = round(write_elapsed, 1)
-        summary["total_elapsed_human"] = Utils.ago_str(int(write_elapsed))
+            verify_step = {
+                "step": verify_label,
+                "elapsed": Utils.ago_str(int(verify_elapsed)),
+                "rate": f"{Utils.human(int(verify_rate_bps))}/s",
+                "bytes_checked": self.verify_progress,
+                "result": self.verify_result,
+            }
+            if verify_detail:
+                verify_step["verify_detail"] = verify_detail
+
+            steps.append(verify_step)
+
+        # Build top-level summary
+        summary = {
+            "result": "stopped" if self.do_abort else "completed",
+            "total_elapsed": Utils.ago_str(int(total_elapsed)),
+            "total_errors": self.total_errors,
+            "pct_complete": round(pct_complete, 1),
+            "resumed_from_bytes": self.resume_from,
+            "steps": steps,
+        }
 
         return summary
 

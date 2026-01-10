@@ -138,6 +138,13 @@ class DiskWipe:
         if not key:
             return True
 
+        # Handle search bar input
+        if self.stack.curr.num == LOG_ST:
+            screen_obj = self.stack.get_curr_obj()
+            if screen_obj.search_bar.is_active:
+                if screen_obj.search_bar.handle_key(key):
+                    return None # key handled by search bar
+
         # Handle filter bar input
         if self.filter_bar.is_active:
             if self.filter_bar.handle_key(key):
@@ -323,6 +330,7 @@ class DiskWipe:
         spin.add_key('theme_screen', 't - theme picker', genre='action', scope=MAIN_ST)
         spin.add_key('spin_theme', 't - theme', genre='action', scope=THEME_ST)
         spin.add_key('header_mode', '_ - header style', vals=['Underline', 'Reverse', 'Off'])
+        spin.add_key('expand', 'e - expand history entry', genre='action', scope=LOG_ST)
         self.opts.theme = ''
         self.persistent_state.restore_updated_opts(self.opts)
         Theme.set(self.opts.theme)
@@ -345,7 +353,7 @@ class DiskWipe:
             current_screen.draw_screen()
             self.win.render()
 
-            seconds = 3.0
+            seconds = current_screen.refresh_seconds
             _ = self.do_key(self.win.prompt(seconds=seconds))
 
             # Handle actions using perform_actions
@@ -369,6 +377,7 @@ class DiskWipe:
 class DiskWipeScreen(Screen):
     """ TBD """
     app: DiskWipe
+    refresh_seconds = 3.0  # Default refresh rate for screens
 
     def screen_escape_ACTION(self):
         """ return to main screen """
@@ -478,7 +487,7 @@ class MainScreen(DiskWipeScreen):
                                         verify_detail = verify_result
 
                                 # Structured logging
-                                Utils.log_wipe_structured(partition, partition.job)
+                                Utils.log_wipe_structured(app.partitions, partition, partition.job)
                                 # Legacy text log (keep for compatibility)
                                 Utils.log_wipe(partition.name, partition.size_bytes, 'Vrfy', result, elapsed,
                                               uuid=partition.uuid, verify_result=verify_detail)
@@ -528,7 +537,7 @@ class MainScreen(DiskWipeScreen):
                         if partition.job.do_abort and partition.job.total_size > 0:
                             pct = int((partition.job.total_written / partition.job.total_size) * 100)
                         # Structured logging
-                        Utils.log_wipe_structured(partition, partition.job, mode=mode)
+                        Utils.log_wipe_structured(app.partitions, partition, partition.job, mode=mode)
                         # Legacy text log (keep for compatibility)
                         # Only pass label/fstype for stopped wipes (not completed)
                         if result == 'stopped':
@@ -823,6 +832,8 @@ class HelpScreen(DiskWipeScreen):
 class HistoryScreen(DiskWipeScreen):
     """History/log screen showing structured log entries with expand/collapse functionality"""
 
+    refresh_seconds = 60.0  # Slower refresh for history screen to allow copy/paste
+
     def __init__(self, app):
         super().__init__(app)
         self.expands = {}  # Maps timestamp -> True (expanded) or False (collapsed)
@@ -914,10 +925,11 @@ class HistoryScreen(DiskWipeScreen):
         search_display = self.search_bar.get_display_string(prefix='', suffix='')
 
         # Build level summary for header
-        level_summary = ' '.join(f'{lvl}:{cnt}' for lvl, cnt in sorted(level_counts.items()))
+        # level_summary = ' '.join(f'{lvl}:{cnt}' for lvl, cnt in sorted(level_counts.items()))
 
         # Header
-        header_line = f'ESC:back [e]xpand [/]search {len(self.filtered_entries)}/{len(self.entries)} ({level_summary}) '
+        # header_line = f'ESC:back [e]xpand [/]search {len(self.filtered_entries)}/{len(self.entries)} ({level_summary}) '
+        header_line = f'ESC:back [e]xpand [/]search {len(self.filtered_entries)}/{len(self.entries)} '
         if search_display:
             header_line += f'/ {search_display}'
         else:
@@ -947,12 +959,10 @@ class HistoryScreen(DiskWipeScreen):
                 level_attr = cs.color_pair(Theme.WARNING) | cs.A_BOLD
             elif level in ('WIPE_COMPLETE', 'VERIFY_COMPLETE'):
                 level_attr = cs.color_pair(Theme.SUCCESS) | cs.A_BOLD
-            elif level == 'SESSION':
-                level_attr = cs.color_pair(Theme.PROGRESS) | cs.A_BOLD
             else:
                 level_attr = cs.A_BOLD
 
-            line = f"{timestamp_display} [{level:>15}] {summary}{deep_indicator}"
+            line = f"{timestamp_display} {summary}{deep_indicator}"
             win.add_body(line, attr=level_attr, context=Context("header", timestamp=timestamp))
 
             # Handle expansion - show the structured data
@@ -968,7 +978,7 @@ class HistoryScreen(DiskWipeScreen):
 
                     lines = formatted.split('\n')
                     for line in lines:
-                        win.add_body(f"  {line}", attr=cs.A_DIM, context=Context("body", timestamp=timestamp))
+                        win.add_body(f"  {line}", context=Context("body", timestamp=timestamp))
 
                 except Exception as e:
                     win.add_body(f"  (error formatting: {e})", attr=cs.A_DIM)

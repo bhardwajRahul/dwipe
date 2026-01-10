@@ -102,7 +102,7 @@ class EraseStatus(Enum):
     UNKNOWN = "unknown"
 
 @dataclass
-class PreCheckResult:
+class OLD-PreCheckResult:
     compatible: bool = False
     tool: Optional[str] = None
     frozen: bool = False
@@ -110,6 +110,17 @@ class PreCheckResult:
     enhanced_supported: bool = False
     issues: List[str] = None
     recommendation: Optional[str] = None
+
+@dataclass
+class PreCheckResult:
+#   compatible: bool = False
+#   tool: Optional[str] = None
+#   frozen: bool = False
+#   locked: bool = False
+#   enhanced_supported: bool = False
+    issues: List[str] = None  # list of "why not" ... any set, no wipe
+#   recommendation: Optional[str] = None
+    modes = {}   # dict of descr/how  'Cropto': '--wipe=crypto'
     
     def __post_init__(self):
         if self.issues is None:
@@ -147,142 +158,123 @@ class DrivePreChecker:
                 pass
         
         return False
-    
+
     def check_nvme_drive(self, device: str) -> PreCheckResult:
-        """Check if NVMe secure erase will likely work"""
-        result = PreCheckResult(tool='nvme')
+        """Probes NVMe and returns specific command flags for available wipe modes"""
+        result = PreCheckResult()
+        result.modes = {}
         
         try:
-            # Check if device exists
-            if not os.path.exists(device):
-                result.issues.append(f"Device {device} does not exist")
-                return result
-            
-            # Check USB attachment
-            if self.is_usb_attached(device):
-                result.issues.append("NVMe is USB-attached - hardware erase unreliable")
-                result.recommendation = "Use software wipe"
-                return result
-            
-            # Check if NVMe device responds
+            # Get controller capabilities in JSON for easy parsing
             id_ctrl = subprocess.run(
-                ['nvme', 'id-ctrl', device],
-                capture_output=True,
-                text=True,
-                timeout=self.timeout
+                ['nvme', 'id-ctrl', device, '-o', 'json'],
+                capture_output=True, text=True, timeout=self.timeout
             )
             
             if id_ctrl.returncode != 0:
-                result.issues.append(f"Not an NVMe device: {id_ctrl.stderr}")
+                result.issues.append("NVMe controller unresponsive")
                 return result
+
+            import json
+            data = json.loads(id_ctrl.stdout)
             
-            # Check format support
-            if 'Format NVM' not in id_ctrl.stdout:
-                result.issues.append("Drive doesn't support Format NVM command")
-            
-            # Check for write protection
-            id_ns = subprocess.run(
-                ['nvme', 'id-ns', device],
-                capture_output=True,
-                text=True,
-                timeout=self.timeout
-            )
-            
-            if id_ns.returncode == 0 and 'Write Protected' in id_ns.stdout:
-                result.issues.append("Namespace is write protected")
-            
-            result.compatible = len(result.issues) == 0
-            result.recommendation = "Proceed with hardware erase" if result.compatible else "Use software wipe"
-            
-        except subprocess.TimeoutExpired:
-            result.issues.append(f"Command timed out after {self.timeout}s")
+            # 1. Check for Sanitize Capabilities (The most modern/safe method)
+            # Bit 1: Block, Bit 2: Crypto, Bit 3: Overwrite
+            sanicap = data.get('sanicap', 0)
+            if sanicap > 0:
+                # We use OrderedDict or similar to put the 'best' options first
+                if sanicap & 0x04: # Crypto Erase
+                    result.modes['Sanitize-Crypto'] = 'sanitize --action=0x04'
+                if sanicap & 0x02: # Block Erase (Physical)
+                    result.modes['Sanitize-Block'] = 'sanitize --action=0x02'
+                if sanicap & 0x08: # Overwrite
+                    result.modes['Sanitize-Overwrite'] = 'sanitize --action=0x03'
+
+            # 2. Check for Legacy Format Capabilities
+            # Bit 1: Crypto, Bit 2: User Data Erase
+            fna = data.get('fna', 0)
+            if 'Format NVM' in id_ctrl.stdout:
+                # Check if Crypto Erase is supported via Format
+                if (fna >> 2) & 0x1:
+                    result.modes['Format-Crypto'] = 'format --ses=2'
+                # Standard User Data Erase
+                result.modes['Format-Erase'] = 'format --ses=1'
+
+            # Final Validation
+            if not result.modes:
+                result.issues.append("No HW wipe modes (Sanitize/Format) supported")
+
         except Exception as e:
-            result.issues.append(f"Unexpected error: {e}")
+            result.issues.append(f"Probe Error: {str(e)}")
         
         return result
-    
+
     def check_ata_drive(self, device: str) -> PreCheckResult:
-        """Check if ATA secure erase will likely work"""
-        result = PreCheckResult(tool='hdparm')
+        """Probes SATA/ATA and returns hdparm flags or specific blocking reasons
+          + Why the "NULL" password? In the modes dictionary above, we use NULL.
+            - To perform an ATA Secure Erase, you have to set a temporary password first,
+              then immediately issue the erase command with that same password.
+            - Most tools (and hdparm itself) use NULL or a simple string like p
+              as a throwaway.
+            - Note: If the dwipe app crashes after setting the password but before the
+              erase finishes, the drive will stay locked. On the next run, your enabled
+              check (Step 3) will catch this.
+          + Handling "Frozen" in the UI
+            -the "Frozen" issue is the one that will frustrate users most.
+            -The "Short Crisp Reason": Drive is FROZEN.
+            - The Fix: To unfreeze, try suspending (sleeping) and waking the computer,
+              or re-plugging the drive's power cable."
+
+          + Now, dwipe builds that list:
+            It calls can_use_hardware_erase().
+            It looks at result.issues. If empty, the [f]:irmW key is active.
+        """
+        result = PreCheckResult()
+        result.modes = {}
         
         try:
-            if not os.path.exists(device):
-                result.issues.append(f"Device {device} does not exist")
-                return result
-            
-            # Check USB attachment
-            if self.is_usb_attached(device):
-                result.issues.append("Drive is USB-attached - hardware erase unreliable")
-                result.recommendation = "Use software wipe"
-                return result
-            
-            # Get drive info
+            # Get drive info via hdparm
             info = subprocess.run(
                 ['hdparm', '-I', device],
-                capture_output=True,
-                text=True,
-                timeout=self.timeout
+                capture_output=True, text=True, timeout=self.timeout
             )
             
             if info.returncode != 0:
-                result.issues.append(f"Drive not responsive: {info.stderr}")
+                result.issues.append("Drive not responsive to hdparm")
                 return result
-            
-            output = info.stdout
-            
-            # Check if frozen
-            if 'frozen' in output.lower():
-                result.frozen = True
-                result.issues.append("Drive is FROZEN - will hang on erase")
-            
-            # Check if locked/enabled
-            if 'enabled' in output and 'not' not in output:
-                result.locked = True
-                result.issues.append("Security is ENABLED - needs password")
-            
-            # Check enhanced erase support
-            if 'supported: enhanced erase' in output:
-                result.enhanced_supported = True
-            
-            # Check ATA device and erase support
-            if 'ATA' not in output and 'SATA' not in output:
-                result.issues.append("Not an ATA/SATA device")
-            
-            if 'SECURITY ERASE UNIT' not in output:
-                result.issues.append("Drive doesn't support SECURITY ERASE UNIT")
-            
-            result.compatible = len(result.issues) == 0
-            
-            if result.compatible:
-                result.recommendation = "Proceed with hardware erase"
-            elif result.frozen:
-                result.recommendation = "Thaw drive first or use software wipe"
-            elif result.locked:
-                result.recommendation = "Disable security first or use software wipe"
-            else:
-                result.recommendation = "Use software wipe"
-            
-        except subprocess.TimeoutExpired:
-            result.issues.append(f"Command timed out after {self.timeout}s")
+
+            out = info.stdout.lower()
+
+            # 1. Check if the drive even supports Security Erase
+            if "security erase unit" not in out:
+                result.issues.append("Drive does not support ATA Security Erase")
+                return result
+
+            # 2. Check for "Frozen" state (The most common blocker)
+            # A frozen drive rejects security commands until a power cycle.
+            if "frozen" in out and "not frozen" not in out:
+                result.issues.append("Drive is FROZEN (BIOS/OS lock)")
+                # You might want to keep this in issues so user can't select it,
+                # or move it to a 'warning' if you want to allow them to try anyway.
+
+            # 3. Check if security is already "Enabled" (Drive is locked)
+            if "enabled" in out and "not enabled" not in out:
+                # If it's already locked, we can't wipe without the existing password.
+                result.issues.append("Security is ENABLED (Drive is password locked)")
+
+            # 4. Populate Modes if no fatal issues
+            if not result.issues:
+                # Enhanced Erase: Usually writes a pattern or destroys encryption keys
+                if "enhanced erase" in out:
+                    result.modes['ATA-Enhanced'] = '--user-master u --security-erase-enhanced NULL'
+                
+                # Normal Erase: Usually writes zeros to the whole platter
+                result.modes['ATA-Normal'] = '--user-master u --security-erase NULL'
+
         except Exception as e:
-            result.issues.append(f"Unexpected error: {e}")
-        
+            result.issues.append(f"ATA Probe Error: {str(e)}")
         return result
     
-    def can_use_hardware_erase(self, device: str) -> PreCheckResult:
-        """
-        Determine if hardware erase will work.
-        Returns comprehensive pre-check result.
-        """
-        if not os.path.exists(device):
-            return PreCheckResult(issues=[f"Device {device} does not exist"])
-        
-        if 'nvme' in device:
-            return self.check_nvme_drive(device)
-        elif device.startswith('/dev/sd'):
-            return self.check_ata_drive(device)
-        else:
-            return PreCheckResult(issues=[f"Unsupported device type: {device}"])
 
 # ============================================================================
 # Part 3: Drive Eraser with Monitoring
@@ -297,6 +289,48 @@ class DriveEraser:
         self.progress_callback = progress_callback
         self.monitor_thread = None
         self.current_process = None
+    
+    def run_firmware_wipe(self):
+        """The thread target for firmware wipes"""
+        self.start_mono = time.monotonic()
+        
+        # 1. Start the process (non-blocking)
+        # self.opts.hw_cmd might be: "nvme sanitize --action=0x02"
+        full_cmd = f"{self.opts.tool} {self.opts.hw_cmd} {self.device_path}"
+        self.process = subprocess.Popen(full_cmd.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        # 2. Polling Loop
+        while not self._abort_requested:
+            if self.process.poll() is not None:
+                break
+                
+            # Optional: For NVMe, you can poll 'nvme sanitize-log' here 
+            # to get actual 0-100% progress and update self.total_written
+            
+            time.sleep(1) 
+
+        # 3. Finalize
+        self.finish_mono = time.monotonic()
+        if self.process.returncode == 0:
+            self.total_written = self.total_size  # Mark as done for the UI
+    
+    def abort(self):
+        self._abort_requested = True
+        if self.process and self.process.poll() is None:
+            self.process.terminate() # Try nice first
+            time.sleep(0.5)
+            self.process.kill()      # Then hammer it
+    
+    """
+    # Inside get_summary_dict...
+    is_hw = getattr(self.opts, 'is_hardware', False)
+
+    if is_hw:
+        # Rate and written bytes don't follow standard rules
+        wipe_step["rate"] = "Hardware"
+        wipe_step["status"] = "Sanitizing..." if not self.done else "Complete"
+    
+    """
         
     def start_nvme_erase(self, device: str) -> bool:
         """Start NVMe secure erase (non-blocking)"""
@@ -589,6 +623,24 @@ class HardwareWipeController:
         except:
             pass
         return 500  # Default guess
+    
+    def apply_marker(self):
+    # 1. Force the OS to realize the partitions are gone
+    subprocess.run(['blockdev', '--rereadpt', self.device_path])
+    time.sleep(1) # Give the kernel a breath
+    
+    try:
+        with open(self.device_path, 'wb') as f:
+            # Clear first 16K
+            f.write(b'\x00' * 16384)
+            # Seek to 15K
+            f.seek(15360)
+            f.write(self.generate_json_marker())
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError as e:
+        # If this happens, the drive is likely still 'settling' its FTL
+        return "RETRY_NEEDED"
 
 # ============================================================================
 # Part 5: Example Usage & Integration Helper

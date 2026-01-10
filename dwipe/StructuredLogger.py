@@ -138,10 +138,6 @@ class StructuredLogger:
     TRIM_TO_RATIO = 0.67  # Trim to 67% when max exceeded
     ERR_AGE_WEIGHT = 10  # ERR entries age 10x slower
 
-    # Compression for archived logs
-    COMPRESS_ARCHIVES = True
-    ARCHIVE_DAYS_TO_KEEP = 30
-
     def __init__(self, app_name: str = 'rmbloat',
                  log_dir: Optional[Path] = None,
                  session_id: str = ""):
@@ -163,31 +159,40 @@ class StructuredLogger:
             'last_trim': datetime.now()
         }
     
+    def _fix_ownership(self, path: Path) -> None:
+        """Fix file/directory ownership to real user when running with sudo."""
+        real_user = os.environ.get('SUDO_USER')
+        if real_user:
+            try:
+                import pwd
+                pw_record = pwd.getpwnam(real_user)
+                uid, gid = pw_record.pw_uid, pw_record.pw_gid
+                os.chown(path, uid, gid)
+            except (OSError, KeyError):
+                pass  # Ignore permission errors and missing users
+
     def _setup_paths(self, log_dir: Optional[Path]) -> None:
         """Set up log directory and file paths."""
         try:
             if log_dir:
-                base_dir = Path(log_dir)
+                # Use provided directory exactly as specified
+                self.log_dir = Path(log_dir)
             else:
+                # Construct default path from app_name
                 base_dir = Path.home() / '.config'
+                self.log_dir = base_dir / self.app_name
 
-            # Create app-specific directory
-            self.log_dir = base_dir / self.app_name
             self.log_dir.mkdir(parents=True, exist_ok=True)
+            self._fix_ownership(self.log_dir)
 
             # Single log file (JSON Lines format)
             self.log_file = self.log_dir / "events.jsonl"
-
-            # Archive directory
-            self.archive_dir = self.log_dir / "archive"
-            self.archive_dir.mkdir(exist_ok=True)
 
         except Exception as e:
             print(f"FATAL: Cannot setup log directory: {e}", file=sys.stderr)
             # Fallback to current directory
             self.log_dir = Path.cwd()
             self.log_file = Path("events.jsonl")
-            self.archive_dir = Path("archive")
     
     def _get_caller_info(self, depth: int = 3) -> tuple:
         """Get caller information from stack frame."""
@@ -248,6 +253,9 @@ class StructuredLogger:
 
             self.stats['entries_written'] += 1
 
+            # Fix ownership after writing
+            self._fix_ownership(self.log_file)
+
         except Exception as e:
             print(f"LOG WRITE ERROR: {e}", file=sys.stderr)
 
@@ -307,6 +315,9 @@ class StructuredLogger:
                 f.writelines(kept)
 
             self.stats['last_trim'] = datetime.now()
+
+            # Fix ownership after trimming
+            self._fix_ownership(self.log_file)
 
         except Exception as e:
             print(f"TRIM ERROR: {e}", file=sys.stderr)
@@ -429,12 +440,18 @@ class StructuredLogger:
 
             # Deep search: check JSON content if requested
             deep_match = False
-            if deep and '{' in entry.message:
+            if deep:
                 try:
-                    json_start = entry.message.index('{')
-                    json_str = entry.message[json_start:]
-                    deep_match = pattern_lower in json_str.lower()
-                except (ValueError, IndexError):
+                    # Search in the structured data field
+                    if entry.data:
+                        json_str = json.dumps(entry.data)
+                        deep_match = pattern_lower in json_str.lower()
+                    # Also search in message if it contains JSON
+                    if not deep_match and '{' in entry.message:
+                        json_start = entry.message.index('{')
+                        json_str = entry.message[json_start:]
+                        deep_match = pattern_lower in json_str.lower()
+                except (ValueError, IndexError, TypeError):
                     pass
 
             # Include if either match
