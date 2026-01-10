@@ -9,7 +9,7 @@ import os
 import sys
 import re
 import time
-import shutil
+# import shutil
 import json
 import curses as cs
 from types import SimpleNamespace
@@ -68,18 +68,18 @@ class DiskWipe:
 
         # Initialize persistent state
         self.persistent_state = PersistentState()
-        self.check_preqreqs()
+#       self.check_preqreqs()
 
-    @staticmethod
-    def check_preqreqs():
-        """Check that needed programs are installed."""
-        ok = True
-        for prog in 'lsblk'.split():
-            if shutil.which(prog) is None:
-                ok = False
-                print(f'ERROR: cannot find {prog!r} on $PATH')
-        if not ok:
-            sys.exit(1)
+#   @staticmethod
+#   def check_preqreqs():
+#       """Check that needed programs are installed."""
+#       ok = True
+#       for prog in 'lsblk'.split():
+#           if shutil.which(prog) is None:
+#               ok = False
+#               print(f'ERROR: cannot find {prog!r} on $PATH')
+#       if not ok:
+#           sys.exit(1)
 
     def _start_wipe(self):
         """Start the wipe job after confirmation"""
@@ -275,6 +275,20 @@ class DiskWipe:
             self.filter = None
             self.prev_filter = ''
         self.win.passthrough_mode = False
+        
+    def get_hw_caps_when_needed(self):
+        """ Look for wipeable disks w/o hardware info """
+        for  ns in self.partitions.values():
+            if ns.parent:
+                continue
+            if ns.port.startswith('USB'):
+                continue
+            if ns.name[:2] not in ('nv', 'sd', 'hd'):
+                continue
+            if ns.hw_nopes or ns.hw_caps:  # already done
+                continue
+            self.dev_info.get_hw_capabilities(ns)
+
 
     def main_loop(self):
         """Main event loop"""
@@ -342,6 +356,7 @@ class DiskWipe:
         # Initialize device info and pick range before first draw
         info = DeviceInfo(opts=self.opts, persistent_state=self.persistent_state)
         self.partitions = info.assemble_partitions(self.partitions)
+        self.get_hw_caps_when_needed()
         self.dev_info = info
         pick_range = info.get_pick_range()
         self.win.set_pick_range(pick_range[0], pick_range[1])
@@ -362,6 +377,7 @@ class DiskWipe:
             if time.monotonic() - check_devices_mono > (seconds * 0.95):
                 info = DeviceInfo(opts=self.opts, persistent_state=self.persistent_state)
                 self.partitions = info.assemble_partitions(self.partitions)
+                self.get_hw_caps_when_needed()
                 self.dev_info = info
                 # Update pick range to highlight NAME through SIZE fields
                 pick_range = info.get_pick_range()
@@ -386,11 +402,14 @@ class DiskWipeScreen(Screen):
 class MainScreen(DiskWipeScreen):
     """Main device list screen"""
 
-    def _port_serial_line(self, port, serial):
+    def _port_serial_line(self, partition):
         wids = self.app.wids
         wid = wids.state if wids else 5
-        sep = '  '
-        return f'{"":>{wid}}{sep}│   └────── {port:<12} {serial}'
+        sep, more = '  ', ''
+        port, serial = partition.port, partition.serial
+        if partition.hw_caps or partition.hw_nopes:
+            more = f' {partition.hw_caps}' if partition.hw_caps else f' {partition.hw_nopes}'
+        return f'{"":>{wid}}{sep}│   └────── {port:<12} {serial} {more}'
 
     def draw_screen(self):
         """Draw the main device list"""
@@ -640,7 +659,7 @@ class MainScreen(DiskWipeScreen):
                          partition=partition)
             app.win.add_body(partition.line, attr=attr, context=ctx)
             if partition.parent is None and app.opts.port_serial:
-                line = self._port_serial_line(partition.port, partition.serial)
+                line = self._port_serial_line(partition)
                 app.win.add_body(line, attr=attr, context=Context(genre='DECOR'))
 
             # Show inline confirmation prompt if this is the partition being confirmed

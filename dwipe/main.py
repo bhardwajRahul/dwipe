@@ -15,6 +15,7 @@ import traceback
 from .DiskWipe import DiskWipe
 from .DeviceInfo import DeviceInfo
 from .Utils import Utils
+from .Prereqs import Prereqs
 
 
 def main():
@@ -32,6 +33,11 @@ def main():
         if os.geteuid() != 0:
             # Re-run the script with sudo needed and opted
             Utils.rerun_module_as_root('dwipe.main')
+            
+        prereqs = Prereqs(verbose=True)
+            # lsblk is critical for everything; others are critical for firmware wipes
+        prereqs.check_all(['lsblk', 'hdparm', 'nvme'])
+        prereqs.report_and_exit_if_failed()
 
         dwipe = DiskWipe()  # opts=opts)
         dwipe.dev_info = info = DeviceInfo(opts=opts)
