@@ -16,8 +16,21 @@ from types import SimpleNamespace
 from .Utils import Utils
 
 
-class WipeJob:
-    """Handles disk/partition wiping operations with progress tracking"""
+class WipeTask:
+    """Abstract base class for wipe/verify operations
+
+    Defines the interface that all tasks must implement:
+    - run_task(): Execute the task (blocking, runs in thread)
+    - get_status(): Get current progress (thread-safe, called from main thread)
+    - get_summary_dict(): Get final summary after completion
+    - abort(): Signal task to stop
+
+    Shared state across all task types:
+    - Device info: device_path, total_size
+    - Control: opts, do_abort, done
+    - Progress: total_written, start_mono, wr_hists
+    - Errors: exception
+    """
 
     # O_DIRECT requires aligned buffers and write sizes
     BLOCK_SIZE = 4096  # Alignment requirement for O_DIRECT
@@ -33,6 +46,496 @@ class WipeJob:
     buffer_mem = None  # Underlying mmap object
     zero_buffer = None  # Zero buffer (memoryview)
     zero_buffer_mem = None  # Underlying mmap object
+
+    def __init__(self, device_path, total_size, opts=None):
+        """Initialize base task with common attributes
+
+        Args:
+            device_path: Path to device (e.g., '/dev/sda1')
+            total_size: Total size in bytes
+            opts: Options namespace (wipe_mode, verify_pct, etc.)
+        """
+        self.device_path = device_path
+        self.total_size = total_size
+        self.opts = opts if opts else SimpleNamespace(dry_run=False)
+
+        # Control flags
+        self.do_abort = False
+        self.done = False
+        self.exception = None
+
+        # Progress tracking
+        self.total_written = 0  # Bytes processed (write or verify)
+        self.start_mono = time.monotonic()
+        self.wr_hists = []  # Progress history: list of SimpleNamespace(mono, written)
+        self.wr_hists.append(SimpleNamespace(mono=self.start_mono, written=0))
+
+    def run_task(self):
+        """Execute the task (blocking, runs in thread)
+
+        Must be implemented by subclasses. Should:
+        - Perform the actual work (write or verify)
+        - Update self.total_written as it progresses
+        - Check self.do_abort periodically and stop if True
+        - Set self.exception if errors occur
+        - Set self.done = True when complete (or use finally block)
+        """
+        raise NotImplementedError("Subclasses must implement run_task()")
+
+    def get_status(self):
+        """Get current progress status (thread-safe, called from main thread)
+
+        Returns:
+            tuple: (elapsed_str, pct_str, rate_str, eta_str)
+                - elapsed_str: e.g., "5m23s"
+                - pct_str: e.g., "45%" or "v23%" (for verify)
+                - rate_str: e.g., "450MB/s"
+                - eta_str: e.g., "2m15s"
+        """
+        mono = time.monotonic()
+        elapsed_time = mono - self.start_mono
+
+        # Calculate percentage
+        pct = (self.total_written / self.total_size) * 100 if self.total_size > 0 else 0
+        pct = min(pct, 100)
+        pct_str = f'{int(round(pct))}%'
+
+        if self.do_abort:
+            pct_str = 'STOP'
+
+        # Track progress for rate calculation
+        self.wr_hists.append(SimpleNamespace(mono=mono, written=self.total_written))
+        floor = mono - 30  # 30 second window
+        while len(self.wr_hists) >= 3 and self.wr_hists[1].mono >= floor:
+            del self.wr_hists[0]
+
+        # Calculate rate from sliding window
+        delta_mono = mono - self.wr_hists[0].mono
+        rate = (self.total_written - self.wr_hists[0].written) / delta_mono if delta_mono > 1.0 else 0
+        rate_str = f'{Utils.human(int(round(rate, 0)))}/s'
+
+        # Calculate ETA
+        if rate > 0:
+            remaining = self.total_size - self.total_written
+            when = int(round(remaining / rate))
+            when_str = Utils.ago_str(when)
+        else:
+            when_str = '0'
+
+        return Utils.ago_str(int(round(elapsed_time))), pct_str, rate_str, when_str
+
+    def get_summary_dict(self):
+        """Get final summary after task completion
+
+        Returns:
+            dict: Summary with step name, elapsed, rate, bytes processed, etc.
+        """
+        mono = time.monotonic()
+        elapsed = mono - self.start_mono
+        rate_bps = self.total_written / elapsed if elapsed > 0 else 0
+
+        return {
+            "step": f"task {self.__class__.__name__}",
+            "elapsed": Utils.ago_str(int(elapsed)),
+            "rate": f"{Utils.human(int(rate_bps))}/s",
+            "bytes_processed": self.total_written,
+        }
+
+    def abort(self):
+        """Signal task to stop (thread-safe)"""
+        self.do_abort = True
+
+
+class WriteTask(WipeTask):
+    """Abstract base class for write operations (WriteZeroTask, WriteRandTask)
+
+    Implements the main write loop with:
+    - O_DIRECT unbuffered I/O for maximum performance
+    - Error handling with safe_write() and reopen on error
+    - Performance monitoring (stall/slowdown detection)
+    - Periodic marker updates for crash recovery
+    - Multi-pass support
+
+    Subclasses must implement:
+    - get_buffer(chunk_size): Return buffer slice (zeros or random)
+    """
+
+    def __init__(self, device_path, total_size, opts=None, resume_from=0, pass_number=0):
+        """Initialize write task
+
+        Args:
+            device_path: Path to device (e.g., '/dev/sda1')
+            total_size: Total size in bytes (single pass)
+            opts: Options namespace
+            resume_from: Byte offset to resume from (0 for fresh start)
+            pass_number: Current pass number (0-indexed, for multi-pass)
+        """
+        super().__init__(device_path, total_size, opts)
+
+        # Resume support
+        self.resume_from = resume_from
+        self.total_written = resume_from  # Start from resume offset
+        self.current_pass = pass_number
+
+        # Marker updates for crash recovery
+        self.last_marker_update_mono = time.monotonic() - 25  # Last marker write
+        self.marker_update_interval = 30  # Update every 30 seconds
+
+        # Performance monitoring
+        self.slowdown_stop = getattr(opts, 'slowdown_stop', 16)
+        self.stall_timeout = getattr(opts, 'stall_timeout', 60)
+        self.max_slowdown_ratio = 0
+        self.max_stall_secs = 0
+        self.baseline_speed = None  # Bytes per second baseline
+        self.baseline_end_mono = None
+        self.last_progress_mono = time.monotonic()
+        self.last_progress_written = resume_from
+        self.last_slowdown_check = 0
+
+        # Error handling
+        self.max_consecutive_errors = 3
+        self.max_total_errors = 100
+        self.reopen_on_error = True
+        self.reopen_count = 0
+        self.total_errors = 0
+
+        # Initialize write history
+        self.wr_hists = [SimpleNamespace(mono=self.start_mono, written=resume_from)]
+
+    def get_buffer(self, chunk_size):
+        """Get buffer slice for writing (abstract method)
+
+        Args:
+            chunk_size: Number of bytes to return
+
+        Returns:
+            memoryview: Buffer slice of requested size
+
+        Must be implemented by subclasses:
+        - WriteZeroTask returns WipeTask.zero_buffer[:chunk_size]
+        - WriteRandTask returns WipeTask.buffer[:chunk_size]
+        """
+        raise NotImplementedError("Subclasses must implement get_buffer()")
+
+    def run_task(self):
+        """Execute write operation (blocking, runs in thread)"""
+        try:
+            # Set low I/O priority
+            self._setup_ionice()
+
+            # Open device with O_DIRECT for unbuffered I/O
+            if not self.opts.dry_run:
+                fd = os.open(self.device_path, os.O_WRONLY | os.O_DIRECT)
+            else:
+                fd = None
+
+            try:
+                # Start from resume offset if resuming
+                offset_in_pass = self.resume_from
+
+                # SKIP MARKER AREA - don't overwrite it!
+                if offset_in_pass < WipeTask.MARKER_SIZE:
+                    self.total_written += WipeTask.MARKER_SIZE - offset_in_pass
+                    offset_in_pass = WipeTask.MARKER_SIZE
+
+                # Seek to current position (O_DIRECT requires block-aligned seeks)
+                if not self.opts.dry_run:
+                    os.lseek(fd, offset_in_pass, os.SEEK_SET)
+
+                # Write until end of pass
+                bytes_to_write = self.total_size - offset_in_pass
+                bytes_written_this_run = 0
+
+                while bytes_written_this_run < bytes_to_write and not self.do_abort:
+                    current_mono = time.monotonic()
+
+                    # Update baseline if needed (first 60 seconds)
+                    self._update_baseline_if_needed(current_mono)
+
+                    # Check for stall (frequently)
+                    if self._check_for_stall(current_mono):
+                        break
+
+                    # Check for slowdown (every 10 seconds)
+                    if self.baseline_speed is not None:
+                        time_since_last_check = current_mono - self.last_slowdown_check
+                        if time_since_last_check >= 10:
+                            if self._check_for_slowdown(current_mono):
+                                break
+                            self.last_slowdown_check = current_mono
+
+                    # Update progress tracking
+                    if self.total_written > self.last_progress_written:
+                        self.last_progress_mono = current_mono
+                        self.last_progress_written = self.total_written
+
+                    # Calculate chunk size (must be block-aligned for O_DIRECT)
+                    remaining = bytes_to_write - bytes_written_this_run
+                    chunk_size = min(WipeTask.WRITE_SIZE, remaining)
+                    # Round down to block boundary
+                    chunk_size = (chunk_size // WipeTask.BLOCK_SIZE) * WipeTask.BLOCK_SIZE
+                    if chunk_size == 0:
+                        break
+
+                    # Get buffer from subclass (polymorphic)
+                    chunk = self.get_buffer(chunk_size)
+
+                    if self.opts.dry_run:
+                        bytes_written = chunk_size
+                        time.sleep(0.001)
+                    else:
+                        try:
+                            # Write with O_DIRECT (bypasses page cache)
+                            bytes_written, fd = self.safe_write(fd, chunk)
+                        except Exception as e:
+                            # Save exception for debugging
+                            self.exception = str(e)
+                            self.do_abort = True
+                            bytes_written = 0
+
+                    self.total_written += bytes_written
+                    bytes_written_this_run += bytes_written
+
+                    # Periodically update marker for crash recovery (every 30s)
+                    if not self.opts.dry_run and self.total_written > WipeTask.MARKER_SIZE:
+                        self.maybe_update_marker()
+
+                    # Check for errors or incomplete writes
+                    if bytes_written < chunk_size:
+                        break
+
+            finally:
+                # Close device file descriptor
+                if fd is not None:
+                    os.close(fd)
+
+            self.done = True
+        except Exception:
+            self.exception = traceback.format_exc()
+            self.done = True
+
+    def safe_write(self, fd, chunk):
+        """Safe write with error recovery and reopen logic
+
+        Args:
+            fd: File descriptor
+            chunk: Data to write
+
+        Returns:
+            tuple: (bytes_written, fd) - fd might be new if reopened
+
+        Raises:
+            Exception: If should abort (too many consecutive/total errors)
+        """
+        consecutive_errors = 0
+        while True:  # Keep trying until success, skip, or abort
+            try:
+                bytes_written = os.write(fd, chunk)
+                self.reopen_count = 0
+                return bytes_written, fd  # success
+
+            except Exception as e:
+                consecutive_errors += 1
+                self.total_errors += 1
+
+                # Check if we should abort
+                if consecutive_errors >= self.max_consecutive_errors:
+                    raise Exception(f"{consecutive_errors} consecutive write errors") from e
+
+                if self.total_errors >= self.max_total_errors:
+                    raise Exception(f"{self.total_errors} total write errors") from e
+
+                # Not fatal yet - try reopening if enabled
+                if self.reopen_on_error:
+                    try:
+                        current_pos = self.total_written
+                        # Open new fd first
+                        new_fd = os.open(self.device_path, os.O_WRONLY | os.O_DIRECT)
+                        try:
+                            # Seek to correct position on new fd
+                            os.lseek(new_fd, current_pos, os.SEEK_SET)
+                            # Only close old fd after new one is ready
+                            old_fd = fd
+                            fd = new_fd
+                            try:
+                                os.close(old_fd)
+                            except Exception:
+                                pass  # Old fd close failed, but new fd is good
+                            self.reopen_count += 1
+                        except Exception:
+                            # New fd setup failed, close it and keep using old fd
+                            os.close(new_fd)
+                            raise
+                    except Exception:
+                        # Reopen failed - count as another error and retry with old fd
+                        self.total_errors += 1
+
+                # Retry the write (continue loop)
+
+    def maybe_update_marker(self):
+        """Periodically update marker to enable crash recovery
+
+        Updates marker every marker_update_interval seconds (default 30s).
+        This allows resume to work even after crashes, power loss, or kill -9.
+        """
+        now_mono = time.monotonic()
+        if now_mono - self.last_marker_update_mono < self.marker_update_interval:
+            return  # Not time yet
+
+        # Marker writes use separate file handle (buffered I/O, not O_DIRECT)
+        # because marker buffer is not aligned
+        try:
+            # Determine if this is a random or zero write
+            is_random = isinstance(self, WriteRandTask)
+            with open(self.device_path, 'r+b') as marker_file:
+                marker_file.seek(0)
+                marker_file.write(self._prep_marker_buffer(is_random))
+            self.last_marker_update_mono = now_mono
+        except Exception:
+            # If marker update fails, just continue - we'll try again in 30s
+            pass
+
+    def _prep_marker_buffer(self, is_random):
+        """Prepare marker buffer for this write task
+
+        Args:
+            is_random: bool, whether random data is being written
+
+        Returns:
+            bytearray: 16KB marker buffer with JSON status
+        """
+        data = {
+            "unixtime": int(time.time()),
+            "scrubbed_bytes": self.total_written,
+            "size_bytes": self.total_size,
+            "passes": 1,  # Single pass per WriteTask
+            "mode": 'Rand' if is_random else 'Zero'
+        }
+        json_data = json.dumps(data).encode('utf-8')
+        buffer = bytearray(WipeTask.MARKER_SIZE)  # Only 16KB, not 1MB
+        buffer[:WipeTask.STATE_OFFSET] = b'\x00' * WipeTask.STATE_OFFSET
+        buffer[WipeTask.STATE_OFFSET:WipeTask.STATE_OFFSET + len(json_data)] = json_data
+        remaining_size = WipeTask.MARKER_SIZE - (WipeTask.STATE_OFFSET + len(json_data))
+        buffer[WipeTask.STATE_OFFSET + len(json_data):] = b'\x00' * remaining_size
+        return buffer
+
+    def _check_for_stall(self, current_monotonic):
+        """Check for stall (no progress) - called frequently"""
+        if self.stall_timeout <= 0:
+            return False
+
+        time_since_progress = current_monotonic - self.last_progress_mono
+        self.max_stall_secs = max(time_since_progress, self.max_stall_secs)
+        if time_since_progress >= self.stall_timeout:
+            self.do_abort = True
+            self.exception = f"Stall detected: No progress for {time_since_progress:.1f} seconds"
+            return True
+
+        return False
+
+    def _check_for_slowdown(self, current_monotonic):
+        """Check for slowdown - called every 10 seconds"""
+        if self.slowdown_stop <= 0 or self.baseline_speed is None or self.baseline_speed <= 0:
+            return False
+
+        # Calculate current speed over last 30 seconds
+        floor = current_monotonic - 30
+        recent_history = [h for h in self.wr_hists if h.mono >= floor]
+
+        if len(recent_history) >= 2:
+            recent_start = recent_history[0]
+            recent_written = self.total_written - recent_start.written
+            recent_elapsed = current_monotonic - recent_start.mono
+
+            if recent_elapsed > 1.0:
+                current_speed = recent_written / recent_elapsed
+                self.baseline_speed = max(self.baseline_speed, current_speed)
+                slowdown_ratio = self.baseline_speed / max(current_speed, 1)
+                slowdown_ratio = int(round(slowdown_ratio, 0))
+                self.max_slowdown_ratio = max(self.max_slowdown_ratio, slowdown_ratio)
+
+                if slowdown_ratio > self.slowdown_stop:
+                    self.do_abort = True
+                    self.exception = (f"Slowdown abort: ({Utils.human(current_speed)}B/s)"
+                                     f" is 1/{slowdown_ratio} baseline")
+                    return True
+
+        return False
+
+    def _update_baseline_if_needed(self, current_monotonic):
+        """Update baseline speed measurement if still in first 60 seconds"""
+        if self.baseline_speed is not None:
+            return  # Baseline already established
+
+        if (current_monotonic - self.start_mono) >= 60:
+            total_written_60s = self.total_written - self.resume_from
+            elapsed_60s = current_monotonic - self.start_mono
+            if elapsed_60s > 0:
+                self.baseline_speed = total_written_60s / elapsed_60s
+                self.baseline_end_mono = current_monotonic
+                self.last_slowdown_check = current_monotonic  # Start slowdown checking
+
+    def _setup_ionice(self):
+        """Setup I/O priority to best-effort class, lowest priority"""
+        try:
+            # Class 2 = best-effort, priority 7 = lowest (0 is highest, 7 is lowest)
+            subprocess.run(["ionice", "-c", "2", "-n", "7", "-p", str(os.getpid())],
+                          capture_output=True, check=False)
+        except Exception:
+            pass
+
+    def get_summary_dict(self):
+        """Get final summary for this write task
+
+        Returns:
+            dict: Summary with step name, elapsed, rate, bytes written, errors, etc.
+        """
+        mono = time.monotonic()
+        elapsed = mono - self.start_mono
+        rate_bps = self.total_written / elapsed if elapsed > 0 else 0
+
+        # Determine mode from class name
+        mode = "Rand" if isinstance(self, WriteRandTask) else "Zero"
+
+        return {
+            "step": f"wipe {mode} {self.device_path}",
+            "elapsed": Utils.ago_str(int(elapsed)),
+            "rate": f"{Utils.human(int(rate_bps))}/s",
+            "bytes_written": self.total_written,
+            "bytes_total": self.total_size,
+            "passes_total": 1,  # Single pass per WriteTask
+            "passes_completed": 1 if self.done and not self.exception else 0,
+            "current_pass": self.current_pass,
+            "peak_write_rate": f"{Utils.human(int(self.baseline_speed))}/s" if self.baseline_speed else None,
+            "worst_stall": Utils.ago_str(int(self.max_stall_secs)),
+            "worst_slowdown_ratio": round(self.max_slowdown_ratio, 1),
+            "errors": self.total_errors,
+            "reopen_count": self.reopen_count,
+        }
+
+
+class WriteZeroTask(WriteTask):
+    """Write zeros to disk"""
+
+    def get_buffer(self, chunk_size):
+        """Return zero buffer slice"""
+        return WipeTask.zero_buffer[:chunk_size]
+
+
+class WriteRandTask(WriteTask):
+    """Write random data to disk"""
+
+    def get_buffer(self, chunk_size):
+        """Return random buffer slice"""
+        return WipeTask.buffer[:chunk_size]
+
+
+class WipeJob:
+    """Handles disk/partition wiping operations with progress tracking
+
+    Note: Constants and buffers are now defined in WipeTask base class.
+    WipeJob uses WipeTask.BLOCK_SIZE, WipeTask.WRITE_SIZE, WipeTask.buffer, etc.
+    """
 
     @staticmethod
     def _get_dirty_kb():
@@ -221,8 +724,8 @@ class WipeJob:
                    # Partial/stopped wipe - resume from where it left off
                 resume_from = scrubbed
                 # Ensure we don't resume in the marker area
-                if resume_from < WipeJob.MARKER_SIZE:
-                    resume_from = WipeJob.MARKER_SIZE
+                if resume_from < WipeTask.MARKER_SIZE:
+                    resume_from = WipeTask.MARKER_SIZE
                 # Also ensure not past the end (sanity check)
                 if resume_from > total_size * getattr(opts, 'passes', 1):
                     resume_from = 0  # Start over if marker corrupted
@@ -616,11 +1119,11 @@ class WipeJob:
         if verify_status is not None:
             data["verify_status"] = verify_status
         json_data = json.dumps(data).encode('utf-8')
-        buffer = bytearray(self.MARKER_SIZE)  # Only 16KB, not 1MB
-        buffer[:self.STATE_OFFSET] = b'\x00' * self.STATE_OFFSET
-        buffer[self.STATE_OFFSET:self.STATE_OFFSET + len(json_data)] = json_data
-        remaining_size = self.MARKER_SIZE - (self.STATE_OFFSET + len(json_data))
-        buffer[self.STATE_OFFSET + len(json_data):] = b'\x00' * remaining_size
+        buffer = bytearray(WipeTask.MARKER_SIZE)  # Only 16KB, not 1MB
+        buffer[:WipeTask.STATE_OFFSET] = b'\x00' * WipeTask.STATE_OFFSET
+        buffer[WipeTask.STATE_OFFSET:WipeTask.STATE_OFFSET + len(json_data)] = json_data
+        remaining_size = WipeTask.MARKER_SIZE - (WipeTask.STATE_OFFSET + len(json_data))
+        buffer[WipeTask.STATE_OFFSET + len(json_data):] = b'\x00' * remaining_size
         return buffer
 
     def get_pass_pattern(self, pass_number, desired_mode):
@@ -702,7 +1205,7 @@ class WipeJob:
         try:
             with open(device_path, 'rb') as device:
                 # Skip past the marker area (first 16KB)
-                device.seek(WipeJob.WRITE_SIZE)
+                device.seek(WipeTask.WRITE_SIZE)
                 data = device.read(sample_size)
 
                 if not data:
@@ -748,15 +1251,15 @@ class WipeJob:
         try:
             with open(f'/dev/{device_name}', 'rb') as device:
                 device.seek(0)
-                buffer = device.read(WipeJob.MARKER_SIZE)
+                buffer = device.read(WipeTask.MARKER_SIZE)
         except Exception:
             return None  # cannot find info
 
-        if buffer[:WipeJob.STATE_OFFSET] != b'\x00' * (WipeJob.STATE_OFFSET):
+        if buffer[:WipeTask.STATE_OFFSET] != b'\x00' * (WipeTask.STATE_OFFSET):
             return None  # First 15 KB are not zeros
 
         # Extract JSON data from the next 1 KB Strip trailing zeros
-        json_data_bytes = buffer[WipeJob.STATE_OFFSET:WipeJob.MARKER_SIZE].rstrip(b'\x00')
+        json_data_bytes = buffer[WipeTask.STATE_OFFSET:WipeTask.MARKER_SIZE].rstrip(b'\x00')
 
         if not json_data_bytes:
             return None  # No JSON data found
@@ -822,9 +1325,9 @@ class WipeJob:
                     offset_in_pass = self.total_written % self.total_size
                     
                     # SKIP MARKER AREA - don't overwrite it!
-                    if offset_in_pass < self.MARKER_SIZE:
-                        self.total_written += self.MARKER_SIZE - offset_in_pass
-                        offset_in_pass = self.MARKER_SIZE
+                    if offset_in_pass < WipeTask.MARKER_SIZE:
+                        self.total_written += WipeTask.MARKER_SIZE - offset_in_pass
+                        offset_in_pass = WipeTask.MARKER_SIZE
 
                     # Determine pattern for this pass (alternating for multi-pass)
                     is_random_pass = self.get_pass_pattern(self.current_pass, desired_mode)
@@ -865,19 +1368,19 @@ class WipeJob:
       
                         # Calculate chunk size (must be block-aligned for O_DIRECT)
                         remaining = bytes_to_write_this_pass - pass_bytes_written
-                        chunk_size = min(WipeJob.WRITE_SIZE, remaining)
+                        chunk_size = min(WipeTask.WRITE_SIZE, remaining)
                         # Round down to block boundary
-                        chunk_size = (chunk_size // WipeJob.BLOCK_SIZE) * WipeJob.BLOCK_SIZE
+                        chunk_size = (chunk_size // WipeTask.BLOCK_SIZE) * WipeTask.BLOCK_SIZE
                         if chunk_size == 0:
                             break
 
                         # Select buffer based on pass type
                         if is_random_pass:
                             # Use slice of random buffer (still aligned via memoryview)
-                            chunk = WipeJob.buffer[:chunk_size]
+                            chunk = WipeTask.buffer[:chunk_size]
                         else:
                             # Use zero buffer
-                            chunk = WipeJob.zero_buffer[:chunk_size]
+                            chunk = WipeTask.zero_buffer[:chunk_size]
 
                         if self.opts.dry_run:
                             bytes_written = chunk_size
@@ -897,7 +1400,7 @@ class WipeJob:
 
                         # Periodically update marker for crash recovery (every 30s)
                         # Note: marker writes use separate buffered file handle
-                        if not self.opts.dry_run and self.total_written > self.MARKER_SIZE:
+                        if not self.opts.dry_run and self.total_written > WipeTask.MARKER_SIZE:
                             marker_is_random = (desired_mode == 'Rand')
                             self.maybe_update_marker(marker_is_random)
 
@@ -1033,7 +1536,7 @@ class WipeJob:
             SAMPLE_STEP = 23  # Sample every 23rd byte (~4% of data) - prime for even distribution
 
             # Skip marker area
-            marker_skip = WipeJob.BUFFER_SIZE
+            marker_skip = WipeTask.BUFFER_SIZE
             usable_size = self.total_size - marker_skip
             
             # Divide disk into 100 sections for sampling
@@ -1350,19 +1853,20 @@ class WipeJob:
 
 
 # Initialize the class-level buffers with mmap for O_DIRECT alignment
-if WipeJob.buffer is None:
+# Now using WipeTask base class for shared buffers
+if WipeTask.buffer is None:
     # Allocate random buffer with mmap (page-aligned for O_DIRECT)
-    WipeJob.buffer_mem = mmap.mmap(-1, WipeJob.BUFFER_SIZE,
+    WipeTask.buffer_mem = mmap.mmap(-1, WipeTask.BUFFER_SIZE,
                                    flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
-    raw_buffer = os.urandom(WipeJob.BUFFER_SIZE)
+    raw_buffer = os.urandom(WipeTask.BUFFER_SIZE)
     rebalanced = WipeJob._rebalance_buffer(raw_buffer)
-    WipeJob.buffer_mem.write(rebalanced)
-    WipeJob.buffer_mem.seek(0)
-    WipeJob.buffer = memoryview(WipeJob.buffer_mem)
+    WipeTask.buffer_mem.write(rebalanced)
+    WipeTask.buffer_mem.seek(0)
+    WipeTask.buffer = memoryview(WipeTask.buffer_mem)
 
     # Allocate zero buffer with mmap
-    WipeJob.zero_buffer_mem = mmap.mmap(-1, WipeJob.WRITE_SIZE,
+    WipeTask.zero_buffer_mem = mmap.mmap(-1, WipeTask.WRITE_SIZE,
                                         flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
-    WipeJob.zero_buffer_mem.write(b'\x00' * WipeJob.WRITE_SIZE)
-    WipeJob.zero_buffer_mem.seek(0)
-    WipeJob.zero_buffer = memoryview(WipeJob.zero_buffer_mem)
+    WipeTask.zero_buffer_mem.write(b'\x00' * WipeTask.WRITE_SIZE)
+    WipeTask.zero_buffer_mem.seek(0)
+    WipeTask.zero_buffer = memoryview(WipeTask.zero_buffer_mem)
