@@ -274,7 +274,13 @@ class DeviceInfo:
                         formatted = self._format_marker_string(marker_data, entry.size_bytes)
                         if formatted:
                             entry.marker = formatted
-                            entry.state = formatted.split()[0] if ' ' in formatted else 'W'
+                            # Extract state: if starts with verify symbol (✓ or ✗), state is 2nd element
+                            # Otherwise state is 1st element (W, s, etc.)
+                            parts = formatted.split()
+                            if parts and parts[0] in ('✓', '✗'):
+                                entry.state = parts[1] if len(parts) > 1 else 'W'
+                            else:
+                                entry.state = parts[0] if parts else 'W'
                             entry.dflt = entry.state
 
             # 5. Store THIS entry in the flat dict BEFORE processing children

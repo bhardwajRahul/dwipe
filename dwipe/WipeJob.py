@@ -1020,26 +1020,40 @@ class WipeJob:
 
         return bytes(result)
 
-    def __init__(self, device_path, total_size, opts=None, resume_from=0, resume_mode=None):
+    def __init__(self, device_path, total_size, opts=None, tasks=None):
+        """Initialize WipeJob as a task orchestrator
+
+        Args:
+            device_path: Path to device (e.g., '/dev/sda1')
+            total_size: Total size in bytes
+            opts: Options namespace
+            tasks: List of WipeTask instances to execute sequentially (if None, legacy mode)
+        """
         self.opts = opts if opts else SimpleNamespace(dry_run=False)
         self.device_path = device_path
         self.total_size = total_size
         self.do_abort = False
         self.thread = None
 
+        # Task orchestration (new)
+        self.tasks = tasks if tasks else []  # List of WipeTask instances
+        self.current_task = None  # Currently executing task
+        self.current_task_index = 0  # Index of current task
+
+        # Legacy attributes (kept for backwards compatibility)
         self.start_mono = time.monotonic()  # Track the start time
-        self.total_written = resume_from  # Start from resumed offset if resuming
-        self.resume_from = resume_from  # Track resume offset
-        self.resume_mode = resume_mode  # Original mode if resuming (overrides opts.wipe_mode)
+        self.total_written = 0  # Will be set by tasks
+        self.resume_from = 0  # Track resume offset
+        self.resume_mode = None  # Original mode if resuming (overrides opts.wipe_mode)
         self.wr_hists = []  # list of (mono, written)
         self.done = False
         self.exception = None  # in case of issues
 
-        # Multi-pass tracking
+        # Multi-pass tracking (legacy, now handled by task sequence)
         self.passes = getattr(opts, 'passes', 1)  # Total number of passes to perform
         self.current_pass = 0  # Current pass number (0-indexed)
 
-        # Verification tracking
+        # Verification tracking (proxied from verify tasks)
         self.verify_phase = False  # True when verifying
         self.verify_start_mono = None  # Start time of verify phase
         self.verify_progress = 0  # Bytes verified so far
@@ -1053,8 +1067,8 @@ class WipeJob:
         self.last_marker_update_mono = time.monotonic() - 25  # Last time we wrote progress marker
         self.marker_update_interval = 30  # Update marker every 30 seconds
 
-        ## SLOWDOWN / STALL DETECTION/ABORT FEATURE
-        ## 
+        ## SLOWDOWN / STALL DETECTION/ABORT FEATURE (proxied from tasks)
+        ##
         self.slowdown_stop = getattr(opts, 'slowdown_stop', 16)
         self.stall_timeout = getattr(opts, 'stall_timeout', 60)
         self.max_slowdown_ratio = 0
@@ -1064,13 +1078,13 @@ class WipeJob:
         self.baseline_end_mono = None  # When baseline measurement ended
             # Stall tracking
         self.last_progress_mono = time.monotonic()  # Last time we made progress
-        self.last_progress_written = resume_from  # Bytes written at last progress check
+        self.last_progress_written = 0  # Bytes written at last progress check
             # For periodic slowdown checks (every 10 seconds)
         self.last_slowdown_check = 0
             # Initialize write history for speed calculation
-        self.wr_hists.append(SimpleNamespace(mono=self.start_mono, written=resume_from))
-        
-        # ERROR ABORT FEATURE
+        self.wr_hists.append(SimpleNamespace(mono=self.start_mono, written=0))
+
+        # ERROR ABORT FEATURE (proxied from write tasks)
         self.max_consecutive_errors = 3 # a control
         self.max_total_errors = 100 # a control
         self.reopen_on_error = True # a control
@@ -1078,6 +1092,113 @@ class WipeJob:
         self.total_errors = 0 # cumulative
 
 
+
+    def run_tasks(self):
+        """Execute task sequence and update WipeJob state from tasks
+
+        This is the main orchestration method that runs each task in sequence.
+        It proxies task state to WipeJob attributes for backwards compatibility.
+        """
+        # Start abort flag sync thread
+        stop_sync = [False]
+
+        def sync_abort_flag():
+            """Continuously sync WipeJob.do_abort to current task"""
+            while not stop_sync[0]:
+                if self.current_task and not self.current_task.do_abort:
+                    self.current_task.do_abort = self.do_abort
+                time.sleep(0.1)  # Check every 100ms
+
+        sync_thread = threading.Thread(target=sync_abort_flag, daemon=True)
+        sync_thread.start()
+
+        try:
+            for i, task in enumerate(self.tasks):
+                # Skip already-completed tasks (from resume logic)
+                if task.done:
+                    continue
+
+                if self.do_abort:
+                    break
+
+                self.current_task = task
+                self.current_task_index = i
+
+                # Run the task
+                task.run_task()
+
+                # Check for task errors
+                if task.exception:
+                    self.exception = task.exception
+                    break
+
+                # Check if task was aborted (sync abort state)
+                if task.do_abort and not self.do_abort:
+                    self.do_abort = True
+                    break
+
+                # Proxy task state back to WipeJob for compatibility
+                # Write tasks
+                if isinstance(task, WriteTask):
+                    self.total_written = task.total_written
+                    self.max_slowdown_ratio = max(self.max_slowdown_ratio, task.max_slowdown_ratio)
+                    self.max_stall_secs = max(self.max_stall_secs, task.max_stall_secs)
+                    self.total_errors = task.total_errors
+                    self.reopen_count = task.reopen_count
+                    # Set expected pattern from write task
+                    if isinstance(task, WriteZeroTask):
+                        self.expected_pattern = "zeroed"
+                    elif isinstance(task, WriteRandTask):
+                        self.expected_pattern = "random"
+
+                # Verify tasks
+                elif isinstance(task, VerifyTask):
+                    self.verify_phase = True
+                    if self.verify_start_mono is None:
+                        self.verify_start_mono = task.start_mono
+                    self.verify_progress = task.total_written  # VerifyTask uses total_written for progress
+                    self.verify_pct = task.verify_pct
+                    # Extract verify result from task summary
+                    summary = task.get_summary_dict()
+                    self.verify_result = summary.get('result', None)
+
+        finally:
+            # Stop abort sync thread
+            stop_sync[0] = True
+            # Always mark as done when tasks complete
+            self.done = True
+            self.current_task = None
+
+    @staticmethod
+    def _get_pass_pattern_static(pass_number, total_passes, desired_mode):
+        """Static version of get_pass_pattern for use in start_job()
+
+        Determine what pattern to write for a given pass.
+
+        Args:
+            pass_number: 0-indexed pass number
+            total_passes: Total number of passes
+            desired_mode: 'Rand' or 'Zero' - the final desired pattern
+
+        Returns:
+            bool: True for random, False for zeros
+        """
+        if total_passes == 1:
+            # Single pass: just write desired pattern
+            return desired_mode == 'Rand'
+
+        # Multi-pass: alternate patterns, ending on desired
+        # Final pass is always desired pattern
+        if pass_number == total_passes - 1:
+            return desired_mode == 'Rand'
+
+        # Earlier passes: alternate, starting with opposite
+        if desired_mode == 'Rand':
+            # Even passes (0, 2, ...) = Zero, odd (1, 3, ...) = Rand
+            return pass_number % 2 == 1
+        else:
+            # Even passes (0, 2, ...) = Rand, odd (1, 3, ...) = Zero
+            return pass_number % 2 == 0
 
     @staticmethod
     def start_job(device_path, total_size, opts):
@@ -1145,9 +1266,57 @@ class WipeJob:
                         # Pattern matches - resume from current position
                         resume_from = scrubbed
 
-        job = WipeJob(device_path=device_path, total_size=total_size, opts=opts,
-                     resume_from=resume_from, resume_mode=resume_mode)
-        job.thread = threading.Thread(target=job.write_partition)
+        # Build task sequence
+        tasks = []
+        mode = getattr(opts, 'wipe_mode', 'Rand')
+        base_mode = mode.replace('+V', '')  # Remove verification suffix
+        auto_verify = '+V' in mode
+        passes = getattr(opts, 'passes', 1)
+
+        # Use resume_mode if resuming, otherwise use current mode
+        desired_mode = resume_mode if resume_mode else base_mode
+
+        # Build write task sequence (alternating patterns for multi-pass)
+        for pass_num in range(passes):
+            # Determine pattern for this pass
+            is_random = WipeJob._get_pass_pattern_static(pass_num, passes, desired_mode)
+
+            # Calculate pass offset and resume point
+            pass_start = pass_num * total_size
+            pass_resume = 0
+            if resume_from > pass_start:
+                # Resume within this pass
+                pass_resume = resume_from - pass_start
+
+            # Create appropriate write task
+            if is_random:
+                task = WriteRandTask(device_path, total_size, opts,
+                                    resume_from=pass_resume, pass_number=pass_num)
+            else:
+                task = WriteZeroTask(device_path, total_size, opts,
+                                    resume_from=pass_resume, pass_number=pass_num)
+            tasks.append(task)
+
+            # If we haven't reached the resume point yet, skip this task
+            if resume_from >= (pass_num + 1) * total_size:
+                # This pass is already complete, mark task as done
+                task.done = True
+                task.total_written = total_size
+
+        # Add auto-verification task if requested
+        if auto_verify:
+            verify_pct = getattr(opts, 'verify_pct', 2)
+            if desired_mode == 'Rand':
+                task = VerifyRandTask(device_path, total_size, opts, verify_pct=verify_pct)
+            else:
+                task = VerifyZeroTask(device_path, total_size, opts, verify_pct=verify_pct)
+            tasks.append(task)
+
+        # Create WipeJob with task sequence
+        job = WipeJob(device_path=device_path, total_size=total_size, opts=opts, tasks=tasks)
+        job.resume_from = resume_from
+        job.resume_mode = resume_mode
+        job.thread = threading.Thread(target=job.run_tasks)
         job.thread.start()
         return job
 
@@ -1161,44 +1330,43 @@ class WipeJob:
             opts: Options namespace with verify_pct
             expected_pattern: "zeroed", "random", or None (auto-detect)
         """
-        job = WipeJob(device_path=device_path, total_size=total_size, opts=opts)
-        job.is_verify_only = True  # Mark as standalone verification job
-        job.expected_pattern = expected_pattern
+        # Read existing marker to determine expected pattern if not specified
+        device_name = os.path.basename(device_path)
+        existing_marker = WipeJob.read_marker_buffer(device_name)
+        if existing_marker and expected_pattern is None:
+            expected_pattern = "random" if existing_marker.mode == 'Rand' else "zeroed"
+
         verify_pct = getattr(opts, 'verify_pct', 0)
         if verify_pct == 0:
             verify_pct = 2  # Default to 2% if not set
 
-        # Initialize verify state BEFORE starting thread to avoid showing "0%"
-        job.verify_pct = verify_pct
-        job.verify_start_mono = time.monotonic()
-        job.verify_progress = 0
-        job.wr_hists = [SimpleNamespace(mono=job.verify_start_mono, written=0)]
-        job.verify_phase = True  # Set before thread starts
+        # Create verify task
+        tasks = []
+        if expected_pattern == "random":
+            task = VerifyRandTask(device_path, total_size, opts, verify_pct=verify_pct)
+        else:
+            task = VerifyZeroTask(device_path, total_size, opts, verify_pct=verify_pct)
+        tasks.append(task)
+
+        # Create WipeJob with verify task
+        job = WipeJob(device_path=device_path, total_size=total_size, opts=opts, tasks=tasks)
+        job.is_verify_only = True
+        job.expected_pattern = expected_pattern
+        job.verify_phase = True
 
         def verify_runner():
             try:
-                # Read existing marker to determine the mode and expected pattern
-                device_name = os.path.basename(device_path)
-                existing_marker = WipeJob.read_marker_buffer(device_name)
-                if existing_marker:
-                    # Infer expected pattern from marker if not already set
-                    if job.expected_pattern is None:
-                        job.expected_pattern = "random" if existing_marker.mode == 'Rand' else "zeroed"
-
-                job.verify_partition(verify_pct)
+                # Run the verify task
+                job.run_tasks()
 
                 # Write marker with verification status
                 if existing_marker:
                     is_random = existing_marker.mode == 'Rand'
                     job._write_marker_with_verify_status(is_random)
-                    # Note: _write_marker_with_verify_status sets job.done in its finally block
-                else:
-                    # No marker - just mark as done
-                    job.done = True
             except Exception:
                 job.exception = traceback.format_exc()
             finally:
-                # ALWAYS ensure job is marked as done, even if exception or early return
+                # ALWAYS ensure job is marked as done
                 if not job.done:
                     job.done = True
 
@@ -1280,6 +1448,11 @@ class WipeJob:
         - Flushing phase: 100% FLUSH while kernel syncs to device
         - Verify phase (v0-v100%): elapsed/rate/eta for verification only
         """
+        # NEW: Proxy to current task if using task-based architecture
+        if self.current_task is not None:
+            return self.current_task.get_status()
+
+        # LEGACY: Original implementation for backwards compatibility
         pct_str, rate_str, when_str = '', '', ''
         mono = time.monotonic()
 
@@ -1413,6 +1586,31 @@ class WipeJob:
         Returns:
             dict: Summary with top-level aggregates and per-step details
         """
+        # NEW: Aggregate task summaries if using task-based architecture
+        if self.tasks:
+            mono = time.monotonic()
+            total_elapsed = mono - self.start_mono
+
+            # Aggregate all task summaries
+            steps = []
+            total_errors = 0
+            for task in self.tasks:
+                task_summary = task.get_summary_dict()
+                steps.append(task_summary)
+                total_errors += task_summary.get('errors', 0)
+
+            # Build top-level summary
+            summary = {
+                "result": "stopped" if self.do_abort else "completed",
+                "total_elapsed": Utils.ago_str(int(total_elapsed)),
+                "total_errors": total_errors,
+                "pct_complete": 100.0 if self.done and not self.do_abort else 0.0,
+                "resumed_from_bytes": self.resume_from,
+                "steps": steps,
+            }
+            return summary
+
+        # LEGACY: Original implementation for backwards compatibility
         mono = time.monotonic()
         write_elapsed = mono - self.start_mono
 
