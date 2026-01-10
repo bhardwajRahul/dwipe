@@ -274,7 +274,7 @@ class DeviceInfo:
                         formatted = self._format_marker_string(marker_data, entry.size_bytes)
                         if formatted:
                             entry.marker = formatted
-                            entry.state = formatted.split()[1] if ' ' in formatted else 'W'
+                            entry.state = formatted.split()[0] if ' ' in formatted else 'W'
                             entry.dflt = entry.state
 
             # 5. Store THIS entry in the flat dict BEFORE processing children
