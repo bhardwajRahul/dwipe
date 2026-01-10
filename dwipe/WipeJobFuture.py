@@ -39,11 +39,11 @@ class MaybeSomeDay:
         """Throttle write speed to specified maximum"""
         if self.max_speed_mbps <= 0:
             return
-        
+
         elapsed = time.monotonic() - start_time
         if elapsed <= 0:
             return
-        
+
         actual_speed_mbps = (bytes_written / (1024 * 1024)) / elapsed
         if actual_speed_mbps > self.max_speed_mbps:
             # Calculate how long to sleep to hit target speed
@@ -208,7 +208,7 @@ class MaybeSomeDay:
             elif pattern == 'ones':
                 # Special pattern: all ones (0xFF)
                 return 'ones'
-        
+
         # Fall back to standard pattern
         mode_to_use = self.resume_mode if self.resume_mode else self.opts.wipe_mode.replace('+V', '')
         return self.get_pass_pattern(pass_number, mode_to_use)

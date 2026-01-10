@@ -83,7 +83,7 @@ Features added since V2 deployed (may not be in latest demo):
 
 
 > **Note:** `dwipe` shows file system labels, and if not available, the partition label. It is best practice to label partitions and file systems well to make selection easier.
-  
+
 ## Usage
 
 Simply run `dwipe` from the command line without arguments: `dwipe`

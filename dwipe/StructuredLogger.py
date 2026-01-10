@@ -158,7 +158,7 @@ class StructuredLogger:
             'entries_written': 0,
             'last_trim': datetime.now()
         }
-    
+
     def _fix_ownership(self, path: Path) -> None:
         """Fix file/directory ownership to real user when running with sudo."""
         real_user = os.environ.get('SUDO_USER')
@@ -193,7 +193,7 @@ class StructuredLogger:
             # Fallback to current directory
             self.log_dir = Path.cwd()
             self.log_file = Path("events.jsonl")
-    
+
     def _get_caller_info(self, depth: int = 3) -> tuple:
         """Get caller information from stack frame."""
         try:
@@ -201,7 +201,7 @@ class StructuredLogger:
             for _ in range(depth):
                 if frame:
                     frame = frame.f_back
-            
+
             if frame:
                 return (
                     Path(frame.f_code.co_filename).name,
@@ -212,15 +212,15 @@ class StructuredLogger:
         except Exception:
             pass
         return ("unknown", 0, "unknown", "")
-    
-    def _create_log_entry(self, level: str, *args, 
+
+    def _create_log_entry(self, level: str, *args,
                          data: Optional[Dict] = None,
                          **kwargs) -> LogEntry:
         """Create a structured log entry."""
         file, line, function, module = self._get_caller_info()
         timestamp = datetime.now().isoformat()
         message = " ".join(str(arg) for arg in args)
-        
+
         return LogEntry(
             timestamp=timestamp,
             level=level,
@@ -233,7 +233,7 @@ class StructuredLogger:
             session_id=self.session_id,
             _raw=message
         )
-    
+
     def _append_log(self, entry: LogEntry) -> None:
         """
         Append entry to log file, trimming if necessary.
@@ -321,8 +321,8 @@ class StructuredLogger:
 
         except Exception as e:
             print(f"TRIM ERROR: {e}", file=sys.stderr)
-    
-    
+
+
     # ========================================================================
     # Public API
     # ========================================================================

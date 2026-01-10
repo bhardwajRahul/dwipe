@@ -275,9 +275,11 @@ class DiskWipe:
             self.filter = None
             self.prev_filter = ''
         self.win.passthrough_mode = False
-        
+
     def get_hw_caps_when_needed(self):
         """ Look for wipeable disks w/o hardware info """
+        if not self.dev_info:
+            return
         for  ns in self.partitions.values():
             if ns.parent:
                 continue
@@ -287,7 +289,8 @@ class DiskWipe:
                 continue
             if ns.hw_nopes or ns.hw_caps:  # already done
                 continue
-            self.dev_info.get_hw_capabilities(ns)
+            if self.test_state(ns, to='0%'):
+                self.dev_info.get_hw_capabilities(ns)
 
 
     def main_loop(self):
@@ -405,11 +408,13 @@ class MainScreen(DiskWipeScreen):
     def _port_serial_line(self, partition):
         wids = self.app.wids
         wid = wids.state if wids else 5
-        sep, more = '  ', ''
+        sep, key_str = '  ', ''
         port, serial = partition.port, partition.serial
         if partition.hw_caps or partition.hw_nopes:
-            more = f' {partition.hw_caps}' if partition.hw_caps else f' {partition.hw_nopes}'
-        return f'{"":>{wid}}{sep}│   └────── {port:<12} {serial} {more}'
+            lead = 'CAPS' if partition.hw_caps else 'ERRS'
+            infos = partition.hw_caps if partition.hw_caps else partition.hw_nopes
+            key_str = f'   Fw{lead}: ' + ','.join(list(infos.keys()))
+        return f'{"":>{wid}}{sep}│   └────── {port:<12} {serial}{key_str}'
 
     def draw_screen(self):
         """Draw the main device list"""

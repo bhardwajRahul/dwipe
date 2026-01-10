@@ -475,50 +475,50 @@ class WipeJob:
         """Check for stall (no progress) - called frequently"""
         if self.stall_timeout <= 0:
             return False
-        
+
         time_since_progress = current_monotonic - self.last_progress_mono
         self.max_stall_secs = max(time_since_progress, self.max_stall_secs)
         if time_since_progress >= self.stall_timeout:
             self.do_abort = True
             self.exception = f"Stall detected: No progress for {time_since_progress:.1f} seconds"
             return True
-        
+
         return False
 
     def _check_for_slowdown(self, current_monotonic):
         """Check for slowdown - called every 10 seconds"""
         if self.slowdown_stop <= 0 or self.baseline_speed is None or self.baseline_speed <= 0:
             return False
-        
+
         # Calculate current speed over last 30 seconds
         floor = current_monotonic - 30
         recent_history = [h for h in self.wr_hists if h.mono >= floor]
-        
+
         if len(recent_history) >= 2:
             recent_start = recent_history[0]
             recent_written = self.total_written - recent_start.written
             recent_elapsed = current_monotonic - recent_start.mono
-            
+
             if recent_elapsed > 1.0:
                 current_speed = recent_written / recent_elapsed
                 self.baseline_speed = max(self.baseline_speed, current_speed)
                 slowdown_ratio = self.baseline_speed / max(current_speed, 1)
                 slowdown_ratio = int(round(slowdown_ratio, 0))
                 self.max_slowdown_ratio = max(self.max_slowdown_ratio, slowdown_ratio)
-                
+
                 if slowdown_ratio > self.slowdown_stop:
                     self.do_abort = True
                     self.exception = (f"Slowdown abort: ({Utils.human(current_speed)}B/s)"
                                      f" is 1/{slowdown_ratio} baseline")
                     return True
-        
+
         return False
 
     def _update_baseline_if_needed(self, current_monotonic):
         """Update baseline speed measurement if still in first 60 seconds"""
         if self.baseline_speed is not None:
             return  # Baseline already established
-        
+
         if (current_monotonic - self.start_mono) >= 60:
             total_written_60s = self.total_written - self.resume_from
             elapsed_60s = current_monotonic - self.start_mono
@@ -1011,7 +1011,7 @@ class WipeJob:
                     # Calculate current pass and offset within pass
                     self.current_pass = self.total_written // self.total_size
                     offset_in_pass = self.total_written % self.total_size
-                    
+
                     # SKIP MARKER AREA - don't overwrite it!
                     if offset_in_pass < WipeTask.MARKER_SIZE:
                         self.total_written += WipeTask.MARKER_SIZE - offset_in_pass
@@ -1036,11 +1036,11 @@ class WipeJob:
 
                         # Update baseline if needed (first 60 seconds)
                         self._update_baseline_if_needed(current_mono)
-                        
+
                         # Check for stall (frequently)
                         if self._check_for_stall(current_mono):
                             break
-                        
+
                         # Check for slowdown (every 10 seconds)
                         if self.baseline_speed is not None:
                             time_since_last_check = current_mono - self.last_slowdown_check
@@ -1048,12 +1048,12 @@ class WipeJob:
                                 if self._check_for_slowdown(current_mono):
                                     break
                                 self.last_slowdown_check = current_mono
-                        
+
                         # Update progress tracking
                         if self.total_written > self.last_progress_written:
                             self.last_progress_mono = current_mono
 
-      
+
                         # Calculate chunk size (must be block-aligned for O_DIRECT)
                         remaining = bytes_to_write_this_pass - pass_bytes_written
                         chunk_size = min(WipeTask.WRITE_SIZE, remaining)
@@ -1134,13 +1134,13 @@ class WipeJob:
 
     def safe_write(self, fd, chunk):
         """Safe write with error recovery.
-        
+
         Returns:
             tuple: (bytes_written, fd) - bytes_written is either:
                    - Actual bytes written (success)
                    - len(chunk) (failed but non-fatal - skip entire chunk)
                    fd might be new if reopened
-        
+
         Raises:
             Exception: If should abort (too many consecutive errors)
         """
@@ -1150,7 +1150,7 @@ class WipeJob:
                 bytes_written = os.write(fd, chunk)
                 self.reopen_count = 0
                 return bytes_written, fd # success
-                
+
             except Exception as e:
                 consecutive_errors += 1
                 self.total_errors += 1
@@ -1206,10 +1206,10 @@ class WipeJob:
 
         # Fast-fail for zeros
         fast_fail_zeros = (self.expected_pattern == "zeroed")
-        
+
         # For unmarked disks: track if ALL bytes are zero
         all_zeros = (self.expected_pattern is None)
-        
+
         # Track section results for debugging
         self.section_results = []  # Store (section_idx, result, stats)
 
@@ -1226,7 +1226,7 @@ class WipeJob:
             # Skip marker area
             marker_skip = WipeTask.BUFFER_SIZE
             usable_size = self.total_size - marker_skip
-            
+
             # Divide disk into 100 sections for sampling
             num_sections = 100
             section_size = usable_size // num_sections
@@ -1286,7 +1286,7 @@ class WipeJob:
                     # --------------------------------------------------
                     # SECTION ANALYSIS
                     # --------------------------------------------------
-                    
+
                     # FAST zero check for zeroed pattern
                     if fast_fail_zeros:
                         # Ultra-fast: compare against pre-allocated zero pattern
@@ -1306,12 +1306,12 @@ class WipeJob:
                     # Use memoryview for fast slicing
                     mv = memoryview(data)
                     data_len = len(data)
-                    
+
                     # Sample every SAMPLE_STEP-th byte
                     for i in range(0, data_len, SAMPLE_STEP):
                         section_byte_counts[mv[i]] += 1
                         section_samples += 1
-                    
+
                     # --------------------------------------------------
                     # END SECTION ANALYSIS
                     # --------------------------------------------------
@@ -1328,7 +1328,7 @@ class WipeJob:
                     # Already passed zero check if we got here
                     section_result = "zeroed"
                     section_stats = {}
-                    
+
                 elif all_zeros:
                     if not section_found_nonzero:
                         section_result = "zeroed"
@@ -1338,15 +1338,15 @@ class WipeJob:
                         section_result, section_stats = self._analyze_section_randomness(
                             section_byte_counts, section_samples
                         )
-                        
+
                 else:  # Expected random
                     section_result, section_stats = self._analyze_section_randomness(
                         section_byte_counts, section_samples
                     )
-                
+
                 # Store section result
                 self.section_results.append((section_idx, section_result, section_stats))
-                
+
                 # Check if section failed
                 if (self.expected_pattern == "random" and section_result != "random") or \
                    (self.expected_pattern == "zeroed" and section_result != "zeroed") or \
@@ -1371,7 +1371,7 @@ class WipeJob:
                     zeroed_sections = sum(1 for _, result, _ in self.section_results if result == "zeroed")
                     random_sections = sum(1 for _, result, _ in self.section_results if result == "random")
                     total_checked = len([r for _, r, _ in self.section_results if r != "skipped"])
-                    
+
                     if zeroed_sections == total_checked:
                         self.verify_result = "zeroed"
                         self.expected_pattern = "zeroed"
@@ -1390,7 +1390,7 @@ class WipeJob:
                     # Determine from section consensus
                     zeroed_sections = sum(1 for _, result, _ in self.section_results if result == "zeroed")
                     random_sections = sum(1 for _, result, _ in self.section_results if result == "random")
-                    
+
                     if zeroed_sections > random_sections:
                         self.verify_result = "zeroed"
                         self.expected_pattern = "zeroed"
@@ -1411,7 +1411,7 @@ class WipeJob:
         """Analyze if a section appears random"""
         if total_samples < 100:
             return "insufficient-data", {"samples": total_samples}
-        
+
         # Calculate statistics
         max_count = max(byte_counts)
         max_freq = max_count / total_samples
@@ -1421,7 +1421,7 @@ class WipeJob:
 
         # Count completely unused bytes
         unused_bytes = sum(1 for count in byte_counts if count == 0)
-        
+
         # Calculate expected frequency and variance
         expected = total_samples / 256
         if expected > 0:
@@ -1431,19 +1431,19 @@ class WipeJob:
             cv = std_dev / expected
         else:
             cv = float('inf')
-        
+
         # Decision logic for "random"
         # Good random data should:
         # 1. Use most byte values (>200 unique)
         # 2. No single byte dominates (<2% frequency)
         # 3. Relatively even distribution (CV < 2.0)
         # 4. Not too many zeros (if it's supposed to be random, not zeroed)
-        
+
         is_random = (unique_bytes > 200 and      # >78% of bytes used
                      max_freq < 0.02 and         # No byte > 2%
                      cv < 2.0 and               # Not too lumpy
                      byte_counts[0] / total_samples < 0.5)  # Not mostly zeros
-        
+
         stats = {
             "samples": total_samples,
             "max_freq": max_freq,
@@ -1452,7 +1452,7 @@ class WipeJob:
             "cv": cv,
             "zero_freq": byte_counts[0] / total_samples if total_samples > 0 else 0
         }
-        
+
         if is_random:
             return "random", stats
         else:

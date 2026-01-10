@@ -1,6 +1,11 @@
 """
 DeviceInfo class for device discovery and information management
 """
+# pylint: disable=invalid-name,broad-exception-caught
+# pylint: disable=line-too-long,too-many-locals,too-many-branches
+# pylint: disable=too-many-return-statements,too-many-nested-blocks
+# pylint: disable=too-many-statements
+
 import os
 import re
 import json
@@ -8,13 +13,14 @@ import subprocess
 import time
 import datetime
 import curses
+import traceback
 from fnmatch import fnmatch
 from types import SimpleNamespace
+from console_window import Theme
+
 from .WipeJob import WipeJob
 from .Utils import Utils
 from .DrivePreChecker import DrivePreChecker
-
-from console_window import Theme
 # from .PersistentState import PersistentState
 
 
@@ -30,34 +36,6 @@ class DeviceInfo:
         self.head_str = None
         self.partitions = None
         self.persistent_state = persistent_state
-        self._lsblk_columns = None
-        self._do_discover_lsblk_columns = True
-
-    def _get_supported_columns(self):
-        """Probe lsblk once to see which columns it supports."""
-        # Absolute essentials
-        base = ['name', 'maj:min', 'fstype', 'type', 'label', 'partlabel', 
-                'size', 'mountpoints', 'uuid', 'partuuid', 'serial', 'model']
-        
-        # Modern columns to test
-        extras = ['tran', 'id-path']
-        supported = list(base)
-        
-        for col in extras:
-            try:
-                # Test column support with a dummy call
-                res = subprocess.run(['lsblk', '-o', col], 
-                         check=False, capture_output=True, text=True)
-                if res.returncode == 0:
-                    supported.append(col)
-            except Exception:
-                continue
-                
-        self._lsblk_columns = ",".join(supported)
-        self._do_discover_lsblk_columns = False
-        if self.DB:
-            print(f"DB: lsblk columns discovered: {self._lsblk_columns}")
-        return self._lsblk_columns
 
     @staticmethod
     def _make_partition_namespace(major, name, size_bytes, dflt):
@@ -80,7 +58,7 @@ class DeviceInfo:
                                serial='',      # disk serial number (for whole disks)
                                port='',        # port (for whole disks)
                                hw_caps={},      # hw_wipe capabilities (for whole disks)
-                               hw_nopes=[],   # hw reasons cannot do hw wipe
+                               hw_nopes={},   # hw reasons cannot do hw wipe
                                )
 
     def get_hw_capabilities(self, ns):
@@ -93,83 +71,63 @@ class DeviceInfo:
             return ns.hw_caps, ns.hw_nopes
 
         # Initialize defaults
-        ns.hw_caps = {}
-        ns.hw_nopes = []
-
-#       # 2. Basic Pre-Flight: Is it a disk? Is it busy?
-#       if ns.type != 'disk':
-#           ns.hw_nopes.append("Not a physical disk")
-#           return ns.hw_caps, ns.hw_nopes
-
-#       if ns.state == 'Mnt' or ns.mounts:
-#           ns.hw_nopes.append("Drive has active mounts")
-#           return ns.hw_caps, ns.hw_nopes
-
-#       # 3. Port Check: USB Safety
-#       # We use the port string we worked so hard to get earlier
-#       if ns.port and "USB" in ns.port:
-#           ns.hw_nopes.append("USB bridges are unsafe for FW wipes")
-#           return ns.hw_caps, ns.hw_nopes
+        ns.hw_caps, ns.hw_nopes = {}, {}
 
         # 4. Perform the actual Probe
         dev_path = f"/dev/{ns.name}"
-        
-        if "nvme" in ns.name:
+        if ns.name.startswith('nv'):
             result = self.checker.check_nvme_drive(dev_path)
-        else:
+        elif ns.name.startswith('sd'):
             result = self.checker.check_ata_drive(dev_path)
-
         # 5. Store Results
-        ns.hw_caps = result.modes
-        ns.hw_nopes = result.issues
-
+        ns.hw_caps, ns.hw_nopes = result.modes, result.issues
         return ns.hw_caps, ns.hw_nopes
 
-
     def _get_port_from_sysfs(self, device_name):
-        """ TBD """
         try:
             sysfs_path = f'/sys/class/block/{device_name}'
+            if not os.path.exists(sysfs_path):
+                return ''
+
             real_path = os.path.realpath(sysfs_path).lower()
 
-            # 1. USB - Capture the specific bus/port (e.g., 2-3)
+            # 1. USB - Format: USB:1-1.4
             if '/usb' in real_path:
-                # Matches the '2-3' in .../usb2/2-3/2-3:1.0/...
                 usb_match = re.search(r'/(\d+-\d+(?:\.\d+)*):', real_path)
-                return f"USB:{usb_match.group(1)}" if usb_match else "USB"
+                if usb_match:
+                    return f"USB:{usb_match.group(1)}"
 
-            # 2. SATA - Capture the host number (e.g., SATA:1)
+            # 2. SATA - Format: SATA:1
             elif '/ata' in real_path:
-                # Matches the '1' in .../ata1/host1/...
                 ata_match = re.search(r'ata(\d+)', real_path)
-                return f"SATA:{ata_match.group(1)}" if ata_match else "SATA"
+                if ata_match:
+                    return f"SATA:{ata_match.group(1)}"
 
-            # 3. NVMe - Capture the PCI slot
+            # 3. NVMe - Format: PCI:1b.0 (Stripped of 0000:00: noise)
             elif '/nvme' in real_path:
+                # This regex ignores the 4-digit domain and the first 2-digit bus
                 pci_match = re.search(r'0000:[0-9a-f]{2}:([0-9a-f]{2}\.[0-9a-f])', real_path)
-                return f"PCI:{pci_match.group(1)}" if pci_match else "NVMe"
+                if pci_match:
+                    return f"PCI:{pci_match.group(1)}"
+                return "NVMe"
 
-        except Exception:
-            pass
-        return ''
+            # 4. MMC/eMMC - Format: MMC:0 or PCI:1a.0 (if PCI-attached)
+            elif '/mmc' in real_path:
+                # Try to extract mmc host number
+                mmc_match = re.search(r'/mmc_host/mmc(\d+)', real_path)
+                if mmc_match:
+                    return f"MMC:{mmc_match.group(1)}"
+                # Fallback: try to get PCI address if available
+                pci_match = re.search(r'0000:[0-9a-f]{2}:([0-9a-f]{2}\.[0-9a-f])', real_path)
+                if pci_match:
+                    return f"PCI:{pci_match.group(1)}"
+                return "MMC"
 
-    def _get_port_info(self, device):
-        """
-        Uses lsblk for the protocol (TRAN), but relies on sysfs 
-        to get the specific port/socket number.
-        """
-        name = device.get('name') or ''
-        # Get the detailed string (e.g., "SATA:1" or "USB:2-3")
-        sysfs_port = self._get_port_from_sysfs(name)
-        
-        if sysfs_port:
-            return sysfs_port
-
-        # Fallback: if sysfs failed but lsblk has transport info
-        tran = (device.get('tran') or '').upper()
-        if tran:
-            return tran # Returns "USB", "SATA", "NVME" etc.
-            
+        except Exception as e:
+            # Log exception to file for debugging
+            with open('/tmp/dwipe_port_debug.log', 'a', encoding='utf-8') as f:
+                f.write(f"Exception in _get_port_from_sysfs({device_name}): {e}\n")
+                traceback.print_exc(file=f)
         return ''
 
     @staticmethod
@@ -191,129 +149,145 @@ class DeviceInfo:
         rv = f'{get_str(device_name, "model")}'
         return rv.strip()
 
-
-    def _format_marker_string(self, marker, entry_size):
-        """Converts raw marker data into the UI string (e.g., '✓ W 100% Zero 2026/01/05')"""
-        now = int(round(time.time()))
-        if not (marker and marker.size_bytes == entry_size and marker.unixtime < now):
-            return None
-
-        # Calculate completion percentage
-        pct = min(100, int(round((marker.scrubbed_bytes / marker.size_bytes) * 100)))
-        state = 'W' if pct >= 100 else 's'
-        
-        # Format Date
-        dt = datetime.datetime.fromtimestamp(marker.unixtime)
-        date_str = dt.strftime("%Y/%m/%d %H:%M")
-        
-        # Verification Prefix
-        verify_prefix = ''
-        verify_status = getattr(marker, 'verify_status', None)
-        if verify_status == 'pass':
-            verify_prefix = '✓ '
-        elif verify_status == 'fail':
-            verify_prefix = '✗ '
-
-        return f'{verify_prefix}{state} {pct}% {marker.mode} {date_str}'
-
     def parse_lsblk(self, dflt, prev_nss=None):
-        """ PARSE lsblk output """
+        """Parse ls_blk for all the goodies we need"""
+        def eat_one(device):
+            entry = self._make_partition_namespace(0, '', '', dflt)
+            entry.name = device.get('name', '')
+            maj_min = device.get('maj:min', (-1, -1))
+            wds = maj_min.split(':', maxsplit=1)
+            entry.major = -1
+            if len(wds) > 0:
+                entry.major = int(wds[0])
+            entry.fstype = device.get('fstype', '')
+            if entry.fstype is None:
+                entry.fstype = ''
+            entry.type = device.get('type', '')
+            entry.label = device.get('label', '')
+            if not entry.label:
+                entry.label = device.get('partlabel', '')
+            if entry.label is None:
+                entry.label = ''
+            entry.size_bytes = int(device.get('size', 0))
 
-        cols = self._lsblk_columns if not self._do_discover_lsblk_columns else self._get_supported_columns()
+            # Get UUID - prefer PARTUUID for partitions, UUID for filesystems
+            entry.uuid = device.get('partuuid', '') or device.get('uuid', '') or ''
+            entry.serial = device.get('serial', '') or ''
 
-        try:
-            result = subprocess.run(['lsblk', '-J', '--bytes', '-o', cols],
-                                   capture_output=True, text=True, timeout=10.0, check=True)
-            parsed_data = json.loads(result.stdout)
-        except Exception:
-            return prev_nss or {}
+            mounts = device.get('mountpoints', [])
+            while len(mounts) >= 1 and mounts[0] is None:
+                del mounts[0]
+            entry.mounts = mounts
 
-        # The flat dictionary that the UI actually uses
-        entries = {}
+            # Check if we should read the marker (3-state model: dont-know, got-marker, no-marker)
+            # Read marker ONCE when:
+            # 1. Not mounted
+            # 2. No filesystem (fstype/label empty)
+            # 3. No active job
+            # 4. Haven't checked yet (marker_checked=False)
+            has_job = prev_nss and entry.name in prev_nss and getattr(prev_nss[entry.name], 'job', None) is not None
+            has_filesystem = entry.fstype or entry.label
 
-        def process_node(device, parent_name=None):
-            name = device.get('name', '')
-            if not name: 
-                return None
-            
-            # 1. Create the basic namespace entry
-            entry = self._make_partition_namespace(0, name, int(device.get('size', 0)), dflt)
-            
-            # 2. Fill standard fields
-            maj_min = (device.get('maj:min') or '0:0').split(':')
-            entry.major = int(maj_min[0])
-            entry.fstype = device.get('fstype') or ''
-            entry.type = device.get('type') or ''
-            entry.label = device.get('label') or device.get('partlabel') or ''
-            entry.uuid = device.get('partuuid') or device.get('uuid') or ''
-            entry.serial = device.get('serial') or ''
-            entry.mounts = [m for m in device.get('mountpoints', []) if m]
-            entry.parent = parent_name
-            entry.minors = [] # Initialize empty for recursion
+            # Inherit marker_checked from previous scan, or False if new/changed
+            prev_had_filesystem = (prev_nss and entry.name in prev_nss and
+                                   (prev_nss[entry.name].fstype or prev_nss[entry.name].label))
+            filesystem_changed = prev_had_filesystem != bool(has_filesystem)
 
-            # 3. Hardware Discovery (Only for top-level disks)
-            if entry.type == 'disk':
-                # Guard against None values from JSON
-                raw_model = device.get('model') or ''
-                entry.model = raw_model.strip()
-                # If model is still empty, try the fallback
-                if not entry.model:
-                    entry.model = self._get_device_vendor_model(entry.name)
-                entry.port = self._get_port_info(device)
-            
-            # 4. Marker Logic
-            has_job = prev_nss and name in prev_nss and getattr(prev_nss[name], 'job', None)
-            if not entry.mounts and not (entry.fstype or entry.label) and not has_job:
-                if prev_nss and name in prev_nss:
-                    entry.marker_checked = prev_nss[name].marker_checked
-                
-                if not entry.marker_checked:
-                    entry.marker_checked = True
-                    marker_data = WipeJob.read_marker_buffer(entry.name)
-                    if marker_data:
-                        formatted = self._format_marker_string(marker_data, entry.size_bytes)
-                        if formatted:
-                            entry.marker = formatted
-                            # Extract state: if starts with verify symbol (✓ or ✗), state is 2nd element
-                            # Otherwise state is 1st element (W, s, etc.)
-                            parts = formatted.split()
-                            if parts and parts[0] in ('✓', '✗'):
-                                entry.state = parts[1] if len(parts) > 1 else 'W'
-                            else:
-                                entry.state = parts[0] if parts else 'W'
-                            entry.dflt = entry.state
+            if prev_nss and entry.name in prev_nss and not filesystem_changed:
+                entry.marker_checked = prev_nss[entry.name].marker_checked
 
-            # 5. Store THIS entry in the flat dict BEFORE processing children
-            entries[name] = entry
+            # Read marker if haven't checked yet and safe to do so
+            should_read_marker = (not mounts and not has_filesystem and not has_job and
+                                  not entry.marker_checked)
 
-            # 6. Recurse through children (Partitions/LVM)
-            children = device.get('children', [])
-            for child in children:
-                child_entry = process_node(child, name)
-                if child_entry:
-                    entry.minors.append(child_entry.name)
-                    # Propagate "Mnt" state upward to the disk
-                    if child_entry.state == 'Mnt':
-                        entry.state = 'Mnt'
-
-            # 7. Superfloppy Logic (Post-child check)
-            if entry.type == 'disk' and not entry.minors and (entry.fstype or entry.label or entry.mounts):
-                v_name = f"{name}_data"
-                v_child = self._make_partition_namespace(entry.major, "----", entry.size_bytes, dflt)
-                v_child.parent = name
-                v_child.fstype, v_child.label, v_child.mounts = entry.fstype, entry.label, entry.mounts
-                if entry.mounts: v_child.state = 'Mnt'
-                
-                entries[v_name] = v_child
-                entry.minors.append(v_name)
-                entry.fstype = entry.model or 'DISK'
-                entry.label, entry.mounts = '', []
+            if should_read_marker:
+                entry.marker_checked = True  # Mark as checked regardless of result
+                marker = WipeJob.read_marker_buffer(entry.name)
+                now = int(round(time.time()))
+                if (marker and marker.size_bytes == entry.size_bytes
+                        and marker.unixtime < now):
+                    # For multi-pass wipes, scrubbed_bytes can exceed size_bytes
+                    # Calculate completion percentage (capped at 100%)
+                    pct = min(100, int(round((marker.scrubbed_bytes / marker.size_bytes) * 100)))
+                    state = 'W' if pct >= 100 else 's'
+                    dt = datetime.datetime.fromtimestamp(marker.unixtime)
+                    # Add verification status prefix
+                    verify_prefix = ''
+                    verify_status = getattr(marker, 'verify_status', None)
+                    if verify_status == 'pass':
+                        verify_prefix = '✓ '
+                    elif verify_status == 'fail':
+                        verify_prefix = '✗ '
+                    entry.marker = f'{verify_prefix}{state} {pct}% {marker.mode} {dt.strftime("%Y/%m/%d %H:%M")}'
+                    entry.state = state
+                    entry.dflt = state  # Set dflt so merge logic knows this partition has a marker
 
             return entry
 
-        # Trigger the recursion
-        for dev in parsed_data.get('blockdevices', []):
-            process_node(dev)
+        # Run the `lsblk` command and get its output in JSON format with additional columns
+        # Use timeout to prevent UI freeze if lsblk hangs on problematic devices
+        try:
+            result = subprocess.run(['lsblk', '-J', '--bytes', '-o',
+                                    'NAME,MAJ:MIN,FSTYPE,TYPE,LABEL,PARTLABEL,FSUSE%,SIZE,MOUNTPOINTS,UUID,PARTUUID,SERIAL'],
+                                   stdout=subprocess.PIPE, text=True, check=False, timeout=10.0)
+            parsed_data = json.loads(result.stdout)
+        except subprocess.TimeoutExpired:
+            # lsblk hung - return empty dict to use previous device state
+            return {}
+        entries = {}
+
+        # Parse each block device and its properties
+        for device in parsed_data['blockdevices']:
+            parent = eat_one(device)
+            entries[parent.name] = parent
+            for child in device.get('children', []):
+                entry = eat_one(child)
+                entries[entry.name] = entry
+                entry.parent = parent.name
+                parent.minors.append(entry.name)
+                self.disk_majors.add(entry.major)
+                if entry.mounts:
+                    entry.state = 'Mnt'
+                    parent.state = 'Mnt'
+
+
+        # Final pass: Identify disks, assign ports, and handle superfloppies
+        final_entries = {}
+        for name, entry in entries.items():
+            final_entries[name] = entry
+
+            # Only process top-level physical disks
+            if entry.parent is None:
+                # Hardware Info Gathering
+                entry.model = self._get_device_vendor_model(entry.name)
+                entry.port = self._get_port_from_sysfs(entry.name)
+
+                # The Split (Superfloppy Case)
+                # If it has children, the children already hold the data.
+                # If it has NO children but HAS data, we create the '----' child.
+                if not entry.minors and (entry.fstype or entry.label or entry.mounts):
+                    v_key = f"{name}_data"
+                    v_child = self._make_partition_namespace(entry.major, name, entry.size_bytes, dflt)
+                    v_child.name = "----"
+                    v_child.fstype = entry.fstype
+                    v_child.label = entry.label
+                    v_child.mounts = entry.mounts
+                    v_child.parent = name
+
+                    final_entries[v_key] = v_child
+                    entry.minors.append(v_key)
+
+                # Clean the hardware row of data-specific strings
+                entry.fstype = entry.model if entry.model else 'DISK'
+                entry.label = ''
+                entry.mounts = []
+
+        entries = final_entries
+
+        if self.DB:
+            print('\n\nDB: --->>> after parse_lsblk:')
+            for entry in entries.values():
+                print(vars(entry))
 
         return entries
 
@@ -562,12 +536,6 @@ class DeviceInfo:
             if new_ns:
                 if prev_ns.job:
                     new_ns.job = prev_ns.job
-                # Inheritance: Carry forward capabilities 
-                # ONLY if the drive hasn't changed state significantly
-                if hasattr(prev_ns, 'hw_caps'):
-                    new_ns.hw_caps = prev_ns.hw_caps
-                    new_ns.hw_nopes = getattr(prev_ns, 'hw_nopes', [])
-
                 # Note: Do NOT preserve port - use fresh value from current scan
                 new_ns.dflt = prev_ns.dflt
                 # Preserve the "wiped this session" flag
@@ -654,53 +622,3 @@ class DeviceInfo:
                 print(f'DB: {name}: {vars(ns)}')
         self.partitions = nss
         return nss
-
-def main():
-    """
-    Standalone test runner for DeviceInfo.
-    Run with: python3 DeviceInfo.py
-    """
-
-    # 1. Mock the options object expected by DeviceInfo
-    mock_opts = SimpleNamespace(
-        debug=True,
-    )
-
-    # 2. Initialize the class
-    print("--- Initializing DeviceInfo Probe ---")
-    discovery = DeviceInfo(mock_opts)
-
-    # 3. Perform the scan
-    # We pass '-' as the default state
-    start_time = time.time()
-    nss = discovery.assemble_partitions(prev_nss=None)
-    elapsed = time.time() - start_time
-
-    # 4. Display Results
-    print(f"\nScan completed in {elapsed:.3f}s")
-    print(f"{'NAME':<12} | {'TYPE':<6} | {'PORT':<12} | {'STATE':<5} | {'LABEL/MODEL'}")
-    print("-" * 70)
-
-    # We sort keys to keep parents and children somewhat near each other
-    for name in sorted(nss.keys()):
-        ns = nss[name]
-        
-        # Format the display line
-        indent = "  └─ " if ns.parent else ""
-        label_or_model = ns.label if ns.parent else ns.model
-        
-        print(f"{indent + ns.name:<12} | {ns.type:<6} | {getattr(ns, 'port', ''):<12} | {ns.state:<5} | {label_or_model}")
-
-    # 5. Optional: Detailed JSON dump of a specific device for debugging fields
-    if nss:
-        first_device = list(nss.keys())[0]
-        print(f"\n--- Detailed Data for {first_device} ---")
-        # Convert SimpleNamespace to dict for JSON printing
-        sample_data = vars(nss[first_device])
-        # We exclude the 'job' object as it's not serializable
-        sample_data = {k: v for k, v in sample_data.items() if k != 'job'}
-        print(json.dumps(sample_data, indent=4))
-
-if __name__ == "__main__":
-    # Ensure dependencies are imported for the standalone test
-    main()

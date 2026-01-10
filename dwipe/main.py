@@ -33,16 +33,16 @@ def main():
         if os.geteuid() != 0:
             # Re-run the script with sudo needed and opted
             Utils.rerun_module_as_root('dwipe.main')
-            
+
         prereqs = Prereqs(verbose=True)
             # lsblk is critical for everything; others are critical for firmware wipes
         prereqs.check_all(['lsblk', 'hdparm', 'nvme'])
         prereqs.report_and_exit_if_failed()
 
         dwipe = DiskWipe()  # opts=opts)
-        dwipe.dev_info = info = DeviceInfo(opts=opts)
-        dwipe.partitions = info.assemble_partitions()
         if dwipe.DB:
+            dwipe.dev_info = info = DeviceInfo(opts=opts)
+            dwipe.partitions = info.assemble_partitions()
             sys.exit(1)
 
         dwipe.main_loop()

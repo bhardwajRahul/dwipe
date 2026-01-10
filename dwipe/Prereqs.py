@@ -6,7 +6,7 @@ from typing import Optional, Dict, List
 
 class Prereqs:
     """Manages tool dependencies and provides actionable install suggestions."""
-    
+
     # Mapping tool binary to the actual package name for different managers
     TOOL_MAP = {
         'lsblk': {
@@ -47,10 +47,10 @@ class Prereqs:
         """Returns a string suggesting how to fix the missing tool."""
         if not self.pm:
             return "Please install via your system's package manager."
-        
+
         # Get package name (default to tool name if mapping missing)
         pkg = self.TOOL_MAP.get(tool, {}).get(self.pm, tool)
-        
+
         commands = {
             'apt': f"sudo apt update && sudo apt install {pkg}",
             'dnf': f"sudo dnf install {pkg}",
@@ -66,19 +66,19 @@ class Prereqs:
         """Prints a clean summary to stdout. Exits if critical tools are missing."""
         print("\n--- System Prerequisite Check ---")
         failed = False
-        
+
         for tool, available in self.results.items():
             mark = "✓" if available else "✗"
             status = "FOUND" if available else "MISSING"
             print(f"  {mark} {tool:<10} : {status}")
-            
+
             if not available:
                 failed = True
                 print(f"    └─ Suggestion: {self.get_install_hint(tool)}")
-        
+
         if failed:
             print("\nERROR: Dwipe cannot start until all prerequisites are met.\n")
             sys.exit(1)
-        
+
         if self.verbose:
             print("All prerequisites satisfied.\n")
