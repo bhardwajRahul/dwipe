@@ -24,7 +24,7 @@ class PersistentState:
         self.config_path = Path(config_path)
         self.state = {
             'theme': 'default',
-            'wipe_mode': 'Zero',  # 'Rand' or 'Zero' or +V
+            'wipe_mode': '+V',  # '+V' (verify) or '-V' (no verify)
             'passes': 1,  # 1, 2, or 4 wipe pass
             'confirmation': 'YES',  # 'Y', 'y', 'YES', 'yes', 'device'
             'verify_pct': 2,  # 0, 2, 5, 10, 25, 50, 100
@@ -63,6 +63,18 @@ class PersistentState:
                 with open(self.config_path, 'r', encoding='utf-8') as f:
                     loaded = json.load(f)
                     self.state.update(loaded)
+
+                    # Migrate old wipe_mode values to new format
+                    old_wipe_mode = self.state.get('wipe_mode', '+V')
+                    if old_wipe_mode not in ['+V', '-V']:
+                        # Old format: 'Zero', 'Zero+V', 'Rand', 'Rand+V'
+                        # Convert to new format: '+V' or '-V'
+                        if '+V' in str(old_wipe_mode):
+                            self.state['wipe_mode'] = '+V'
+                        else:
+                            self.state['wipe_mode'] = '-V'
+                        self.dirty = True  # Save the migration
+
             except (json.JSONDecodeError, IOError) as e:
                 print(f'Warning: Could not load state from {self.config_path}: {e}')
 

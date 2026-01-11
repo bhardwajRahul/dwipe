@@ -10,6 +10,7 @@ import os
 import sys
 import re
 import time
+import threading
 # import shutil
 import json
 import curses as cs
@@ -90,10 +91,83 @@ class DiskWipe:
             # Clear any previous verify failure message when starting wipe
             if hasattr(part, 'verify_failed_msg'):
                 delattr(part, 'verify_failed_msg')
-            part.job = WipeJob.start_job(f'/dev/{part.name}',
-                                          part.size_bytes, opts=self.opts)
-            self.job_cnt += 1
-            self.set_state(part, to='0%')
+
+            # Get the wipe type from user's choice
+            wipe_type = self.confirmation.input_buffer.strip()
+
+            # Check if it's a firmware wipe
+            if wipe_type not in ('Zero', 'Rand'):
+                # Firmware wipe - check if it's available
+                if not part.hw_caps or wipe_type not in part.hw_caps:
+                    part.mounts = [f'⚠ Firmware wipe {wipe_type} not available']
+                    self.confirmation.cancel()
+                    self.win.passthrough_mode = False
+                    return
+
+                # Get command args from hw_caps
+                command_args = part.hw_caps[wipe_type]
+
+                # Import firmware task classes
+                from .FirmwareWipeTask import NvmeWipeTask, SataWipeTask
+
+                # Determine task type based on device name
+                if part.name.startswith('nvme'):
+                    task_class = NvmeWipeTask
+                else:
+                    task_class = SataWipeTask
+
+                # Create firmware task
+                task = task_class(
+                    device_path=f'/dev/{part.name}',
+                    total_size=part.size_bytes,
+                    opts=self.opts,
+                    command_args=command_args,
+                    wipe_name=wipe_type
+                )
+
+                # Store wipe type for logging
+                part.wipe_type = wipe_type
+
+                # Create WipeJob with single firmware task
+                part.job = WipeJob(
+                    device_path=f'/dev/{part.name}',
+                    total_size=part.size_bytes,
+                    opts=self.opts,
+                    tasks=[task]
+                )
+                part.job.thread = threading.Thread(target=part.job.run_tasks)
+                part.job.thread.start()
+
+                self.job_cnt += 1
+                self.set_state(part, to='0%')
+
+                # Clear confirmation and return early
+                self.confirmation.cancel()
+                self.win.passthrough_mode = False
+                return
+
+            # Construct full wipe mode (e.g., 'Zero+V', 'Rand', etc.)
+            if self.opts.wipe_mode == '+V':
+                full_wipe_mode = wipe_type + '+V'
+            else:
+                full_wipe_mode = wipe_type
+
+            # Store wipe type for later logging
+            part.wipe_type = wipe_type
+
+            # Temporarily set the full wipe mode
+            old_wipe_mode = self.opts.wipe_mode
+            self.opts.wipe_mode = full_wipe_mode
+
+            try:
+                part.job = WipeJob.start_job(f'/dev/{part.name}',
+                                              part.size_bytes, opts=self.opts)
+                self.job_cnt += 1
+                self.set_state(part, to='0%')
+            finally:
+                # Restore original wipe_mode
+                self.opts.wipe_mode = old_wipe_mode
+
         # Clear confirmation state
         self.confirmation.cancel()
         self.win.passthrough_mode = False  # Disable passthrough
@@ -330,7 +404,7 @@ class DiskWipe:
         spin.add_key('stall_timeout', 'T - stall timeout (sec)', vals=[60, 120, 300, 600, 0,])
         spin.add_key('verify_pct', 'V - verification %', vals=[0, 2, 5, 10, 25, 50, 100])
         spin.add_key('passes', 'P - wipe pass count', vals=[1, 2, 4])
-        spin.add_key('wipe_mode', 'm - wipe mode', vals=['Zero', 'Zero+V', 'Rand', 'Rand+V'])
+        spin.add_key('wipe_mode', 'm - wipe mode', vals=['-V', '+V'])
 
         spin.add_key('quit', 'q,x - quit program', keys='qx', genre='action')
         spin.add_key('screen_escape', 'ESC- back one screen',
@@ -555,8 +629,8 @@ class MainScreen(DiskWipeScreen):
                         # Log the wipe operation
                         elapsed = time.monotonic() - partition.job.start_mono
                         result = 'stopped' if partition.job.do_abort else 'completed'
-                        # Extract base mode (remove '+V' suffix if present)
-                        mode = app.opts.wipe_mode.replace('+V', '')
+                        # Get the wipe type that was used (stored when wipe was started)
+                        mode = getattr(partition, 'wipe_type', 'Unknown')
                         # Calculate percentage if stopped
                         pct = None
                         if partition.job.do_abort and partition.job.total_size > 0:
@@ -677,16 +751,13 @@ class MainScreen(DiskWipeScreen):
                     msg = f'⚠️  VERIFY {partition.name} ({Utils.human(partition.size_bytes)}) - writes marker'
 
                 # Add mode-specific prompt
-                if app.confirmation.mode == 'Y':
-                    msg += " - Press 'Y' or ESC"
-                elif app.confirmation.mode == 'y':
-                    msg += " - Press 'y' or ESC"
-                elif app.confirmation.mode == 'YES':
-                    msg += f" - Type 'YES': {app.confirmation.input_buffer}_"
-                elif app.confirmation.mode == 'yes':
+                if app.confirmation.mode == 'yes':
                     msg += f" - Type 'yes': {app.confirmation.input_buffer}_"
                 elif app.confirmation.mode == 'identity':
                     msg += f" - Type '{partition.name}': {app.confirmation.input_buffer}_"
+                elif app.confirmation.mode == 'choices':
+                    choices_str = ', '.join(app.confirmation.choices)
+                    msg += f" - Choose ({choices_str}): {app.confirmation.input_buffer}_"
 
                 # Position message at fixed column (reduced from 28 to 20)
                 msg = ' ' * 20 + msg
@@ -763,8 +834,12 @@ class MainScreen(DiskWipeScreen):
                 part = ctx.partition
                 if app.test_state(part, to='0%'):
                     self.clear_hotswap_marker(part)
+                    # Build choices: Zero, Rand, and any firmware wipe types
+                    choices = ['Zero', 'Rand']
+                    if part.hw_caps:
+                        choices.extend(list(part.hw_caps.keys()))
                     app.confirmation.start(action_type='wipe',
-                               identity=part.name, mode='yes')
+                               identity=part.name, mode='choices', choices=choices)
                     app.win.passthrough_mode = True
 
     def verify_ACTION(self):
