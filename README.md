@@ -9,7 +9,7 @@
 | Interactive TUI | ✓ | ✓ | ✗ | ✗ |
 | Multiple simultaneous wipes | ✓ | ✗ | ✗ | ✗ |
 | Hot-swap detection | ✓ | ✗ | ✗ | ✗ |
-| Device/partition locking | ✓ | ✗ | ✗ | ✗ |
+| Device/partition blocking | ✓ | ✗ | ✗ | ✗ |
 | Persistent wipe state | ✓ | ✗ | ✗ | ✗ |
 | Resume interrupted wipes | ✓ | ✗ | ✗ | ✗ |
 | Wipe operation logging | ✓ | ✗ | ✗ | ✗ |
@@ -35,10 +35,10 @@
 * **Configurable confirmation modes** - Choose your safety level: single keypress (Y/y), typed confirmation (YES/yes), or device name (cycle with **c** key)
 * **Enhanced wipe history** - Detailed log viewer (**h** key) shows wipe history with UUIDs, filesystems, labels, and percentages for stopped wipes
 * **Active wipe highlighting** - In-progress wipes displayed in bright cyan/blue with elapsed time, remaining time, and transfer speed (0-100% write, 101-200% verify)
-* **Persistent user preferences** - Theme, wipe mode (Rand/Zero/Rand+V/Zero+V), confirmation mode, verification %, and locked devices persist across sessions (saved to `~/.config/dwipe/state.json`)
-* **Individual partition locking** - Lock individual partitions to prevent accidental wiping (previously only whole disks could be locked)
+* **Persistent user preferences** - Theme, wipe mode (Rand/Zero/Rand+V/Zero+V), confirmation mode, verification %, and blocked devices persist across sessions (saved to `~/.config/dwipe/state.json`)
+* **Individual partition blocking** - Block individual partitions to prevent accidental wiping (previously only whole disks could be blocked)
 * **Full terminal color themes** - Complete themed color schemes with backgrounds, not just highlights (cycle with **t** key)
-* **Visual feedback improvements** - Mounted and locked devices appear dimmed; active wipes are bright and prominent
+* **Visual feedback improvements** - Mounted and blocked devices appear dimmed; active wipes are bright and prominent
 * **Smart device identification** - Uses UUID/PARTUUID/serial numbers for stable device tracking across reconnections
 * **Screen-based navigation** - Modern screen stack architecture with help screen (**?**) and history screen (**h**)
 * **Direct I/O to Disk** - Wiping is done with direct I/O which is fast and avoid polluting your page cache. Writer threads are given lower than normal I/O priority to play nice with other apps.  This makes stopping jobs fast and certain.
@@ -71,14 +71,14 @@ Features added since V2 deployed (may not be in latest demo):
 `dwipe` provides comprehensive disk wiping capabilities with safety features:
 
 * **Smart device display** - Shows disks and partitions with labels, sizes, types, and vendor/model information to help identify devices correctly
-* **Safety protections** - Prevents wiping mounted devices, detects overlapping wipes, supports manual disk locking
+* **Safety protections** - Prevents wiping mounted devices, detects overlapping wipes, supports manual disk blocking
 * **Hot-swap detection** - Updates the device list when storage changes; newly added devices are marked with **^** to make them easy to spot
 * **Multiple simultaneous wipes** - Start wipes on multiple devices at once, with individual progress tracking and completion states
 * **Flexible wipe modes** - Choose between Rand, Zero, Rand+V (with auto-verify), or Zero+V (with auto-verify). Multi-pass modes alternate patterns for improved data destruction
 * **Persistent state tracking** - Wipe status survives reboots; partially wiped (**s**) and completed (**W**) states are stored on the device
 * **Device filtering** - Filter devices by name/pattern using regex in case of too many for one screen
 * **Stop capability** - Stop individual wipes or all wipes in progress
-* **Disk locking** - Manually lock disks to prevent accidental wipes (locks hide all partitions)
+* **Disk blocking** - Manually block disks to prevent accidental wipes (blocks hide all partitions)
 * **Dry-run mode** - Practice using the interface without risk using `--dry-run`
 
 
@@ -92,7 +92,7 @@ Simply run `dwipe` from the command line without arguments: `dwipe`
 
 `dwipe` uses color coding to provide instant visual feedback about device and operation status:
 
-- **Dimmed (gray)** - Mounted or locked devices (cannot be wiped)
+- **Dimmed (gray)** - Mounted or blocked devices (cannot be wiped)
 - **Default (white)** - Ready to wipe, idle state, or previously wiped (before this session)
 - **Bright cyan/blue + bold** - Active wipe or verification in progress (0-100% write, v0-v100% verify)
 - **Bold yellow** - Stopped or partially completed wipe
@@ -140,8 +140,8 @@ The **STATE** column shows the current status of each device:
 | **STOP** | Wipe or verification is being stopped |
 | **s** | Wipe was stopped - device is partially wiped (can restart or verify) |
 | **W** | Wipe was completed successfully (can wipe again or verify) |
-| **Lock** | Disk is manually locked - partitions are hidden and cannot be wiped |
-| **Unlk** | Disk was just unlocked (transitory state) |
+| **Blk** | Disk is manually blocked - partitions are hidden and cannot be wiped |
+| **Unbl** | Disk was just unblocked (transitory state) |
 
 ### Available Actions
 
@@ -153,7 +153,7 @@ The top line shows available actions. Some are context-sensitive (only available
 | **v** | verify | Verify a wiped device or detect pattern on unmarked disk (context-sensitive) |
 | **s** | stop | Stop the selected wipe in progress (context-sensitive) |
 | **S** | Stop All | Stop all wipes in progress |
-| **l** | lock/unlock | Lock or unlock a disk to prevent accidental wiping |
+| **b** | block/unblock | Block or unblock a disk to prevent accidental wiping |
 | **q** or **x** | quit | Quit the application (stops all wipes first) |
 | **?** | help | Show help screen with all actions and navigation keys |
 | **h** | history | Show wipe history log |
@@ -314,7 +314,7 @@ Press **ESC** from the main screen to clear the filter and return to showing all
 
 **Best practices:**
 - Verify device labels and sizes carefully before wiping
-- Use the **Lock** feature to protect critical disks
+- Use the **Block** feature to protect critical disks
 - Test with `--dry-run` first if unsure
 - Consider encryption for sensitive data as the primary security measure
 
@@ -334,7 +334,7 @@ Press **ESC** from the main screen to clear the filter and return to showing all
 ### Wipe issues
 - **Can't wipe a device** - Check the STATE column:
   - **Mnt** - Unmount the partition first: `sudo umount /dev/sdXN`
-  - **Lock** - Press **l** to unlock
+  - **Blk** - Press **b** to unblock
   - **Busy** - Another partition on the disk is being wiped
 - **Wipe is very slow** - Normal for large drives; check write rate to verify progress
 - **Wipe seems stuck** - Most likely due to bad disks; Direct I/O makes progress almost constant on good disks.

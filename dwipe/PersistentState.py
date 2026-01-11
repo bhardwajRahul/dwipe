@@ -9,7 +9,7 @@ from .Utils import Utils
 
 
 class PersistentState:
-    """Manages persistent state for dwipe preferences and device locks"""
+    """Manages persistent state for dwipe preferences and device blocks"""
 
     def __init__(self, config_path=None):
         """Initialize persistent state
@@ -32,7 +32,7 @@ class PersistentState:
             'slowdown_stop': 16,
             'stall_timeout': 60,
             'port_serial': False,
-            'devices': {}  # device_id -> {locked, last_seen, last_name, size_bytes}
+            'devices': {}  # device_id -> {blocked, last_seen, last_name, size_bytes}
         }
         self.dirty = False
         self.max_devices = 400
@@ -134,24 +134,28 @@ class PersistentState:
         return f'fallback:{fallback_id}'
 
     def get_device_locked(self, partition):
-        """Check if a device is locked
+        """Check if a device is blocked (backward compatible with 'locked')
 
         Args:
             partition: SimpleNamespace with device info
 
         Returns:
-            bool: True if device is locked
+            bool: True if device is blocked
         """
         device_id = self.make_device_id(partition)
         device_state = self.state['devices'].get(device_id, {})
+
+        # Check new 'blocked' field first, fall back to old 'locked' field for backward compatibility
+        if 'blocked' in device_state:
+            return device_state['blocked']
         return device_state.get('locked', False)
 
     def set_device_locked(self, partition, locked):
-        """Set device lock state
+        """Set device block state
 
         Args:
             partition: SimpleNamespace with device info
-            locked: bool, True to lock device
+            locked: bool, True to block device (parameter name kept for API compatibility)
         """
         device_id = self.make_device_id(partition)
         now = int(time.time())
@@ -160,7 +164,9 @@ class PersistentState:
             self.state['devices'][device_id] = {}
 
         device_state = self.state['devices'][device_id]
-        device_state['locked'] = locked
+        device_state['blocked'] = locked  # Only save 'blocked', not 'locked'
+        # Remove old 'locked' field if it exists (gradual migration)
+        device_state.pop('locked', None)
         device_state['last_seen'] = now
         device_state['last_name'] = partition.name
         device_state['size_bytes'] = partition.size_bytes

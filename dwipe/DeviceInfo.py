@@ -313,9 +313,9 @@ class DeviceInfo:
 
         if to == 'STOP' and not state_in(ns.state, job_states):
             return False
-        if to == 'Lock' and not state_in(ns.state, list(ready_states) + ['Mnt']):
+        if to == 'Blk' and not state_in(ns.state, list(ready_states) + ['Mnt']):
             return False
-        if to == 'Unlk' and ns.state != 'Lock':
+        if to == 'Unbl' and ns.state != 'Blk':
             return False
 
         if to and fnmatch(to, '*%'):
@@ -335,7 +335,7 @@ class DeviceInfo:
         # Here we set inferences that block starting jobs
         #  -- clearing these states will be done on the device refresh
         if parent and state_in(ns.state, inferred_states):
-            if parent.state != 'Lock':
+            if parent.state != 'Blk':
                 parent.state = ns.state
         if state_in(ns.state, job_states):
             if parent:
@@ -488,8 +488,8 @@ class DeviceInfo:
         # Check for newly inserted flag first (hot-swapped devices should always show orange)
         if getattr(ns, 'newly_inserted', False):
             # Newly inserted device - orange/bright
-            if ns.state in ('Mnt', 'Lock'):
-                # Dim the orange for mounted/locked devices
+            if ns.state in ('Mnt', 'Blk'):
+                # Dim the orange for mounted/blocked devices
                 attr = curses.color_pair(Theme.HOTSWAP) | curses.A_DIM
             else:
                 attr = curses.color_pair(Theme.HOTSWAP) | curses.A_BOLD
@@ -508,8 +508,8 @@ class DeviceInfo:
         elif ns.state == '^':
             # Newly inserted device (hot-swapped) - orange/bright
             attr = curses.color_pair(Theme.HOTSWAP) | curses.A_BOLD
-        elif ns.state in ('Mnt', 'Lock'):
-            # Dim mounted or locked devices
+        elif ns.state in ('Mnt', 'Blk'):
+            # Dim mounted or blocked devices
             attr = curses.A_DIM
 
         # Override with red/danger color if verify failed
@@ -575,12 +575,12 @@ class DeviceInfo:
                         new_ns.verify_failed_msg = prev_ns.verify_failed_msg
                         new_ns.mounts = [prev_ns.verify_failed_msg]
 
-                if prev_ns.state == 'Lock':
-                    new_ns.state = 'Lock'
+                if prev_ns.state == 'Blk':
+                    new_ns.state = 'Blk'
                 elif new_ns.state not in ('s', 'W'):
                     new_ns.state = new_ns.dflt
                     # Don't copy forward percentage states (like "v96%") - only persistent states
-                    if prev_ns.state not in ('s', 'W', 'Busy', 'Unlk') and not prev_ns.state.endswith('%'):
+                    if prev_ns.state not in ('s', 'W', 'Busy', 'Unbl') and not prev_ns.state.endswith('%'):
                         new_ns.state = prev_ns.state  # re-infer these
             elif prev_ns.job:
                 # unplugged device with job..
@@ -603,14 +603,14 @@ class DeviceInfo:
 
         nss = self.merge_dev_infos(nss, prev_nss)
 
-        # Apply persistent locked states
+        # Apply persistent blocked states
         if self.persistent_state:
             for ns in nss.values():
                 # Update last_seen timestamp
                 self.persistent_state.update_device_seen(ns)
-                # Apply persistent lock state
+                # Apply persistent block state
                 if self.persistent_state.get_device_locked(ns):
-                    ns.state = 'Lock'
+                    ns.state = 'Blk'
 
         self.set_all_states(nss)  # set inferred states
 

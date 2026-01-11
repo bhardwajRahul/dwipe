@@ -5,6 +5,7 @@ DiskWipe class - Main application controller/singleton
 # pylint: disable=too-many-nested-blocks,too-many-instance-attributes
 # pylint: disable=too-many-branches,too-many-statements,too-many-locals
 # pylint: disable=protected-access,too-many-return-statements
+# pylint: disable=too-few-public-methods
 import os
 import sys
 import re
@@ -21,6 +22,7 @@ from .WipeJob import WipeJob
 from .DeviceInfo import DeviceInfo
 from .Utils import Utils
 from .PersistentState import PersistentState
+from .StructuredLogger import StructuredLogger
 
 # Screen constants
 MAIN_ST = 0
@@ -83,8 +85,8 @@ class DiskWipe:
 
     def _start_wipe(self):
         """Start the wipe job after confirmation"""
-        if self.confirmation.partition_name and self.confirmation.partition_name in self.partitions:
-            part = self.partitions[self.confirmation.partition_name]
+        if self.confirmation.identity and self.confirmation.identity in self.partitions:
+            part = self.partitions[self.confirmation.identity]
             # Clear any previous verify failure message when starting wipe
             if hasattr(part, 'verify_failed_msg'):
                 delattr(part, 'verify_failed_msg')
@@ -98,8 +100,8 @@ class DiskWipe:
 
     def _start_verify(self):
         """Start the verify job after confirmation"""
-        if self.confirmation.partition_name and self.confirmation.partition_name in self.partitions:
-            part = self.partitions[self.confirmation.partition_name]
+        if self.confirmation.identity and self.confirmation.identity in self.partitions:
+            part = self.partitions[self.confirmation.identity]
             # Clear any previous verify failure message when starting verify
             if hasattr(part, 'verify_failed_msg'):
                 delattr(part, 'verify_failed_msg')
@@ -118,9 +120,9 @@ class DiskWipe:
         """Set state of partition"""
         result = self.dev_info.set_one_state(self.partitions, ns, to=to)
 
-        # Save lock state changes to persistent state
-        if result and to in ('Lock', 'Unlk'):
-            self.persistent_state.set_device_locked(ns, to == 'Lock')
+        # Save block state changes to persistent state
+        if result and to in ('Blk', 'Unbl'):
+            self.persistent_state.set_device_locked(ns, to == 'Blk')
 
         return result
 
@@ -154,9 +156,9 @@ class DiskWipe:
         if self.confirmation.active:
             result = self.confirmation.handle_key(key)
             if result == 'confirmed':
-                if self.confirmation.confirm_type == 'wipe':
+                if self.confirmation.action_type == 'wipe':
                     self._start_wipe()
-                elif self.confirmation.confirm_type == 'verify':
+                elif self.confirmation.action_type == 'verify':
                     self._start_verify()
             elif result == 'cancelled':
                 self.confirmation.cancel()
@@ -195,7 +197,7 @@ class DiskWipe:
         line += f' [P]ass={self.opts.passes}'
         # Show verification percentage spinner with key
         line += f' [V]pct={self.opts.verify_pct}%'
-        line += f' [p]ort'
+        line += ' [p]ort'
         line += '  '
         if self.opts.dry_run:
             line += ' DRY-RUN'
@@ -238,10 +240,10 @@ class DiskWipe:
                     elif not part.fstype:
                         # Partition without filesystem
                         actions['v'] = 'verify'
-            if self.test_state(part, to='Lock'):
-                actions['l'] = 'lock'
-            if self.test_state(part, to='Unlk'):
-                actions['l'] = 'unlk'
+            if self.test_state(part, to='Blk'):
+                actions['b'] = 'block'
+            if self.test_state(part, to='Unbl'):
+                actions['b'] = 'unblk'
         return name, actions
 
     def _on_filter_change(self, text):
@@ -329,7 +331,7 @@ class DiskWipe:
         spin.add_key('verify_pct', 'V - verification %', vals=[0, 2, 5, 10, 25, 50, 100])
         spin.add_key('passes', 'P - wipe pass count', vals=[1, 2, 4])
         spin.add_key('wipe_mode', 'm - wipe mode', vals=['Zero', 'Zero+V', 'Rand', 'Rand+V'])
-        spin.add_key('confirmation', 'c - confirmation mode', vals=['YES', 'yes', 'device', 'Y', 'y'])
+        spin.add_key('confirmation', 'c - confirmation mode', vals=['YES', 'yes', 'identity', 'Y', 'y'])
 
         spin.add_key('quit', 'q,x - quit program', keys='qx', genre='action')
         spin.add_key('screen_escape', 'ESC- back one screen',
@@ -339,7 +341,7 @@ class DiskWipe:
         spin.add_key('wipe', 'w - wipe device', genre='action')
         spin.add_key('verify', 'v - verify device', genre='action')
         spin.add_key('stop', 's - stop wipe', genre='action')
-        spin.add_key('lock', 'l - lock/unlock disk', genre='action')
+        spin.add_key('block', 'b - block/unblock disk', genre='action')
         spin.add_key('stop_all', 'S - stop ALL wipes', genre='action')
         spin.add_key('help', '? - show help screen', genre='action')
         spin.add_key('history', 'h - show wipe history', genre='action')
@@ -627,7 +629,7 @@ class MainScreen(DiskWipeScreen):
                     partition.mounts = [f'{elapsed} -{until} {rate} ÷{slowdown} 𝚫{Utils.ago_str(stall)}']
 
             if partition.parent and partition.parent in app.partitions and (
-                    app.partitions[partition.parent].state == 'Lock'):
+                    app.partitions[partition.parent].state == 'Blk'):
                 continue
 
             if wanted(name) or partition.job:
@@ -668,9 +670,9 @@ class MainScreen(DiskWipeScreen):
                 app.win.add_body(line, attr=attr, context=Context(genre='DECOR'))
 
             # Show inline confirmation prompt if this is the partition being confirmed
-            if app.confirmation.active and app.confirmation.partition_name == partition.name:
+            if app.confirmation.active and app.confirmation.identity == partition.name:
                 # Build confirmation message
-                if app.confirmation.confirm_type == 'wipe':
+                if app.confirmation.action_type == 'wipe':
                     msg = f'⚠️  WIPE {partition.name} ({Utils.human(partition.size_bytes)})'
                 else:  # verify
                     msg = f'⚠️  VERIFY {partition.name} ({Utils.human(partition.size_bytes)}) - writes marker'
@@ -684,7 +686,7 @@ class MainScreen(DiskWipeScreen):
                     msg += f" - Type 'YES': {app.confirmation.input_buffer}_"
                 elif app.confirmation.mode == 'yes':
                     msg += f" - Type 'yes': {app.confirmation.input_buffer}_"
-                elif app.confirmation.mode == 'device':
+                elif app.confirmation.mode == 'identity':
                     msg += f" - Type '{partition.name}': {app.confirmation.input_buffer}_"
 
                 # Position message at fixed column (reduced from 28 to 20)
@@ -762,7 +764,8 @@ class MainScreen(DiskWipeScreen):
                 part = ctx.partition
                 if app.test_state(part, to='0%'):
                     self.clear_hotswap_marker(part)
-                    app.confirmation.start('wipe', part.name, app.opts.confirmation)
+                    app.confirmation.start(action_type='wipe',
+                               identity=part.name, mode=app.opts.confirmation)
                     app.win.passthrough_mode = True
 
     def verify_ACTION(self):
@@ -780,7 +783,8 @@ class MainScreen(DiskWipeScreen):
                 is_unmarked = part.state == '-' and (not part.parent or not part.fstype)
                 if is_unmarked:
                     # Require confirmation for unmarked partitions
-                    app.confirmation.start('verify', part.name, app.opts.confirmation)
+                    app.confirmation.start(action_type='verify', identity=part.name,
+                                           mode=app.opts.confirmation)
                     app.win.passthrough_mode = True
                 else:
                     # Marked partition - proceed directly
@@ -810,14 +814,14 @@ class MainScreen(DiskWipeScreen):
                 if part.job and not part.job.done:
                     part.job.do_abort = True
 
-    def lock_ACTION(self):
-        """Handle 'l' key"""
+    def block_ACTION(self):
+        """Handle 'b' key"""
         app = self.app
         ctx = app.win.get_picked_context()
         if ctx and hasattr(ctx, 'partition'):
             part = ctx.partition
             self.clear_hotswap_marker(part)
-            app.set_state(part, 'Unlk' if part.state == 'Lock' else 'Lock')
+            app.set_state(part, 'Unbl' if part.state == 'Blk' else 'Blk')
 
     def help_ACTION(self):
         """Handle '?' key - push help screen"""
@@ -906,8 +910,7 @@ class HistoryScreen(DiskWipeScreen):
             return
 
         # Use StructuredLogger's filter method
-        logger = Utils.get_logger()
-        from .StructuredLogger import StructuredLogger
+        # logger = Utils.get_logger()
         self.filtered_entries, self.search_matches = StructuredLogger.filter_entries(
             self.entries, pattern, deep=deep_search
         )
