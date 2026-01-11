@@ -368,6 +368,8 @@ class DeviceInfo:
             # Must be disk or partition type
             if ns.type not in ('disk', 'part'):
                 continue
+            if ns.size_bytes <= 0: # not relevant to wiping
+                continue
 
             # Must be writable (excludes CD-ROMs, eMMC boot partitions, etc.)
             ro_path = f'/sys/class/block/{name}/ro'

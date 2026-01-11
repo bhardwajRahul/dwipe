@@ -331,7 +331,6 @@ class DiskWipe:
         spin.add_key('verify_pct', 'V - verification %', vals=[0, 2, 5, 10, 25, 50, 100])
         spin.add_key('passes', 'P - wipe pass count', vals=[1, 2, 4])
         spin.add_key('wipe_mode', 'm - wipe mode', vals=['Zero', 'Zero+V', 'Rand', 'Rand+V'])
-        spin.add_key('confirmation', 'c - confirmation mode', vals=['YES', 'yes', 'identity', 'Y', 'y'])
 
         spin.add_key('quit', 'q,x - quit program', keys='qx', genre='action')
         spin.add_key('screen_escape', 'ESC- back one screen',
@@ -765,7 +764,7 @@ class MainScreen(DiskWipeScreen):
                 if app.test_state(part, to='0%'):
                     self.clear_hotswap_marker(part)
                     app.confirmation.start(action_type='wipe',
-                               identity=part.name, mode=app.opts.confirmation)
+                               identity=part.name, mode='yes')
                     app.win.passthrough_mode = True
 
     def verify_ACTION(self):
@@ -783,8 +782,8 @@ class MainScreen(DiskWipeScreen):
                 is_unmarked = part.state == '-' and (not part.parent or not part.fstype)
                 if is_unmarked:
                     # Require confirmation for unmarked partitions
-                    app.confirmation.start(action_type='verify', identity=part.name,
-                                           mode=app.opts.confirmation)
+                    app.confirmation.start(action_type='verify',
+                                           identity=part.name, mode="yes")
                     app.win.passthrough_mode = True
                 else:
                     # Marked partition - proceed directly
