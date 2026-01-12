@@ -89,9 +89,6 @@ class FirmwareWipeTask(WipeTask):
         Firmware wipes erase the entire disk including any existing markers.
         We need to write a new marker indicating the wipe is complete.
         """
-        if self.opts.dry_run:
-            return
-
         try:
             # Force OS to re-read partition table (now empty)
             subprocess.run(['blockdev', '--rereadpt', self.device_path],
@@ -133,19 +130,12 @@ class FirmwareWipeTask(WipeTask):
             cmd = self._build_command()
 
             # Start subprocess (non-blocking)
-            if not self.opts.dry_run:
-                self.process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
-            else:
-                # Dry run - simulate quick completion
-                time.sleep(2)
-                self.total_written = self.total_size
-                self.done = True
-                return
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
 
             # Monitor progress with polling loop
             check_interval = 2  # Check every 2 seconds
@@ -232,7 +222,7 @@ class FirmwareWipeTask(WipeTask):
             "step": f"firmware {self.wipe_name} {self.device_path}",
             "elapsed": Utils.ago_str(int(elapsed)),
             "rate": "Firmware",
-            "command": ' '.join(self._build_command()) if not self.opts.dry_run else "dry-run",
+            "command": ' '.join(self._build_command()),
             "bytes_written": self.total_written,
             "bytes_total": self.total_size,
             "result": "completed" if self.total_written == self.total_size else "partial"
@@ -367,11 +357,10 @@ class SataWipeTask(FirmwareWipeTask):
         """Execute SATA firmware wipe (overrides base to add password step)"""
         try:
             # Step 1: Set temporary password
-            if not self.opts.dry_run:
-                if not self._set_ata_password():
-                    self.exception = "Failed to set ATA security password"
-                    self.done = True
-                    return
+            if not self._set_ata_password():
+                self.exception = "Failed to set ATA security password"
+                self.done = True
+                return
 
             # Step 2: Execute erase command (base class handles this)
             super().run_task()

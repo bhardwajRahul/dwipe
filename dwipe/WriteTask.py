@@ -96,10 +96,7 @@ class WriteTask(WipeTask):
             self._setup_ionice()
 
             # Open device with O_DIRECT for unbuffered I/O
-            if not self.opts.dry_run:
-                fd = os.open(self.device_path, os.O_WRONLY | os.O_DIRECT)
-            else:
-                fd = None
+            fd = os.open(self.device_path, os.O_WRONLY | os.O_DIRECT)
 
             try:
                 # Start from resume offset if resuming
@@ -111,8 +108,7 @@ class WriteTask(WipeTask):
                     offset_in_pass = WipeTask.MARKER_SIZE
 
                 # Seek to current position (O_DIRECT requires block-aligned seeks)
-                if not self.opts.dry_run:
-                    os.lseek(fd, offset_in_pass, os.SEEK_SET)
+                os.lseek(fd, offset_in_pass, os.SEEK_SET)
 
                 # Write until end of pass
                 bytes_to_write = self.total_size - offset_in_pass
@@ -152,24 +148,20 @@ class WriteTask(WipeTask):
                     # Get buffer from subclass (polymorphic)
                     chunk = self.get_buffer(chunk_size)
 
-                    if self.opts.dry_run:
-                        bytes_written = chunk_size
-                        time.sleep(0.001)
-                    else:
-                        try:
-                            # Write with O_DIRECT (bypasses page cache)
-                            bytes_written, fd = self.safe_write(fd, chunk)
-                        except Exception as e:
-                            # Save exception for debugging
-                            self.exception = str(e)
-                            self.do_abort = True
-                            bytes_written = 0
+                    try:
+                        # Write with O_DIRECT (bypasses page cache)
+                        bytes_written, fd = self.safe_write(fd, chunk)
+                    except Exception as e:
+                        # Save exception for debugging
+                        self.exception = str(e)
+                        self.do_abort = True
+                        bytes_written = 0
 
                     self.total_written += bytes_written
                     bytes_written_this_run += bytes_written
 
                     # Periodically update marker for crash recovery (every 30s)
-                    if not self.opts.dry_run and self.total_written > WipeTask.MARKER_SIZE:
+                    if self.total_written > WipeTask.MARKER_SIZE:
                         self.maybe_update_marker()
 
                     # Check for errors or incomplete writes

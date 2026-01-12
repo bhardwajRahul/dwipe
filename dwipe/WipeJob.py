@@ -126,7 +126,7 @@ class WipeJob:
             opts: Options namespace
             tasks: List of WipeTask instances to execute sequentially (if None, legacy mode)
         """
-        self.opts = opts if opts else SimpleNamespace(dry_run=False)
+        self.opts = opts
         self.device_path = device_path
         self.total_size = total_size
         self.do_abort = False
@@ -292,12 +292,11 @@ class WipeJob:
                         break
 
                 try:
-                    if not self.opts.dry_run:
-                        with open(self.device_path, 'r+b') as marker_file:
-                            marker_file.seek(0)
-                            marker_file.write(self.prep_marker_buffer(is_random, verify_status=None))
-                            marker_file.flush()
-                            os.fsync(marker_file.fileno())
+                    with open(self.device_path, 'r+b') as marker_file:
+                        marker_file.seek(0)
+                        marker_file.write(self.prep_marker_buffer(is_random, verify_status=None))
+                        marker_file.flush()
+                        os.fsync(marker_file.fileno())
                 except Exception:
                     pass  # Don't fail the stop on marker write error
 
@@ -1047,10 +1046,7 @@ class WipeJob:
 
             # Open device with O_DIRECT for unbuffered I/O (bypasses page cache)
             # O_DIRECT gives maximum performance with zero dirty pages
-            if not self.opts.dry_run:
-                fd = os.open(self.device_path, os.O_WRONLY | os.O_DIRECT)
-            else:
-                fd = None
+            fd = os.open(self.device_path, os.O_WRONLY | os.O_DIRECT)
 
             try:
                 # Continue writing until we reach target_bytes
@@ -1068,8 +1064,7 @@ class WipeJob:
                     is_random_pass = self.get_pass_pattern(self.current_pass, desired_mode)
 
                     # Seek to current position (O_DIRECT requires block-aligned seeks)
-                    if not self.opts.dry_run:
-                        os.lseek(fd, offset_in_pass, os.SEEK_SET)
+                    os.lseek(fd, offset_in_pass, os.SEEK_SET)
 
                     # Write until end of current pass or target_bytes, whichever comes first
                     pass_remaining = self.total_size - offset_in_pass
@@ -1117,25 +1112,21 @@ class WipeJob:
                             # Use zero buffer
                             chunk = WipeTask.zero_buffer[:chunk_size]
 
-                        if self.opts.dry_run:
-                            bytes_written = chunk_size
-                            time.sleep(0.001)
-                        else:
-                            try:
-                                # Write with O_DIRECT (bypasses page cache)
-                                bytes_written, fd = self.safe_write(fd, chunk)
-                            except Exception as e:
-                                # Save exception for debugging
-                                self.exception = str(e)
-                                self.do_abort = True
-                                bytes_written = 0
+                        try:
+                            # Write with O_DIRECT (bypasses page cache)
+                            bytes_written, fd = self.safe_write(fd, chunk)
+                        except Exception as e:
+                            # Save exception for debugging
+                            self.exception = str(e)
+                            self.do_abort = True
+                            bytes_written = 0
 
                         self.total_written += bytes_written
                         pass_bytes_written += bytes_written
 
                         # Periodically update marker for crash recovery (every 30s)
                         # Note: marker writes use separate buffered file handle
-                        if not self.opts.dry_run and self.total_written > WipeTask.MARKER_SIZE:
+                        if self.total_written > WipeTask.MARKER_SIZE:
                             marker_is_random = (desired_mode == 'Rand')
                             self.maybe_update_marker(marker_is_random)
 
@@ -1152,7 +1143,7 @@ class WipeJob:
             # Write final marker buffer at beginning after ALL passes complete
             # Skip marker write on abort to avoid blocking on problematic devices
             # Use separate buffered file handle (marker is not O_DIRECT aligned)
-            if not self.opts.dry_run and self.total_written > 0 and not self.do_abort:
+            if self.total_written > 0 and not self.do_abort:
                 try:
                     final_is_random = (desired_mode == 'Rand')
                     with open(self.device_path, 'r+b') as marker_file:
@@ -1265,10 +1256,7 @@ class WipeJob:
 
         try:
             # Open with regular buffered I/O
-            if not self.opts.dry_run:
-                fd = os.open(self.device_path, os.O_RDONLY)
-            else:
-                fd = None
+            fd = os.open(self.device_path, os.O_RDONLY)
 
             read_chunk_size = 64 * 1024  # 64KB chunks
             SAMPLE_STEP = 23  # Sample every 23rd byte (~4% of data) - prime for even distribution
@@ -1315,8 +1303,7 @@ class WipeJob:
                 verified_in_section = 0
 
                 # Seek to position in this section
-                if not self.opts.dry_run:
-                    os.lseek(fd, read_pos, os.SEEK_SET)
+                os.lseek(fd, read_pos, os.SEEK_SET)
 
                 # Read and analyze THIS SECTION
                 while verified_in_section < bytes_to_verify:
@@ -1325,13 +1312,9 @@ class WipeJob:
 
                     chunk_size = min(read_chunk_size, bytes_to_verify - verified_in_section)
 
-                    if self.opts.dry_run:
-                        time.sleep(0.01)
-                        data = b'\x00' * chunk_size
-                    else:
-                        data = os.read(fd, chunk_size)
-                        if not data:
-                            break
+                    data = os.read(fd, chunk_size)
+                    if not data:
+                        break
 
                     # --------------------------------------------------
                     # SECTION ANALYSIS
@@ -1538,12 +1521,11 @@ class WipeJob:
                 is_random = isinstance(last_write_task, WriteRandTask)
 
             # Write marker WITHOUT verify_status (write completion only)
-            if not self.opts.dry_run:
-                with open(self.device_path, 'r+b') as marker_file:
-                    marker_file.seek(0)
-                    marker_file.write(self.prep_marker_buffer(is_random, verify_status=None))
-                    marker_file.flush()
-                    os.fsync(marker_file.fileno())
+            with open(self.device_path, 'r+b') as marker_file:
+                marker_file.seek(0)
+                marker_file.write(self.prep_marker_buffer(is_random, verify_status=None))
+                marker_file.flush()
+                os.fsync(marker_file.fileno())
 
         except Exception:
             # Log error but don't fail the job - marker write is not critical
@@ -1608,14 +1590,13 @@ class WipeJob:
                 return
 
             # Write marker with verification status
-            if not self.opts.dry_run:
-                with open(self.device_path, 'r+b') as device:
-                    device.seek(0)
-                    marker_buffer = self.prep_marker_buffer(is_random,
-                                                            verify_status=new_verify_status)
-                    device.write(marker_buffer)
-                    device.flush()
-                    os.fsync(device.fileno())
+            with open(self.device_path, 'r+b') as device:
+                device.seek(0)
+                marker_buffer = self.prep_marker_buffer(is_random,
+                                                        verify_status=new_verify_status)
+                device.write(marker_buffer)
+                device.flush()
+                os.fsync(device.fileno())
 
         except Exception:
             # Catch ANY exception in this method to ensure self.done is always set

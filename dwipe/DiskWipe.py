@@ -40,7 +40,7 @@ class DiskWipe:
 
     def __init__(self, opts=None):
         DiskWipe.singleton = self
-        self.opts = opts if opts else SimpleNamespace(debug=0, dry_run=False)
+        self.opts = opts if opts else SimpleNamespace(debug=0)
         self.DB = bool(self.opts.debug)
         self.mounts_lines = None
         self.partitions = {}  # a dict of namespaces keyed by name
@@ -273,9 +273,6 @@ class DiskWipe:
         # Show verification percentage spinner with key
         line += f' [V]pct={self.opts.verify_pct}%'
         line += f' [p]ort={self.opts.port_serial}'
-        line += '  '
-        if self.opts.dry_run:
-            line += ' DRY-RUN'
         line += ' !:scan [h]ist [t]heme ?:help [q]uit'
         return line[1:]
 
@@ -504,7 +501,7 @@ class DiskWipeScreen(Screen):
 
 class MainScreen(DiskWipeScreen):
     """Main device list screen"""
-    
+
     def __init__(self, app):
         super().__init__(app)
         self.app = app

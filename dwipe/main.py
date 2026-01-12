@@ -22,8 +22,6 @@ def main():
     """Main entry point"""
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('-n', '--dry-run', action='store_true',
-                        help='just pretend to zap devices')
     parser.add_argument('-D', '--debug', action='count', default=0,
                         help='debug mode (the more Ds, the higher the debug level)')
     opts = parser.parse_args()

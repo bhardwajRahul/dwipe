@@ -97,7 +97,6 @@ Features added since V2 deployed (may not be in latest demo):
 * **Device filtering** - Filter devices by name/pattern using regex in case of too many for one screen
 * **Stop capability** - Stop individual wipes or all wipes in progress
 * **Disk blocking** - Manually block disks to prevent accidental wipes (blocks hide all partitions)
-* **Dry-run mode** - Practice using the interface without risk using `--dry-run`
 
 
 > **Note:** `dwipe` shows file system labels, and if not available, the partition label. It is best practice to label partitions and file systems well to make selection easier.
@@ -333,7 +332,6 @@ Press **ESC** from the main screen to clear the filter and return to showing all
 **Best practices:**
 - Verify device labels and sizes carefully before wiping
 - Use the **Block** feature to protect critical disks
-- Test with `--dry-run` first if unsure
 - Consider encryption for sensitive data as the primary security measure
 
 ---

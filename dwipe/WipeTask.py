@@ -51,7 +51,7 @@ class WipeTask:
         """
         self.device_path = device_path
         self.total_size = total_size
-        self.opts = opts if opts else SimpleNamespace(dry_run=False)
+        self.opts = opts
 
         # Control flags
         self.do_abort = False

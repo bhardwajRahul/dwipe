@@ -68,10 +68,7 @@ class VerifyTask(WipeTask):
             all_zeros = (self.expected_pattern is None)
 
             # Open with regular buffered I/O
-            if not self.opts.dry_run:
-                fd = os.open(self.device_path, os.O_RDONLY)
-            else:
-                fd = None
+            fd = os.open(self.device_path, os.O_RDONLY)
 
             try:
                 read_chunk_size = 64 * 1024  # 64KB chunks
@@ -119,8 +116,7 @@ class VerifyTask(WipeTask):
                     verified_in_section = 0
 
                     # Seek to position in this section
-                    if not self.opts.dry_run:
-                        os.lseek(fd, read_pos, os.SEEK_SET)
+                    os.lseek(fd, read_pos, os.SEEK_SET)
 
                     # Read and analyze THIS SECTION
                     while verified_in_section < bytes_to_verify:
@@ -129,13 +125,9 @@ class VerifyTask(WipeTask):
 
                         chunk_size = min(read_chunk_size, bytes_to_verify - verified_in_section)
 
-                        if self.opts.dry_run:
-                            time.sleep(0.01)
-                            data = b'\x00' * chunk_size
-                        else:
-                            data = os.read(fd, chunk_size)
-                            if not data:
-                                break
+                        data = os.read(fd, chunk_size)
+                        if not data:
+                            break
 
                         # --------------------------------------------------
                         # SECTION ANALYSIS
