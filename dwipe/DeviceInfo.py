@@ -149,8 +149,15 @@ class DeviceInfo:
         rv = f'{get_str(device_name, "model")}'
         return rv.strip()
 
-    def parse_lsblk(self, dflt, prev_nss=None):
-        """Parse ls_blk for all the goodies we need"""
+    def parse_lsblk(self, dflt, prev_nss=None, lsblk_output=None):
+        """Parse ls_blk for all the goodies we need
+
+        Args:
+            dflt: Default state for new devices
+            prev_nss: Previous device namespaces for merging
+            lsblk_output: Optional lsblk JSON output string. If provided, uses this
+                         instead of running lsblk command. Useful for background monitoring.
+        """
         def eat_one(device):
             entry = self._make_partition_namespace(0, '', '', dflt)
             entry.name = device.get('name', '')
@@ -224,16 +231,25 @@ class DeviceInfo:
 
             return entry
 
-        # Run the `lsblk` command and get its output in JSON format with additional columns
-        # Use timeout to prevent UI freeze if lsblk hangs on problematic devices
-        try:
-            result = subprocess.run(['lsblk', '-J', '--bytes', '-o',
-                                    'NAME,MAJ:MIN,FSTYPE,TYPE,LABEL,PARTLABEL,FSUSE%,SIZE,MOUNTPOINTS,UUID,PARTUUID,SERIAL'],
-                                   stdout=subprocess.PIPE, text=True, check=False, timeout=10.0)
-            parsed_data = json.loads(result.stdout)
-        except subprocess.TimeoutExpired:
-            # lsblk hung - return empty dict to use previous device state
-            return {}
+        # Get lsblk output - either from parameter or by running command
+        if lsblk_output is not None:
+            # Use provided output string
+            try:
+                parsed_data = json.loads(lsblk_output)
+            except (json.JSONDecodeError, Exception):
+                # Invalid JSON - return empty dict
+                return {}
+        else:
+            # Run the `lsblk` command and get its output in JSON format with additional columns
+            # Use timeout to prevent UI freeze if lsblk hangs on problematic devices
+            try:
+                result = subprocess.run(['lsblk', '-J', '--bytes', '-o',
+                                        'NAME,MAJ:MIN,FSTYPE,TYPE,LABEL,PARTLABEL,FSUSE%,SIZE,MOUNTPOINTS,UUID,PARTUUID,SERIAL'],
+                                       stdout=subprocess.PIPE, text=True, check=False, timeout=10.0)
+                parsed_data = json.loads(result.stdout)
+            except subprocess.TimeoutExpired:
+                # lsblk hung - return empty dict to use previous device state
+                return {}
         entries = {}
 
         # Parse each block device and its properties
@@ -597,9 +613,15 @@ class DeviceInfo:
                 new_ns.newly_inserted = True  # Mark for orange color even if locked/mounted
         return nss
 
-    def assemble_partitions(self, prev_nss=None):
-        """Assemble and filter partitions for display"""
-        nss = self.parse_lsblk(dflt='^' if prev_nss else '-', prev_nss=prev_nss)
+    def assemble_partitions(self, prev_nss=None, lsblk_output=None):
+        """Assemble and filter partitions for display
+
+        Args:
+            prev_nss: Previous device namespaces for merging
+            lsblk_output: Optional lsblk JSON output string from LsblkMonitor
+        """
+        nss = self.parse_lsblk(dflt='^' if prev_nss else '-', prev_nss=prev_nss,
+                               lsblk_output=lsblk_output)
 
         nss = self.get_disk_partitions(nss)
 

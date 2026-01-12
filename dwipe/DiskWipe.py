@@ -24,6 +24,7 @@ from .DeviceInfo import DeviceInfo
 from .Utils import Utils
 from .PersistentState import PersistentState
 from .StructuredLogger import StructuredLogger
+from .LsblkMonitor import LsblkMonitor
 
 # Screen constants
 MAIN_ST = 0
@@ -271,11 +272,11 @@ class DiskWipe:
         line += f' [P]ass={self.opts.passes}'
         # Show verification percentage spinner with key
         line += f' [V]pct={self.opts.verify_pct}%'
-        line += ' [p]ort'
+        line += f' [p]ort={self.opts.port_serial}'
         line += '  '
         if self.opts.dry_run:
             line += ' DRY-RUN'
-        line += ' [h]ist [t]heme ?:help [q]uit'
+        line += ' !:scan [h]ist [t]heme ?:help [q]uit'
         return line[1:]
 
     def get_actions(self, part):
@@ -290,6 +291,8 @@ class DiskWipe:
                 actions['s'] = 'stop'
             elif self.test_state(part, to='0%'):
                 actions['w'] = 'wipe'
+                if part.parent is None:
+                    actions['DEL'] = 'DEL'
             # Can verify:
             # 1. Anything with wipe markers (states 's' or 'W')
             # 2. Unmarked whole disks (no parent, state '-' or '^') WITHOUT partitions that have filesystems
@@ -399,7 +402,7 @@ class DiskWipe:
         spin = self.spin = OptionSpinner(stack=self.stack)
         spin.default_obj = self.opts
         spin.add_key('dense', 'D - dense/spaced view', vals=[False, True])
-        spin.add_key('port_serial', 'p - disk port info', vals=[False, True])
+        spin.add_key('port_serial', 'p - disk port info', vals=['Auto', 'On', 'Off'])
         spin.add_key('slowdown_stop', 'L - stop if disk slows Nx', vals=[16, 64, 256, 0, 4])
         spin.add_key('stall_timeout', 'T - stall timeout (sec)', vals=[60, 120, 300, 600, 0,])
         spin.add_key('verify_pct', 'V - verification %', vals=[0, 2, 5, 10, 25, 50, 100])
@@ -415,6 +418,9 @@ class DiskWipe:
         spin.add_key('verify', 'v - verify device', genre='action')
         spin.add_key('stop', 's - stop wipe', genre='action')
         spin.add_key('block', 'b - block/unblock disk', genre='action')
+        spin.add_key('delete_device', 'DEL - remove disk from lsblk',
+                         genre='action', keys=(cs.KEY_DC, cs.KEY_BACKSPACE, 127))
+        spin.add_key('scan_all_devices', '! - rescan all devices', genre='action')
         spin.add_key('stop_all', 'S - stop ALL wipes', genre='action')
         spin.add_key('help', '? - show help screen', genre='action')
         spin.add_key('history', 'h - show wipe history', genre='action')
@@ -439,34 +445,52 @@ class DiskWipe:
         pick_range = info.get_pick_range()
         self.win.set_pick_range(pick_range[0], pick_range[1])
 
+        # Start background lsblk monitor
+        lsblk_monitor = LsblkMonitor(check_interval=0.2)
+        lsblk_monitor.start()
+
         check_devices_mono = time.monotonic()
-        while True:
-            # Draw current screen
-            current_screen = self.screens[self.stack.curr.num]
-            current_screen.draw_screen()
-            self.win.render()
+        last_redraw_time = time.monotonic()
 
-            seconds = current_screen.refresh_seconds
-            _ = self.do_key(self.win.prompt(seconds=seconds))
+        try:
+            while True:
+                # Draw current screen
+                current_screen = self.screens[self.stack.curr.num]
+                current_screen.draw_screen()
+                self.win.render()
 
-            # Handle actions using perform_actions
-            self.stack.perform_actions(spin)
+                # Main thread timeout for responsive UI (background monitor checks every 0.2s)
+                _ = self.do_key(self.win.prompt(seconds=0.25))
 
-            if time.monotonic() - check_devices_mono > (seconds * 0.95):
-                info = DeviceInfo(opts=self.opts, persistent_state=self.persistent_state)
-                self.partitions = info.assemble_partitions(self.partitions)
-                self.get_hw_caps_when_needed()
-                self.dev_info = info
-                # Update pick range to highlight NAME through SIZE fields
-                pick_range = info.get_pick_range()
-                self.win.set_pick_range(pick_range[0], pick_range[1])
-                check_devices_mono = time.monotonic()
+                # Handle actions using perform_actions
+                self.stack.perform_actions(spin)
 
-            # Save any persistent state changes
-            self.persistent_state.save_updated_opts(self.opts)
-            self.persistent_state.sync()
+                # Check for new lsblk data from background monitor
+                lsblk_output = lsblk_monitor.get_and_clear()
 
-            self.win.clear()
+                if lsblk_output:
+                    # New device changes detected - refresh immediately
+                    info = DeviceInfo(opts=self.opts, persistent_state=self.persistent_state)
+                    self.partitions = info.assemble_partitions(self.partitions, lsblk_output=lsblk_output)
+                    self.get_hw_caps_when_needed()
+                    self.dev_info = info
+                    # Update pick range to highlight NAME through SIZE fields
+                    pick_range = info.get_pick_range()
+                    self.win.set_pick_range(pick_range[0], pick_range[1])
+                    check_devices_mono = time.monotonic()
+                    last_redraw_time = time.monotonic()
+                elif time.monotonic() - last_redraw_time > 5.0:
+                    # Gratuitous 5s redraw even if no changes
+                    last_redraw_time = time.monotonic()
+
+                # Save any persistent state changes
+                self.persistent_state.save_updated_opts(self.opts)
+                self.persistent_state.sync()
+
+                self.win.clear()
+        finally:
+            # Clean up monitor thread on exit
+            lsblk_monitor.stop()
 
 class DiskWipeScreen(Screen):
     """ TBD """
@@ -738,9 +762,13 @@ class MainScreen(DiskWipeScreen):
             ctx = Context(genre='disk' if partition.parent is None else 'partition',
                          partition=partition)
             app.win.add_body(partition.line, attr=attr, context=ctx)
-            if partition.parent is None and app.opts.port_serial:
-                line = self._port_serial_line(partition)
-                app.win.add_body(line, attr=attr, context=Context(genre='DECOR'))
+            if partition.parent is None and app.opts.port_serial != 'Off':
+                doit = bool(app.opts.port_serial == 'On')
+                if not doit and app.test_state(partition, to='0%'):
+                    doit = True
+                if doit:
+                    line = self._port_serial_line(partition)
+                    app.win.add_body(line, attr=attr, context=Context(genre='DECOR'))
 
             # Show inline confirmation prompt if this is the partition being confirmed
             if app.confirmation.active and app.confirmation.identity == partition.name:
@@ -869,6 +897,39 @@ class MainScreen(DiskWipeScreen):
                                                         part.size_bytes, opts=app.opts)
                     app.job_cnt += 1
 
+    def scan_all_devices_ACTION(self):
+        """ Trigger a re-scan of all devices to make the appear
+        quicker in the list"""
+        base_path = '/sys/class/scsi_host'
+        if not os.path.exists(base_path):
+            return
+        for host in os.listdir(base_path):
+            scan_file = os.path.join(base_path, host, 'scan')
+            if os.path.exists(scan_file):
+                try:
+                    with open(scan_file, 'w', encoding='utf-8') as f:
+                        f.write("- - -")
+                except Exception:
+                    pass
+
+    def delete_device_ACTION(self):
+        """ DEL key -- Cause the OS to drop a sata device so it
+            can be replaced sooner """
+        app = self.app
+        ctx = app.win.get_picked_context()
+        if ctx and hasattr(ctx, 'partition'):
+            part = ctx.partition
+            if not part or part.parent or not app.test_state(part, to='0%'):
+                return
+            path = f"/sys/block/{part.name}/device/delete"
+            if os.path.exists(path):
+                try:
+                    with open(path, 'w', encoding='utf-8') as f:
+                        f.write("1")
+                    return True
+                except Exception:
+                    pass
+
     def stop_ACTION(self):
         """Handle 's' key"""
         app = self.app
@@ -879,6 +940,7 @@ class MainScreen(DiskWipeScreen):
                 if part.state[-1] == '%':
                     if part.job and not part.job.done:
                         part.job.do_abort = True
+
 
     def stop_all_ACTION(self):
         """Handle 'S' key"""
