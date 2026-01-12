@@ -135,6 +135,14 @@ class WipeTask:
             "bytes_processed": self.total_written,
         }
 
+    def get_display_name(self):
+        """Get human-readable name for this task type (for progress display)
+
+        Returns:
+            str: Task name like "Zero", "Rand", "Crypto", "Verify", etc.
+        """
+        return "Task"  # Default, should be overridden
+
     def abort(self):
         """Signal task to stop (thread-safe)"""
         self.do_abort = True

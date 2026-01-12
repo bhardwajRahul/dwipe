@@ -209,6 +209,15 @@ class WipeJob:
         sync_thread = threading.Thread(target=sync_abort_flag, daemon=True)
         sync_thread.start()
 
+        # Track if all write tasks have completed
+        all_writes_complete = False
+        last_write_task_index = -1
+
+        # Find the last WriteTask index
+        for i, task in enumerate(self.tasks):
+            if isinstance(task, WriteTask):
+                last_write_task_index = i
+
         try:
             for i, task in enumerate(self.tasks):
                 # Skip already-completed tasks (from resume logic)
@@ -227,7 +236,11 @@ class WipeJob:
                 # Check for task errors
                 if task.exception:
                     self.exception = task.exception
-                    break
+                    # For write tasks, failure means wipe didn't succeed
+                    if isinstance(task, WriteTask):
+                        break
+                    # For verify tasks, continue but record the exception
+                    # (wipe succeeded but verification failed)
 
                 # Check if task was aborted (sync abort state)
                 if task.do_abort and not self.do_abort:
@@ -248,6 +261,11 @@ class WipeJob:
                     elif isinstance(task, WriteRandTask):
                         self.expected_pattern = "random"
 
+                    # Write final marker after last write task completes successfully
+                    if i == last_write_task_index and not task.exception and not self.do_abort:
+                        all_writes_complete = True
+                        self._write_final_marker()
+
                 # Verify tasks
                 elif isinstance(task, VerifyTask):
                     self.verify_phase = True
@@ -262,6 +280,27 @@ class WipeJob:
         finally:
             # Stop abort sync thread
             stop_sync[0] = True
+
+            # Write marker on stop to capture current progress (not just last 30s marker)
+            if self.do_abort and self.total_written > 0 and not all_writes_complete:
+                # Stopped mid-wipe - write progress marker
+                # Determine pattern from last completed WriteTask
+                is_random = False  # Default to zeros
+                for task in reversed(self.tasks):
+                    if isinstance(task, WriteTask) and task.total_written > 0:
+                        is_random = isinstance(task, WriteRandTask)
+                        break
+
+                try:
+                    if not self.opts.dry_run:
+                        with open(self.device_path, 'r+b') as marker_file:
+                            marker_file.seek(0)
+                            marker_file.write(self.prep_marker_buffer(is_random, verify_status=None))
+                            marker_file.flush()
+                            os.fsync(marker_file.fileno())
+                except Exception:
+                    pass  # Don't fail the stop on marker write error
+
             # Always mark as done when tasks complete
             self.done = True
             self.current_task = None
@@ -369,6 +408,12 @@ class WipeJob:
         base_mode = mode.replace('+V', '')  # Remove verification suffix
         auto_verify = '+V' in mode
         passes = getattr(opts, 'passes', 1)
+
+        # Check if mode changed - if so, don't resume (start fresh)
+        if resume_mode and resume_mode != base_mode:
+            # User changed wipe mode (e.g., Zero -> Rand) - start fresh
+            resume_from = 0
+            resume_mode = None
 
         # Use resume_mode if resuming, otherwise use current mode
         desired_mode = resume_mode if resume_mode else base_mode
@@ -871,6 +916,8 @@ class WipeJob:
             with open(self.device_path, 'r+b') as marker_file:
                 marker_file.seek(0)
                 marker_file.write(self.prep_marker_buffer(is_random))
+                marker_file.flush()
+                os.fsync(marker_file.fileno())
             self.last_marker_update_mono = now_mono
         except Exception:
             # If marker update fails, just continue - we'll try again in 30s
@@ -1111,8 +1158,11 @@ class WipeJob:
                     with open(self.device_path, 'r+b') as marker_file:
                         marker_file.seek(0)
                         marker_file.write(self.prep_marker_buffer(final_is_random))
+                        marker_file.flush()
+                        os.fsync(marker_file.fileno())
                 except Exception:
-                    pass  # Marker write failure shouldn't fail the whole job
+                    # Log marker write failure but don't fail the whole job
+                    self.exception = f"Marker write failed: {traceback.format_exc()}"
 
             # Auto-start verification if enabled and write completed successfully
             verify_pct = getattr(self.opts, 'verify_pct', 0)
@@ -1469,6 +1519,38 @@ class WipeJob:
 
 
 
+    def _write_final_marker(self):
+        """Write final marker after write tasks complete (shows 100% completion)
+
+        This marker indicates the wipe is complete, regardless of verification.
+        Does NOT include verify_status - that's just for display/logging.
+        """
+        try:
+            # Determine final pattern from last WriteTask in task sequence
+            is_random = False  # Default to zeros
+            last_write_task = None
+            for task in reversed(self.tasks):
+                if isinstance(task, WriteTask):
+                    last_write_task = task
+                    break
+
+            if last_write_task:
+                is_random = isinstance(last_write_task, WriteRandTask)
+
+            # Write marker WITHOUT verify_status (write completion only)
+            if not self.opts.dry_run:
+                with open(self.device_path, 'r+b') as marker_file:
+                    marker_file.seek(0)
+                    marker_file.write(self.prep_marker_buffer(is_random, verify_status=None))
+                    marker_file.flush()
+                    os.fsync(marker_file.fileno())
+
+        except Exception:
+            # Log error but don't fail the job - marker write is not critical
+            # The wipe itself succeeded
+            if not self.exception:  # Don't overwrite existing exception
+                self.exception = f"Final marker write failed: {traceback.format_exc()}"
+
     def _write_marker_with_verify_status(self, is_random):
         """Write marker buffer with verification status if verification was performed
 
@@ -1514,12 +1596,13 @@ class WipeJob:
                     self.total_written = self.total_size  # Mark as fully wiped
                 # Write marker for this previously unmarked disk
             elif existing_marker:
-                # Only write if verify status changed
-                if existing_verify_status == new_verify_status:
-                    return
                 # Preserve original scrubbed_bytes if this is a verify-only job
                 if self.total_written == 0:
                     self.total_written = existing_marker.scrubbed_bytes
+                    # For verify-only jobs, only write if verify status changed
+                    if existing_verify_status == new_verify_status:
+                        return
+                # Otherwise, always update marker (to reflect wipe completion or status change)
             else:
                 # No marker and verify failed - don't write marker
                 return
@@ -1531,6 +1614,8 @@ class WipeJob:
                     marker_buffer = self.prep_marker_buffer(is_random,
                                                             verify_status=new_verify_status)
                     device.write(marker_buffer)
+                    device.flush()
+                    os.fsync(device.fileno())
 
         except Exception:
             # Catch ANY exception in this method to ensure self.done is always set

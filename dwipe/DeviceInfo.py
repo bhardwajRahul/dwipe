@@ -232,7 +232,7 @@ class DeviceInfo:
             return entry
 
         # Get lsblk output - either from parameter or by running command
-        if lsblk_output is not None:
+        if lsblk_output:  # Non-empty string from background monitor
             # Use provided output string
             try:
                 parsed_data = json.loads(lsblk_output)
@@ -247,8 +247,9 @@ class DeviceInfo:
                                         'NAME,MAJ:MIN,FSTYPE,TYPE,LABEL,PARTLABEL,FSUSE%,SIZE,MOUNTPOINTS,UUID,PARTUUID,SERIAL'],
                                        stdout=subprocess.PIPE, text=True, check=False, timeout=10.0)
                 parsed_data = json.loads(result.stdout)
-            except subprocess.TimeoutExpired:
-                # lsblk hung - return empty dict to use previous device state
+            except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception):  # pylint: disable=broad-exception-caught
+                # lsblk hung, returned bad JSON, or other error - return empty dict
+                # assemble_partitions will detect this and preserve previous state
                 return {}
         entries = {}
 
@@ -359,6 +360,14 @@ class DeviceInfo:
             for minor in minors:
                 minor.state = 'Busy'
         return True
+
+    @staticmethod
+    def clear_inferred_states(nss):
+        """Clear all inferred states (Busy, Mnt) so they can be re-inferred"""
+        inferred_states = ('Busy', 'Mnt')
+        for ns in nss.values():
+            if ns.state in inferred_states:
+                ns.state = ns.dflt
 
     @staticmethod
     def set_all_states(nss):
@@ -623,6 +632,17 @@ class DeviceInfo:
         nss = self.parse_lsblk(dflt='^' if prev_nss else '-', prev_nss=prev_nss,
                                lsblk_output=lsblk_output)
 
+        # If parse_lsblk failed (returned empty) and we have previous data, keep previous state
+        if not nss and prev_nss:
+            # lsblk scan failed or returned no devices - preserve previous state
+            # This prevents losing devices when lsblk temporarily fails
+            # But clear temporary status messages from completed jobs
+            for ns in prev_nss.values():
+                if not ns.job and ns.mounts:
+                    # Job finished - clear temporary status messages like "Verified: zeroed"
+                    ns.mounts = [m for m in ns.mounts if not m.startswith(('Verified:', 'Stopped'))]
+            return prev_nss  # Return early - don't reprocess
+
         nss = self.get_disk_partitions(nss)
 
         nss = self.merge_dev_infos(nss, prev_nss)
@@ -636,6 +656,8 @@ class DeviceInfo:
                 if self.persistent_state.get_device_locked(ns):
                     ns.state = 'Blk'
 
+        # Clear inferred states so they can be re-computed based on current job status
+        self.clear_inferred_states(nss)
         self.set_all_states(nss)  # set inferred states
 
         self.compute_field_widths(nss)

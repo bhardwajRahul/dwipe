@@ -419,7 +419,7 @@ class DiskWipe:
         spin.add_key('stop', 's - stop wipe', genre='action')
         spin.add_key('block', 'b - block/unblock disk', genre='action')
         spin.add_key('delete_device', 'DEL - remove disk from lsblk',
-                         genre='action', keys=(cs.KEY_DC, cs.KEY_BACKSPACE, 127))
+                         genre='action', keys=(cs.KEY_DC))
         spin.add_key('scan_all_devices', '! - rescan all devices', genre='action')
         spin.add_key('stop_all', 'S - stop ALL wipes', genre='action')
         spin.add_key('help', '? - show help screen', genre='action')
@@ -429,6 +429,7 @@ class DiskWipe:
         spin.add_key('spin_theme', 't - theme', genre='action', scope=THEME_ST)
         spin.add_key('header_mode', '_ - header style', vals=['Underline', 'Reverse', 'Off'])
         spin.add_key('expand', 'e - expand history entry', genre='action', scope=LOG_ST)
+        spin.add_key('show_keys', 'K - show keys (demo mode)', genre='action')
         self.opts.theme = ''
         self.persistent_state.restore_updated_opts(self.opts)
         Theme.set(self.opts.theme)
@@ -450,7 +451,6 @@ class DiskWipe:
         lsblk_monitor.start()
 
         check_devices_mono = time.monotonic()
-        last_redraw_time = time.monotonic()
 
         try:
             while True:
@@ -467,9 +467,10 @@ class DiskWipe:
 
                 # Check for new lsblk data from background monitor
                 lsblk_output = lsblk_monitor.get_and_clear()
+                time_since_refresh = time.monotonic() - check_devices_mono
 
-                if lsblk_output:
-                    # New device changes detected - refresh immediately
+                if lsblk_output or time_since_refresh > 3.0:
+                    # Refresh if: device changes detected OR periodic refresh (3s default)
                     info = DeviceInfo(opts=self.opts, persistent_state=self.persistent_state)
                     self.partitions = info.assemble_partitions(self.partitions, lsblk_output=lsblk_output)
                     self.get_hw_caps_when_needed()
@@ -478,10 +479,6 @@ class DiskWipe:
                     pick_range = info.get_pick_range()
                     self.win.set_pick_range(pick_range[0], pick_range[1])
                     check_devices_mono = time.monotonic()
-                    last_redraw_time = time.monotonic()
-                elif time.monotonic() - last_redraw_time > 5.0:
-                    # Gratuitous 5s redraw even if no changes
-                    last_redraw_time = time.monotonic()
 
                 # Save any persistent state changes
                 self.persistent_state.save_updated_opts(self.opts)
@@ -501,8 +498,18 @@ class DiskWipeScreen(Screen):
         """ return to main screen """
         self.app.stack.pop()
 
+    def show_keys_ACTION(self):
+        """ Show last key for demo"""
+        self.app.win.set_demo_mode(enabled=None) # toggle it
+
 class MainScreen(DiskWipeScreen):
     """Main device list screen"""
+    
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.persist_port_serial = set()
+
 
     def _port_serial_line(self, partition):
         wids = self.app.wids
@@ -523,6 +530,12 @@ class MainScreen(DiskWipeScreen):
             return not app.filter or app.filter.search(name)
 
         app.win.set_pick_mode(True)
+        if app.opts.port_serial != 'Auto':
+            self.persist_port_serial = set() # name of disks
+        else: # if the disk goes away, clear persistence
+            for name in list(self.persist_port_serial):
+                if name not in app.partitions:
+                    self.persist_port_serial.pop(name)
 
         # First pass: process jobs and collect visible partitions
         visible_partitions = []
@@ -712,18 +725,31 @@ class MainScreen(DiskWipeScreen):
             if partition.job:
                 elapsed, pct, rate, until = partition.job.get_status()
 
+                # Get task display name (Zero, Rand, Crypto, Verify, etc.)
+                task_name = ""
+                if partition.job.current_task:
+                    task_name = partition.job.current_task.get_display_name()
+
                 # FLUSH goes in mounts column, not state
                 if pct.startswith('FLUSH'):
                     partition.state = partition.dflt  # Keep default state (s, W, etc)
                     if rate and until:
-                        partition.mounts = [f'{pct} {elapsed} -{until} {rate}']
+                        partition.mounts = [f'{task_name} {pct} {elapsed} -{until} {rate}']
                     else:
-                        partition.mounts = [f'{pct} {elapsed}']
+                        partition.mounts = [f'{task_name} {pct} {elapsed}']
                 else:
                     partition.state = pct
-                    slowdown =  partition.job.max_slowdown_ratio # temp?
-                    stall =  partition.job.max_stall_secs      # temp
-                    partition.mounts = [f'{elapsed} -{until} {rate} ÷{slowdown} 𝚫{Utils.ago_str(stall)}']
+                    # Build progress line with task name
+                    progress_parts = [task_name, elapsed, f'-{until}', rate]
+
+                    # Only show slowdown/stall if job tracks these metrics
+                    # (WriteTask does, VerifyTask and FirmwareWipeTask don't)
+                    if hasattr(partition.job, 'max_slowdown_ratio') and hasattr(partition.job, 'max_stall_secs'):
+                        slowdown = partition.job.max_slowdown_ratio
+                        stall = partition.job.max_stall_secs
+                        progress_parts.extend([f'÷{slowdown}', f'𝚫{Utils.ago_str(stall)}'])
+
+                    partition.mounts = [' '.join(progress_parts)]
 
             if partition.parent and partition.parent in app.partitions and (
                     app.partitions[partition.parent].state == 'Blk'):
@@ -764,8 +790,11 @@ class MainScreen(DiskWipeScreen):
             app.win.add_body(partition.line, attr=attr, context=ctx)
             if partition.parent is None and app.opts.port_serial != 'Off':
                 doit = bool(app.opts.port_serial == 'On')
+                if not doit:
+                    doit = bool(partition.name in self.persist_port_serial)
                 if not doit and app.test_state(partition, to='0%'):
                     doit = True
+                    self.persist_port_serial.add(partition.name)
                 if doit:
                     line = self._port_serial_line(partition)
                     app.win.add_body(line, attr=attr, context=Context(genre='DECOR'))

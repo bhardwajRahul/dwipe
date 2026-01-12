@@ -61,6 +61,10 @@ class FirmwareWipeTask(WipeTask):
         """
         return 60  # Default 1 minute
 
+    def get_display_name(self):
+        """Get display name for firmware wipe"""
+        return self.wipe_name
+
     def _build_command(self):
         """Build command list for subprocess (must be implemented by subclasses)
 

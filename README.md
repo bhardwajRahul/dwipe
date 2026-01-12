@@ -22,6 +22,24 @@
 > * **Modern drives are reliably wiped with one pass of zeros**; just zero once in almost all cases for best, fastest results.
 > * `dwipe` offers Multi-pass and Rand modes as "checkbox" features, but those provide no additional security on drives manufactured after 2001 (NIST SP 800-88).
 
+## **V3 Features**
+
+* **Hardware-based firmware wipes** - Full support for firmware-level secure erase operations:
+  - **NVMe Sanitize**: Crypto Erase, Block Erase, and Overwrite operations via `nvme-cli`
+  - **NVMe Format**: Secure format with optional crypto erase
+  - **SATA ATA Security Erase**: Normal and Enhanced erase modes via `hdparm`
+  - Automatic capability detection shows only supported methods for each drive
+  - Firmware wipes are much faster than software wipes (seconds to minutes vs hours)
+  - Same user interface - firmware options appear alongside Zero/Rand in wipe confirmation
+  - Progress tracking with "FW" indicator to show hardware operation in progress
+  - Persistent markers track firmware wipe completion and method used
+  - See [FIRMWARE_WIPES.md](FIRMWARE_WIPES.md) for technical details
+* **Background device monitoring** - Efficient hot-swap detection with dedicated monitoring thread:
+  - Monitors `/sys/class/block` and `/proc/partitions` for device changes
+  - Runs `lsblk` only when changes detected (previously ran every refresh)
+  - Reduces CPU usage and improves responsiveness
+  - Faster detection of newly inserted or removed devices
+
 ## **V2 Features**
 
 * **Statistical verification** - Automatic or on-demand verification with intelligent pattern detection:

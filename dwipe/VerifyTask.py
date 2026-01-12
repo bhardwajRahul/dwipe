@@ -401,6 +401,10 @@ class VerifyZeroTask(VerifyTask):
         super().__init__(device_path, total_size, opts, verify_pct, expected_pattern="zeroed")
         self.fast_fail = True  # Use fast memcmp verification
 
+    def get_display_name(self):
+        """Get display name for zero verification"""
+        return "Verify"
+
 
 class VerifyRandTask(VerifyTask):
     """Verify disk contains random pattern"""
@@ -408,3 +412,7 @@ class VerifyRandTask(VerifyTask):
     def __init__(self, device_path, total_size, opts=None, verify_pct=2):
         super().__init__(device_path, total_size, opts, verify_pct, expected_pattern="random")
         self.fast_fail = False  # Use statistical analysis
+
+    def get_display_name(self):
+        """Get display name for random verification"""
+        return "Verify"

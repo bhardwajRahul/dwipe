@@ -393,6 +393,10 @@ class WriteZeroTask(WriteTask):
         """Return zero buffer slice"""
         return WipeTask.zero_buffer[:chunk_size]
 
+    def get_display_name(self):
+        """Get display name for zeros write"""
+        return "Zero"
+
 
 class WriteRandTask(WriteTask):
     """Write random data to disk"""
@@ -400,3 +404,7 @@ class WriteRandTask(WriteTask):
     def get_buffer(self, chunk_size):
         """Return random buffer slice"""
         return WipeTask.buffer[:chunk_size]
+
+    def get_display_name(self):
+        """Get display name for random write"""
+        return "Rand"
