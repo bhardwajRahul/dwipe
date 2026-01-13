@@ -36,6 +36,10 @@
   - Runs `lsblk` only when changes detected (previously ran every refresh)
   - Reduces CPU usage and improves responsiveness
   - Faster detection of newly inserted or removed devices
+* **Lock renamed Block** - To reduce confusion, the "lock" feature is renamed.
+  - "Blocking" a partition or disk is only effective within the running app.
+  - It prevents wiping w/o first unblocking even if unmounted or otherwise it a wipeable state.
+  - It does not system level lock of any type.
 * **Hardware-based firmware wipes (EXPERIMENTAL/ALPHA)** - Full support for firmware-level secure erase operations:
   - **⚠️ Requires `--firmware-wipes` flag to enable (disabled by default)**
   - **NVMe Sanitize**: Crypto Erase, Block Erase, and Overwrite operations via `nvme-cli`
