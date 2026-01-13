@@ -233,21 +233,8 @@ class WipeJob:
                 # Run the task
                 task.run_task()
 
-                # Check for task errors
-                if task.exception:
-                    self.exception = task.exception
-                    # For write tasks, failure means wipe didn't succeed
-                    if isinstance(task, WriteTask):
-                        break
-                    # For verify tasks, continue but record the exception
-                    # (wipe succeeded but verification failed)
-
-                # Check if task was aborted (sync abort state)
-                if task.do_abort and not self.do_abort:
-                    self.do_abort = True
-                    break
-
-                # Proxy task state back to WipeJob for compatibility
+                # Proxy task state back to WipeJob for compatibility FIRST
+                # (before checking exceptions, so we capture metrics even on failure)
                 # Write tasks
                 if isinstance(task, WriteTask):
                     self.total_written = task.total_written
@@ -277,6 +264,23 @@ class WipeJob:
                     summary = task.get_summary_dict()
                     self.verify_result = summary.get('result', None)
 
+                # Check for task errors (AFTER proxying state)
+                if task.exception:
+                    self.exception = task.exception
+                    # For write tasks, failure means wipe didn't succeed
+                    if isinstance(task, WriteTask):
+                        # Sync abort state before breaking
+                        if task.do_abort:
+                            self.do_abort = True
+                        break
+                    # For verify tasks, continue but record the exception
+                    # (wipe succeeded but verification failed)
+
+                # Check if task was aborted (sync abort state)
+                if task.do_abort and not self.do_abort:
+                    self.do_abort = True
+                    break
+
         finally:
             # Stop abort sync thread
             stop_sync[0] = True
@@ -292,9 +296,11 @@ class WipeJob:
                         break
 
                 try:
+                    abort_reason = self._extract_abort_reason()
                     with open(self.device_path, 'r+b') as marker_file:
                         marker_file.seek(0)
-                        marker_file.write(self.prep_marker_buffer(is_random, verify_status=None))
+                        marker_file.write(self.prep_marker_buffer(is_random, verify_status=None,
+                                                                   abort_reason=abort_reason))
                         marker_file.flush()
                         os.fsync(marker_file.fileno())
                 except Exception:
@@ -591,6 +597,10 @@ class WipeJob:
         """
         # NEW: Proxy to current task if using task-based architecture
         if self.current_task is not None:
+            # Continuously proxy task metrics to job for display (especially for WriteTask)
+            if isinstance(self.current_task, WriteTask):
+                self.max_slowdown_ratio = max(self.max_slowdown_ratio, self.current_task.max_slowdown_ratio)
+                self.max_stall_secs = max(self.max_stall_secs, self.current_task.max_stall_secs)
             return self.current_task.get_status()
 
         # LEGACY: Original implementation for backwards compatibility
@@ -740,15 +750,33 @@ class WipeJob:
                 steps.append(task_summary)
                 total_errors += task_summary.get('errors', 0)
 
+            # Calculate actual percentage complete from total work done
+            total_work = self.total_size * self.passes
+            pct_complete = min(100, (self.total_written / total_work) * 100 if total_work > 0 else 0)
+
+            # Extract abort reason and error message if stopped with exception
+            abort_reason = None
+            error_message = None
+            if self.do_abort and self.exception:
+                abort_reason = self._extract_abort_reason()
+                error_message = self.exception
+
             # Build top-level summary
             summary = {
                 "result": "stopped" if self.do_abort else "completed",
                 "total_elapsed": Utils.ago_str(int(total_elapsed)),
                 "total_errors": total_errors,
-                "pct_complete": 100.0 if self.done and not self.do_abort else 0.0,
+                "pct_complete": round(pct_complete, 1),
                 "resumed_from_bytes": self.resume_from,
                 "steps": steps,
             }
+
+            # Add error information if present
+            if abort_reason:
+                summary["abort_reason"] = abort_reason
+            if error_message:
+                summary["error_message"] = error_message
+
             return summary
 
         # LEGACY: Original implementation for backwards compatibility
@@ -813,6 +841,13 @@ class WipeJob:
 
             steps.append(verify_step)
 
+        # Extract abort reason and error message if stopped with exception
+        abort_reason = None
+        error_message = None
+        if self.do_abort and self.exception:
+            abort_reason = self._extract_abort_reason()
+            error_message = self.exception
+
         # Build top-level summary
         summary = {
             "result": "stopped" if self.do_abort else "completed",
@@ -823,9 +858,35 @@ class WipeJob:
             "steps": steps,
         }
 
+        # Add error information if present
+        if abort_reason:
+            summary["abort_reason"] = abort_reason
+        if error_message:
+            summary["error_message"] = error_message
+
         return summary
 
-    def prep_marker_buffer(self, is_random, verify_status=None):
+    def _extract_abort_reason(self):
+        """Extract short error reason from exception for marker
+
+        Returns short lowercase error type like 'slowdown', 'stall', or None
+        if no user-facing abort reason exists (only used for abnormal stops).
+        """
+        if not self.exception:
+            return None
+
+        exc_lower = self.exception.lower()
+
+        # Check for known abort conditions
+        if 'slowdown abort' in exc_lower:
+            return 'slowdown'
+        elif 'stall detected' in exc_lower:
+            return 'stall'
+
+        # Don't record internal errors in marker (marker write failures, tracebacks, etc.)
+        return None
+
+    def prep_marker_buffer(self, is_random, verify_status=None, abort_reason=None):
         """Get the 1st 16KB to write:
         - 15K zeros
         - JSON status + zero fill to 1KB
@@ -837,10 +898,12 @@ class WipeJob:
             - passes: Number of passes intended/completed
             - mode: 'Rand' or 'Zero' (final desired pattern)
             - verify_status: 'pass', 'fail', or omitted (not verified)
+            - abort_reason: short error description if job failed abnormally
 
         Args:
             is_random: bool, whether random data was written
             verify_status: str, "pass", "fail", or None (not verified)
+            abort_reason: str, short error description or None (no error)
         """
         data = {"unixtime": int(time.time()),
                 "scrubbed_bytes": self.total_written,
@@ -850,6 +913,8 @@ class WipeJob:
                 }
         if verify_status is not None:
             data["verify_status"] = verify_status
+        if abort_reason is not None:
+            data["abort_reason"] = abort_reason
         json_data = json.dumps(data).encode('utf-8')
         buffer = bytearray(WipeTask.MARKER_SIZE)  # Only 16KB, not 1MB
         buffer[:WipeTask.STATE_OFFSET] = b'\x00' * WipeTask.STATE_OFFSET
@@ -1008,13 +1073,13 @@ class WipeJob:
         for key, value in data.items():
             if key in ('unixtime', 'scrubbed_bytes', 'size_bytes', 'passes') and isinstance(value, int):
                 rv[key] = value
-            elif key in ('mode', 'verify_status') and isinstance(value, str):
+            elif key in ('mode', 'verify_status', 'abort_reason') and isinstance(value, str):
                 rv[key] = value
             else:
                 return None  # bogus data
-        # Old markers: 4 fields (no passes, no verify_status)
-        # New markers: 5 fields minimum (with passes), 6 with verify_status
-        if len(rv) < 4 or len(rv) > 6:
+        # Old markers: 4 fields (no passes, no verify_status, no abort_reason)
+        # New markers: 5 fields minimum (with passes), 6 with verify_status, 7 with abort_reason
+        if len(rv) < 4 or len(rv) > 7:
             return None  # bogus data
         return SimpleNamespace(**rv)
 

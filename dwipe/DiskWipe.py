@@ -41,7 +41,6 @@ class DiskWipe:
     def __init__(self, opts=None):
         DiskWipe.singleton = self
         self.opts = opts if opts else SimpleNamespace(debug=0)
-        self.DB = bool(self.opts.debug)
         self.mounts_lines = None
         self.partitions = {}  # a dict of namespaces keyed by name
         self.wids = None
@@ -72,18 +71,6 @@ class DiskWipe:
 
         # Initialize persistent state
         self.persistent_state = PersistentState()
-#       self.check_preqreqs()
-
-#   @staticmethod
-#   def check_preqreqs():
-#       """Check that needed programs are installed."""
-#       ok = True
-#       for prog in 'lsblk'.split():
-#           if shutil.which(prog) is None:
-#               ok = False
-#               print(f'ERROR: cannot find {prog!r} on $PATH')
-#       if not ok:
-#           sys.exit(1)
 
     def _start_wipe(self):
         """Start the wipe job after confirmation"""
@@ -273,7 +260,8 @@ class DiskWipe:
         # Show verification percentage spinner with key
         line += f' [V]pct={self.opts.verify_pct}%'
         line += f' [p]ort={self.opts.port_serial}'
-        line += ' !:scan [h]ist [t]heme ?:help [q]uit'
+        # line += ' !:scan [h]ist [t]heme ?:help [q]uit'
+        line += ' [h]ist [t]heme ?:help [q]uit'
         return line[1:]
 
     def get_actions(self, part):
@@ -391,6 +379,22 @@ class DiskWipe:
             pick_attr=cs.A_REVERSE,  # Use reverse video for pick highlighting
             ctrl_c_terminates=False,
         )
+        lsblk_monitor = LsblkMonitor(check_interval=0.2)
+        lsblk_monitor.start()
+        print("Starting first lsblk...")
+        # Initialize device info and pick range before first draw
+        info = DeviceInfo(opts=self.opts, persistent_state=self.persistent_state)
+        lsblk_output = None
+        while not lsblk_output:
+            lsblk_output = lsblk_monitor.get_and_clear()
+            self.partitions = info.assemble_partitions(self.partitions, lsblk_output)
+            if lsblk_output:
+                # print(lsblk_output, '\n\n')
+                print('got ... got lsblk result')
+                if self.opts.dump_lsblk:
+                    DeviceInfo.dump(self.partitions, title="after assemble_partitions")
+                    exit(1)
+            time.sleep(0.2)
 
         self.win = ConsoleWindow(opts=win_opts)
         # Initialize screen stack
@@ -400,7 +404,7 @@ class DiskWipe:
         spin.default_obj = self.opts
         spin.add_key('dense', 'D - dense/spaced view', vals=[False, True])
         spin.add_key('port_serial', 'p - disk port info', vals=['Auto', 'On', 'Off'])
-        spin.add_key('slowdown_stop', 'L - stop if disk slows Nx', vals=[16, 64, 256, 0, 4])
+        spin.add_key('slowdown_stop', 'W - stop if disk slows Nx', vals=[64, 256, 0, 4, 16])
         spin.add_key('stall_timeout', 'T - stall timeout (sec)', vals=[60, 120, 300, 600, 0,])
         spin.add_key('verify_pct', 'V - verification %', vals=[0, 2, 5, 10, 25, 50, 100])
         spin.add_key('passes', 'P - wipe pass count', vals=[1, 2, 4])
@@ -432,20 +436,13 @@ class DiskWipe:
         Theme.set(self.opts.theme)
         self.win.set_handled_keys(self.spin.keys)
 
+        # Start background lsblk monitor
 
-        # self.opts.name = "[hit 'n' to enter name]"
-
-        # Initialize device info and pick range before first draw
-        info = DeviceInfo(opts=self.opts, persistent_state=self.persistent_state)
-        self.partitions = info.assemble_partitions(self.partitions)
         self.get_hw_caps_when_needed()
         self.dev_info = info
         pick_range = info.get_pick_range()
         self.win.set_pick_range(pick_range[0], pick_range[1])
 
-        # Start background lsblk monitor
-        lsblk_monitor = LsblkMonitor(check_interval=0.2)
-        lsblk_monitor.start()
 
         check_devices_mono = time.monotonic()
 
@@ -532,7 +529,7 @@ class MainScreen(DiskWipeScreen):
         else: # if the disk goes away, clear persistence
             for name in list(self.persist_port_serial):
                 if name not in app.partitions:
-                    self.persist_port_serial.pop(name)
+                    self.persist_port_serial.discard(name)
 
         # First pass: process jobs and collect visible partitions
         visible_partitions = []
@@ -631,6 +628,7 @@ class MainScreen(DiskWipeScreen):
                             partition.state = partition.dflt
                         partition.job = None
                         partition.marker_checked = False  # Reset to "dont-know" - will re-read on next scan
+                        partition.marker = ''  # Clear stale marker string to avoid showing old data during re-read
                     else:
                         # Wipe job completed (with or without auto-verify)
                         # Check if stopped during verify phase (after successful write)
@@ -710,15 +708,14 @@ class MainScreen(DiskWipeScreen):
                                           uuid=partition.uuid, verify_result=verify_detail)
 
                         if partition.job.exception:
-                            app.win.stop_curses()
-                            print('\n\n\n==========   ALERT  =========\n')
-                            print(f' FAILED: wipe {repr(partition.name)}')
-                            print(partition.job.exception)
-                            input('\n\n===== Press ENTER to continue ====> ')
-                            app.win._start_curses()
+                            app.win.alert(
+                                message=f'FAILED: wipe {repr(partition.name)}\n{partition.job.exception}',
+                                title='ALERT'
+                            )
 
                         partition.job = None
                         partition.marker_checked = False  # Reset to "dont-know" - will re-read on next scan
+                        partition.marker = ''  # Clear stale marker string to avoid showing old data during re-read
             if partition.job:
                 elapsed, pct, rate, until = partition.job.get_status()
 
@@ -800,25 +797,36 @@ class MainScreen(DiskWipeScreen):
             if app.confirmation.active and app.confirmation.identity == partition.name:
                 # Build confirmation message
                 if app.confirmation.action_type == 'wipe':
-                    msg = f'⚠️  WIPE {partition.name} ({Utils.human(partition.size_bytes)})'
+                    msg = f'⚠️  WIPE {partition.name}'
                 else:  # verify
-                    msg = f'⚠️  VERIFY {partition.name} ({Utils.human(partition.size_bytes)}) - writes marker'
+                    msg = f'⚠️  VERIFY {partition.name} [writes marker]'
 
-                # Add mode-specific prompt
+                # Add mode-specific prompt (base message without input)
                 if app.confirmation.mode == 'yes':
-                    msg += f" - Type 'yes': {app.confirmation.input_buffer}_"
+                    msg += " - Type 'yes': "
                 elif app.confirmation.mode == 'identity':
-                    msg += f" - Type '{partition.name}': {app.confirmation.input_buffer}_"
+                    msg += f" - Type '{partition.name}': "
                 elif app.confirmation.mode == 'choices':
                     choices_str = ', '.join(app.confirmation.choices)
-                    msg += f" - Choose ({choices_str}): {app.confirmation.input_buffer}_"
+                    msg += f" - Choose ({choices_str}): "
 
                 # Position message at fixed column (reduced from 28 to 20)
                 msg = ' ' * 20 + msg
 
-                # Add confirmation message as DECOR (non-pickable)
+                # Add confirmation message base as DECOR (non-pickable)
                 app.win.add_body(msg, attr=cs.color_pair(Theme.DANGER) | cs.A_BOLD,
                                context=Context(genre='DECOR'))
+
+                # Add input or hint on same line
+                if app.confirmation.input_buffer:
+                    # Show current input with cursor
+                    app.win.add_body(app.confirmation.input_buffer + '_',
+                                   attr=cs.color_pair(Theme.DANGER) | cs.A_BOLD,
+                                   resume=True)
+                else:
+                    # Show hint in dimmed italic
+                    hint = app.confirmation.get_hint()
+                    app.win.add_body(hint, attr=cs.A_DIM | cs.A_ITALIC, resume=True)
 
         app.win.add_fancy_header(app.get_keys_line(), mode=app.opts.header_mode)
 

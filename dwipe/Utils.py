@@ -210,7 +210,21 @@ class Utils:
         # Get rate from first step (wipe step)
         rate_str = summary['steps'][0]['rate'] if summary['steps'] else 'N/A'
 
-        message = f"{plan['operation'].capitalize()} {result_str}: {device['name']} {size_str} in {time_str} @ {rate_str}"
+        # Build base message
+        operation = plan['operation'].capitalize()
+        message = f"{operation} {result_str}: {device['name']} {size_str}"
+
+        # Add percentage if stopped
+        if result_str == 'stopped' and summary.get('pct_complete', 0) > 0:
+            message += f" ({summary['pct_complete']:.0f}%)"
+
+        # Add timing and rate
+        message += f" in {time_str} @ {rate_str}"
+
+        # Add error reason if present
+        abort_reason = summary.get('abort_reason')
+        if abort_reason:
+            message += f" [Error: {abort_reason}]"
 
         # Log the structured event
         logger.put(

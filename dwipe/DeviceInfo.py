@@ -17,11 +17,11 @@ import traceback
 from fnmatch import fnmatch
 from types import SimpleNamespace
 from console_window import Theme
+from dataclasses import asdict
 
 from .WipeJob import WipeJob
 from .Utils import Utils
 from .DrivePreChecker import DrivePreChecker
-# from .PersistentState import PersistentState
 
 
 class DeviceInfo:
@@ -31,8 +31,7 @@ class DeviceInfo:
     def __init__(self, opts, persistent_state=None):
         self.opts = opts
         self.checker = DrivePreChecker()
-        self.DB = opts.debug
-        self.wids = None
+        self.wids = SimpleNamespace(state=5, name=4, human=7, fstype=4, label=5)
         self.head_str = None
         self.partitions = None
         self.persistent_state = persistent_state
@@ -72,6 +71,10 @@ class DeviceInfo:
 
         # Initialize defaults
         ns.hw_caps, ns.hw_nopes = {}, {}
+
+        # Skip hardware checks if firmware wipes are disabled
+        if not getattr(self.opts, 'firmware_wipes', False):
+            return ns.hw_caps, ns.hw_nopes
 
         # 4. Perform the actual Probe
         dev_path = f"/dev/{ns.name}"
@@ -225,7 +228,14 @@ class DeviceInfo:
                         verify_prefix = '✓ '
                     elif verify_status == 'fail':
                         verify_prefix = '✗ '
-                    entry.marker = f'{verify_prefix}{state} {pct}% {marker.mode} {dt.strftime("%Y/%m/%d %H:%M")}'
+
+                    # Add error suffix if job failed abnormally
+                    error_suffix = ''
+                    abort_reason = getattr(marker, 'abort_reason', None)
+                    if abort_reason:
+                        error_suffix = f' Err[{abort_reason}]'
+
+                    entry.marker = f'{verify_prefix}{state} {pct}% {marker.mode} {dt.strftime("%Y/%m/%d %H:%M")}{error_suffix}'
                     entry.state = state
                     entry.dflt = state  # Set dflt so merge logic knows this partition has a marker
 
@@ -300,11 +310,6 @@ class DeviceInfo:
                 entry.mounts = []
 
         entries = final_entries
-
-        if self.DB:
-            print('\n\nDB: --->>> after parse_lsblk:')
-            for entry in entries.values():
-                print(vars(entry))
 
         return entries
 
@@ -419,7 +424,7 @@ class DeviceInfo:
 
     def compute_field_widths(self, nss):
         """Compute field widths for display formatting"""
-        wids = self.wids = SimpleNamespace(state=5, name=4, human=7, fstype=4, label=5)
+        wids = self.wids
         for ns in nss.values():
             wids.state = max(wids.state, len(ns.state))
             wids.name = max(wids.name, len(ns.name) + 2)
@@ -428,9 +433,6 @@ class DeviceInfo:
             wids.label = max(wids.label, len(ns.label))
             wids.fstype = max(wids.fstype, len(ns.fstype))
         self.head_str = self.get_head_str()
-        if self.DB:
-            print('\n\nDB: --->>> after compute_field_widths():')
-            print(f'self.wids={vars(wids)}')
 
     def get_head_str(self):
         """Generate header string for device list"""
@@ -661,10 +663,62 @@ class DeviceInfo:
         self.set_all_states(nss)  # set inferred states
 
         self.compute_field_widths(nss)
-
-        if self.DB:
-            print('\n\nDB: --->>> after assemble_partitions():')
-            for name, ns in nss.items():
-                print(f'DB: {name}: {vars(ns)}')
-        self.partitions = nss
         return nss
+
+    @staticmethod
+    def dump(parts=None, title='after lsblk'):
+        """Print nicely formatted device information"""
+        if not parts:
+            return
+
+        print(f'\n{"=" * 80}')
+        print(f'{title}')
+        print(f'{"=" * 80}\n')
+
+        # Separate disks and partitions
+        disks = {name: part for name, part in parts.items() if part.type == 'disk'}
+        partitions = {name: part for name, part in parts.items() if part.type == 'part'}
+
+        # Print each disk with its partitions
+        for disk_name in sorted(disks.keys()):
+            disk = disks[disk_name]
+
+            # Disk header
+            print(f'┌─ {disk.name} ({disk.model or "Unknown Model"})')
+            print(f'│  Size: {Utils.human(disk.size_bytes)}  Serial: {disk.serial or "N/A"}  Port: {disk.port or "N/A"}')
+            print(f'│  State: {disk.state}  Marker: {disk.marker or "(none)"}')
+
+            # Hardware capabilities
+            if disk.hw_caps:
+                caps = ', '.join(disk.hw_caps.keys())
+                print(f'│  Hardware: {caps}')
+
+            # Find and print partitions for this disk
+            disk_parts = [(name, part) for name, part in partitions.items()
+                         if part.parent == disk.name]
+
+            if disk_parts:
+                for i, (part_name, part) in enumerate(sorted(disk_parts)):
+                    is_last = (i == len(disk_parts) - 1)
+                    branch = '└─' if is_last else '├─'
+
+                    # Partition info
+                    label_str = f'"{part.label}"' if part.label else '(no label)'
+                    fstype_str = part.fstype or '(no filesystem)'
+
+                    print(f'│  {branch} {part.name}: {Utils.human(part.size_bytes)}')
+                    print(f'│  {"  " if is_last else "│ "}  Label: {label_str}  Type: {fstype_str}')
+                    print(f'│  {"  " if is_last else "│ "}  State: {part.state}  UUID: {part.uuid or "N/A"}')
+
+                    if part.marker:
+                        print(f'│  {"  " if is_last else "│ "}  Marker: {part.marker}')
+
+                    if part.mounts:
+                        mounts_str = ', '.join(part.mounts)
+                        print(f'│  {"  " if is_last else "│ "}  Mounted: {mounts_str}')
+            else:
+                print(f'│  └─ (no partitions)')
+
+            print('│')
+
+        print(f'{"=" * 80}\n')

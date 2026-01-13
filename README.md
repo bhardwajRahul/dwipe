@@ -22,9 +22,22 @@
 > * **Modern drives are reliably wiped with one pass of zeros**; just zero once in almost all cases for best, fastest results.
 > * `dwipe` offers Multi-pass and Rand modes as "checkbox" features, but those provide no additional security on drives manufactured after 2001 (NIST SP 800-88).
 
-## **V3 Features**
+## **V3 Features** (Partly in V2.x)
 
-* **Hardware-based firmware wipes** - Full support for firmware-level secure erase operations:
+> Features added since initial V2 deployment (may not be in a demo until V3).
+
+* **Port and Serial number**.  Press `p` to control port and serial number; it adds another line per disk and you may want to use it selectively. You may choose "Off" (not shown), "On" (always shown), or the default "Auto" show if the disk is in a state allowed for wiping (e.g., no mounted partitions).
+* **Fast SATA Release**. If you press `DEL` on a SATA drive in a hot-swap bay (and not mounted or otherwise busy):
+  * it will be removed from the OS managed devices, 
+  * when gone from the `dwipe` screen, you can then pull out the device, and insert another one.
+  * So, replacing the drive can take just seconds, not minutes awaiting SATA timeouts.
+* **Background device monitoring** - Faster and more efficient hot-swap detection with dedicated monitoring thread:
+  - Monitors `/sys/class/block` and `/proc/partitions` for device changes
+  - Runs `lsblk` only when changes detected (previously ran every refresh)
+  - Reduces CPU usage and improves responsiveness
+  - Faster detection of newly inserted or removed devices
+* **Hardware-based firmware wipes (EXPERIMENTAL/ALPHA)** - Full support for firmware-level secure erase operations:
+  - **⚠️ Requires `--firmware-wipes` flag to enable (disabled by default)**
   - **NVMe Sanitize**: Crypto Erase, Block Erase, and Overwrite operations via `nvme-cli`
   - **NVMe Format**: Secure format with optional crypto erase
   - **SATA ATA Security Erase**: Normal and Enhanced erase modes via `hdparm`
@@ -34,11 +47,7 @@
   - Progress tracking with "FW" indicator to show hardware operation in progress
   - Persistent markers track firmware wipe completion and method used
   - See [FIRMWARE_WIPES.md](FIRMWARE_WIPES.md) for technical details
-* **Background device monitoring** - Efficient hot-swap detection with dedicated monitoring thread:
-  - Monitors `/sys/class/block` and `/proc/partitions` for device changes
-  - Runs `lsblk` only when changes detected (previously ran every refresh)
-  - Reduces CPU usage and improves responsiveness
-  - Faster detection of newly inserted or removed devices
+  - **Note**: This feature is experimental; software wipes are recommended for most users
 
 ## **V2 Features**
 
@@ -62,14 +71,14 @@
 * **Direct I/O to Disk** - Wiping is done with direct I/O which is fast and avoid polluting your page cache. Writer threads are given lower than normal I/O priority to play nice with other apps.  This makes stopping jobs fast and certain.
 * **Improved Handling of Bad Disks.** Now detects (sometimes corrects) write failures, slowdowns, excessive no progress, and reports/aborts hopeless or hopelessly slow wipes.
 
-## **V2.x Features**
-Features added since V2 deployed (may not be in latest demo):
-* **Port and Serial number**.  Press `p` to toggle whether port and serial number is show; it adds another line per disk and you may want to use it selectively.
 ## Requirements
 - **Linux operating system** (uses `/dev/`, `/sys/`, `/proc/` interfaces)
 - **Python 3.8 or higher**
 - **Root/sudo privileges** (automatically requested when you run the tool)
 - **lsblk utility** (usually pre-installed on most Linux distributions)
+- **Optional (for firmware wipes only):**
+  - `nvme-cli` - For NVMe Sanitize and Format operations
+  - `hdparm` - For SATA ATA Security Erase operations
 
 ## Installation
 
@@ -104,6 +113,16 @@ Features added since V2 deployed (may not be in latest demo):
 ## Usage
 
 Simply run `dwipe` from the command line without arguments: `dwipe`
+
+### Command-Line Options
+
+- `--firmware-wipes` or `-F` - Enable experimental (alpha) firmware wipes
+  - Enables hardware-based secure erase operations (NVMe Sanitize/Format, SATA ATA Security Erase)
+  - Requires `nvme-cli` and `hdparm` tools to be installed
+  - Without this flag, only software wipes (Zero/Rand) are available
+  - **Warning**: This feature is experimental and should be used with caution
+- `--dump-lsblk` - Dump parsed device information and exit (for debugging)
+- `--help` - Show help message with all available options
 
 ### Color Legend
 
@@ -176,36 +195,33 @@ The top line shows available actions. Some are context-sensitive (only available
 | **h** | history | Show wipe history log |
 | **/** | filter | Filter devices by regex pattern (shows matching devices + all active wipes) |
 | **ESC** | clear filter | Clear the filter and jump to top of list |
-| **m** | mode | Cycle wipe mode: Rand, Zero, Rand+V, Zero+V (saved as preference) |
+| **ESC** | back | Return to previous screen if on nested screen |
+| **m** | mode | Cycle auto verify mode: +V (verify), -V (don't) [saved as preference] |
 | **P** | passes | Cycle wipe passes: 1, 2, or 4 (saved as preference) |
 | **V** | verify % | Cycle verification percentage: 0%, 2%, 5%, 10%, 25%, 50%, 100% (saved as preference) |
-| **c** | confirmation | Cycle confirmation mode: Y, y, YES, yes, device name (saved as preference) |
-| **d** | dirty limit | Cycle dirty page limit: 0, 500, 1000, 2000, 4000 MB (saved as preference) |
 | **D** | dense | Toggle dense/spaced view (saved as preference) |
 | **t** | themes | Open theme preview screen to view and change color themes |
 
-### Wipe Modes
+### Wipe Types
 
-`dwipe` supports four wipe modes (cycle with **m** key):
+`dwipe` supports several wipe modes.
 
 - **Zero** - Fills the device with zeros (multi-pass alternates random/zero patterns, ending on zeros)
-- **Zero+V** - Same as Zero, but automatically verifies after wipe completes (if verify % > 0)
 - **Rand** - Fills the device with random data (multi-pass alternates zero/random patterns, ending on random)
-- **Rand+V** - Same as Rand, but automatically verifies after wipe completes (if verify % > 0)
+- **Firmware wipes** - TBD
 
 The `+V` suffix indicates automatic verification after wipe completion. Without `+V`, you can still manually verify by pressing **v** on a wiped device.
 
-> **Note:** Multi-pass wipes (2 or 4 passes) alternate between zero and random patterns to ensure different bit patterns physically overwrite the disk, ending on your selected mode.
+> **Note:** Multi-pass sofware (Zero and Rand) wipes (2 or 4 passes) alternate between zero and random patterns to ensure different bit patterns physically overwrite the disk, ending on your selected mode.
 
 ### Resuming Stopped Wipes
 
-Stopped wipes (state **s**) can be resumed by pressing **w** on the device:
+Stopped wipes (state **s**) can be resumed by pressing **w** on the device. Choose the same type of wipe or it will start over at 0% complete.
 
 **How Resume Works:**
 - Preserves the original wipe mode (Rand or Zero) from when the wipe was started
 - Uses the **current** passes setting to determine how much more to write
-- Continues from the exact byte offset where it stopped (rounded to buffer boundary)
-- Smart validation ensures interrupted wipes resume with correct pattern integrity
+- Continues from the exact byte offset where it marked that stopped (rounded to buffer boundary). "Marks" are written about every 30s so for non-gracefully ended wipes, the position may be as much as 30s (or somewhat more) from the last wiped disk blocks.
 
 **Resume Examples:**
 
@@ -260,7 +276,7 @@ Stopped wipes (state **s**) can be resumed by pressing **w** on the device:
 
 ### Progress Information
 
-When wiping a device, `dwipe` displays:
+When software wiping a device, `dwipe` displays:
 - **Elapsed time** - Time since wipe started (e.g., 1m18s)
 - **Remaining time** - Estimated time to completion (e.g., -3m6s)
 - **Write rate** - Current throughput (e.g., "45.2MB/s")
@@ -318,7 +334,7 @@ Press **ESC** from the main screen to clear the filter and return to showing all
 
 ## Security Considerations
 
-**Important limitations:**
+**Important limitations of software wipes:**
 
 - `dwipe` supports multi-pass wiping with alternating patterns, but does not implement specific DoD 5220.22-M or Gutmann certified pattern sequences
 - More than adequate for **personal and business data** that doesn't require (antiquated) certified destruction

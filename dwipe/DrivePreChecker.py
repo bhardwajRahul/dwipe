@@ -32,16 +32,16 @@ class DrivePreChecker:
             # 1. Sanitize Support
             sanicap = data.get('sanicap', 0)
             if sanicap > 0:
-                if sanicap & 0x04: result.modes['NvCrypto'] = 'sanitize --action=0x04'
-                if sanicap & 0x02: result.modes['NvBlock'] = 'sanitize --action=0x02'
-                if sanicap & 0x08: result.modes['NvOvwr'] = 'sanitize --action=0x03'
+                if sanicap & 0x04: result.modes['CryptoNv'] = 'sanitize --action=0x04'
+                if sanicap & 0x02: result.modes['BlockNv'] = 'sanitize --action=0x02'
+                if sanicap & 0x08: result.modes['OvwrNv'] = 'sanitize --action=0x03'
 
             # 2. Format Support (Legacy)
             if 'Format NVM' in id_ctrl.stdout:
                 fna = data.get('fna', 0)
                 if (fna >> 2) & 0x1:
-                    result.modes['NvFCrypto'] = 'format --ses=2'
-                result.modes['NvFErase'] = 'format --ses=1'
+                    result.modes['FmtCryptoNv'] = 'format --ses=2'
+                result.modes['FmtEraseNv'] = 'format --ses=1'
 
             if not result.modes:
                 result.issues['Unsupported'] = "Drive lacks Sanitize or Format NVM capabilities"
@@ -81,8 +81,8 @@ class DrivePreChecker:
             # 4. Populate Modes only if no fatal issues
             if not result.issues:
                 if "enhanced erase" in out:
-                    result.modes['HdEnhanced'] = '--user-master u --security-erase-enhanced NULL'
-                result.modes['HdErase'] = '--user-master u --security-erase NULL'
+                    result.modes['EnhancedHd'] = '--user-master u --security-erase-enhanced NULL'
+                result.modes['EraseHd'] = '--user-master u --security-erase NULL'
 
         except Exception as e:
             result.issues['Error'] = f"ATA Probe Exception: {str(e)}"

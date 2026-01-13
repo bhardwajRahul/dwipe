@@ -22,8 +22,10 @@ def main():
     """Main entry point"""
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('-D', '--debug', action='count', default=0,
-                        help='debug mode (the more Ds, the higher the debug level)')
+    parser.add_argument('--dump-lsblk', action='store_true',
+                        help='dump parsed lsblk and exit for debugging')
+    parser.add_argument('-F', '--firmware-wipes', action='store_true',
+                        help='enable experimental (alpha) firmware wipes')
     opts = parser.parse_args()
 
     dwipe = None  # Initialize to None so exception handler can reference it
@@ -33,15 +35,14 @@ def main():
             Utils.rerun_module_as_root('dwipe.main')
 
         prereqs = Prereqs(verbose=True)
-            # lsblk is critical for everything; others are critical for firmware wipes
-        prereqs.check_all(['lsblk', 'hdparm', 'nvme'])
+        # lsblk is critical for everything; hdparm and nvme only needed for firmware wipes
+        if opts.firmware_wipes:
+            prereqs.check_all(['lsblk', 'hdparm', 'nvme'])
+        else:
+            prereqs.check_all(['lsblk'])
         prereqs.report_and_exit_if_failed()
 
-        dwipe = DiskWipe()  # opts=opts)
-        if dwipe.DB:
-            dwipe.dev_info = info = DeviceInfo(opts=opts)
-            dwipe.partitions = info.assemble_partitions()
-            sys.exit(1)
+        dwipe = DiskWipe(opts=opts)  # opts=opts)
 
         dwipe.main_loop()
     except Exception as exce:
