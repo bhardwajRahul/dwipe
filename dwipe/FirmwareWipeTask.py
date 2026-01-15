@@ -7,6 +7,9 @@ Includes:
 - SataWipeTask: SATA/ATA secure erase using hdparm
 """
 # pylint: disable=broad-exception-raised,broad-exception-caught
+# pylint: disable=invalid-name,too-many-instance-attributes,too-many-arguments
+# pylint: disable=too-many-positional-arguments,consider-using-with
+# pylint: disable=too-many-return-statements
 import os
 import json
 import time
@@ -102,8 +105,7 @@ class FirmwareWipeTask(WipeTask):
                 "scrubbed_bytes": self.total_size,
                 "size_bytes": self.total_size,
                 "passes": 1,
-                "mode": self.wipe_name,  # e.g., 'Sanitize-Crypto'
-                "firmware_wipe": True
+                "mode": self.wipe_name,  # e.g., 'Sanitize-Crypto', 'EnhancedSd'
             }
             json_data = json.dumps(data).encode('utf-8')
 
@@ -154,7 +156,7 @@ class FirmwareWipeTask(WipeTask):
                     self._write_marker()
                     break
 
-                elif completion_status is False:
+                if completion_status is False:
                     # Failed
                     stderr = self.process.stderr.read() if self.process.stderr else ""
                     self.exception = f"Firmware wipe failed: {stderr}"
@@ -253,12 +255,10 @@ class NvmeWipeTask(FirmwareWipeTask):
         if 'sanitize' in self.command_args:
             if 'crypto' in self.command_args or '0x04' in self.command_args:
                 return 10  # Crypto erase is very fast
-            elif 'block' in self.command_args or '0x02' in self.command_args:
+            if 'block' in self.command_args or '0x02' in self.command_args:
                 return 30
-            else:  # Overwrite
-                return 120
-        else:  # Format
-            return 30
+            return 120 # Overwrite
+        return 30
 
     def _build_command(self):
         """Build nvme command
@@ -314,6 +314,7 @@ class SataWipeTask(FirmwareWipeTask):
     def __init__(self, device_path, total_size, opts, command_args, wipe_name):
         self.tool = SataTool(device_path)
         self.use_enhanced = 'enhanced' in command_args
+        self.state_mono = 0
         super().__init__(device_path, total_size, opts, command_args, wipe_name)
 
     def _estimate_duration(self):
@@ -345,13 +346,42 @@ class SataWipeTask(FirmwareWipeTask):
             raise Exception("Password set but security not enabled")
 
         erase_flag = '--security-erase-enhanced' if self.use_enhanced else '--security-erase'
+        self.more_state = 'hdparmIP'
         return ['hdparm', '--user-master', 'u', erase_flag, 'NULL', self.device_path]
 
     def _check_completion(self):
         """Check SATA erase completion and verify result"""
-        if self.process and self.process.poll() is not None:
-            if self.process.returncode == 0:
-                success, _ = self.tool.verify_wipe_result()
-                return success
-            return False
-        return None
+        if self.more_state == 'hdparmIP':
+            if not self.process:
+                self.more_state = 'no-self.process'
+                return False
+            if self.process.poll() is None:
+                return None # still running, same state
+            if self.process.returncode != 0:
+                self.more_state = f'rv={self.process.return_code}'
+                return False
+            self.more_state = 'NotReady' # move on
+        if self.more_state == 'NotReady':
+            rv, why = self.tool.verify_wipe_result()
+            if not rv:
+                self.more_state = why
+                return None
+            self.more_state = 'Pause'
+            self.state_mono = time.monotonic()
+        if self.more_state == 'Pause':
+            if time.monotonic() - self.state_mono < 5.0:
+                return None # keep waiting
+            self.more_state = 'TestWrite'
+            self.state_mono = time.monotonic()
+        if self.more_state.startswith('TestWrite'):
+            if time.monotonic() - self.state_mono < 10.0:
+                return None
+            rv, why = self.tool.test_and_restore_block()
+            if rv:
+                self.more_state = ''
+                return True
+            self.more_state = 'TestWrite:{why}'
+            self.state_mono = time.monotonic()
+            
+
+        return False # unexpected state

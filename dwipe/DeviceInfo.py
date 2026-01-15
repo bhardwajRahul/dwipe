@@ -157,7 +157,7 @@ class DeviceInfo:
             lsblk_output: Optional lsblk JSON output string. If provided, uses this
                          instead of running lsblk command. Useful for background monitoring.
         """
-        def eat_one(device):
+        def eat_one(device, parent_name=None):
             entry = self._make_partition_namespace(0, '', '', dflt)
             entry.name = device.get('name', '')
             maj_min = device.get('maj:min', (-1, -1))
@@ -189,9 +189,12 @@ class DeviceInfo:
             # Read marker ONCE when:
             # 1. Not mounted
             # 2. No filesystem (fstype/label empty)
-            # 3. No active job
+            # 3. No active job (on this device OR its parent disk)
             # 4. Haven't checked yet (marker_checked=False)
             has_job = prev_nss and entry.name in prev_nss and getattr(prev_nss[entry.name], 'job', None) is not None
+            # Also check if parent disk has a job (e.g., firmware wipe on whole disk blocks partitions)
+            if not has_job and parent_name and prev_nss and parent_name in prev_nss:
+                has_job = getattr(prev_nss[parent_name], 'job', None) is not None
             has_filesystem = entry.fstype or entry.label
 
             # Inherit marker_checked from previous scan, or False if new/changed
@@ -264,7 +267,7 @@ class DeviceInfo:
             parent = eat_one(device)
             entries[parent.name] = parent
             for child in device.get('children', []):
-                entry = eat_one(child)
+                entry = eat_one(child, parent_name=parent.name)
                 entries[entry.name] = entry
                 entry.parent = parent.name
                 parent.minors.append(entry.name)

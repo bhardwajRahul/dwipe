@@ -42,6 +42,7 @@ class SataTool:
         self.job.process = None # set when wipe job is running
         self.job.wipe_started_mono = None # set when wipe job started
         self.job.est_secs = 0
+        self.original_data = None
 
     def run_cmd(self, argv, timeout=None):
         """ RUN a command return the output """
@@ -189,34 +190,37 @@ class SataTool:
         """
         # Refresh the namespace
         self.refresh_secures()
+        if not self.secures.supported:
+            return False, "NotSupported"
 
         # If the wipe worked, the drive automatically disables
         # the security password and clears the 'enabled' bit.
         if not self.secures.enabled and not self.secures.locked:
-            return True, "Wipe Verified: Drive is unlocked and clean."
+            return True, "ReadyUnlocked"
 
         if self.secures.locked:
-            return False, "Wipe Failed: Drive is still LOCKED (Password 'NULL' still active)."
+            return False, "StillLocked"
 
-        return False, "Wipe Incomplete: Security is still enabled."
+        return False, "SecurityEnabled"
         
     def test_and_restore_block(self, offset=0):
         """
         Reads, Writes a test pattern, Reads, and Restores the original data.
         Returns (success_bool, message)
         """
-        original_data = None
         test_pattern = b"WIPE_VERIFY_PATTERN_" + os.urandom(8)
         test_pattern = test_pattern.ljust(512, b'\x00')
 
         try:
             # Step 1: Read original
-            with open(self.device_path, 'rb') as f:
-                f.seek(offset)
-                original_data = f.read(512)
-            
-            if len(original_data) != 512:
-                return False, "Could not read full 512 bytes for backup."
+            if not self.original_data:
+                with open(self.device_path, 'rb') as f:
+                    f.seek(offset)
+                    self.original_data = f.read(512)
+                
+                if len(self.original_data) != 512:
+                    self.original_data = None
+                    return False, "Could not read full 512 bytes for backup."
 
             # Step 2: Write Test Pattern
             # Using O_SYNC to ensure it hits the controller
@@ -242,7 +246,7 @@ class SataTool:
             fd = os.open(self.device_path, os.O_WRONLY | os.O_SYNC)
             try:
                 os.lseek(fd, offset, os.SEEK_SET)
-                os.write(fd, original_data)
+                os.write(fd, self.original_data)
                 os.fsync(fd)
             finally:
                 os.close(fd)
@@ -254,8 +258,8 @@ class SataTool:
                 f.seek(offset)
                 final_check = f.read(512)
 
-            if final_check == original_data:
-                return True, f"Full I/O transaction successful at offset {offset}."
+            if final_check == self.original_data:
+                return True, f"DevReadyForWrite"
             else:
                 return False, "CRITICAL: Failed to restore original data correctly!"
 
