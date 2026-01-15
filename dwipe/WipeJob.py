@@ -588,12 +588,13 @@ class WipeJob:
                 f"Completed: {percent_complete:.2f}%")
 
     def get_status(self):
-        """Get status tuple: (elapsed, percent, rate, eta)
+        """Get status tuple: (elapsed, percent, rate, eta, more_state)
 
         Returns stats for current phase only:
         - Write phase (0-100%): elapsed/rate/eta for writing
         - Flushing phase: 100% FLUSH while kernel syncs to device
         - Verify phase (v0-v100%): elapsed/rate/eta for verification only
+        - more_state: optional extra status from derived task class
         """
         # NEW: Proxy to current task if using task-based architecture
         if self.current_task is not None:
@@ -646,7 +647,7 @@ class WipeJob:
             else:
                 when_str = '0'
 
-            return Utils.ago_str(int(round(elapsed_time))), pct_str, rate_str, when_str
+            return Utils.ago_str(int(round(elapsed_time))), pct_str, rate_str, when_str, ""
         else:
             # Write phase: 0-100% (across all passes)
             written = self.total_written
@@ -683,7 +684,7 @@ class WipeJob:
             else:
                 when_str = '0'
 
-            return Utils.ago_str(int(round(elapsed_time))), pct_str, rate_str, when_str
+            return Utils.ago_str(int(round(elapsed_time))), pct_str, rate_str, when_str, ""
 
     def get_plan_dict(self, mode=None):
         """Generate plan dictionary for structured logging

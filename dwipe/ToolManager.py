@@ -61,30 +61,30 @@ class DrivePreChecker:
     def __init__(self, timeout: int = 10):
         self.timeout = timeout
 
-    def is_usb_attached(self, device: str) -> bool:
-        """Check if device is USB-attached"""
-        dev_name = os.path.basename(device)
+#   def is_usb_attached(self, device: str) -> bool:
+#       """Check if device is USB-attached"""
+#       dev_name = os.path.basename(device)
 
-        # Check via sysfs
-        sys_path = f'/sys/block/{dev_name}'
-        if os.path.exists(sys_path):
-            try:
-                # Check if in USB hierarchy
-                real_path = os.path.realpath(sys_path)
-                if 'usb' in real_path.lower():
-                    return True
+#       # Check via sysfs
+#       sys_path = f'/sys/block/{dev_name}'
+#       if os.path.exists(sys_path):
+#           try:
+#               # Check if in USB hierarchy
+#               real_path = os.path.realpath(sys_path)
+#               if 'usb' in real_path.lower():
+#                   return True
 
-                # Check via udev
-                udev_info = subprocess.run(
-                    ['udevadm', 'info', '-q', 'property', '-n', device],
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-                if udev_info.returncode == 0 and 'ID_BUS=usb' in udev_info.stdout:
-                    return True
-            except:
-                pass
+#               # Check via udev
+#               udev_info = subprocess.run(
+#                   ['udevadm', 'info', '-q', 'property', '-n', device],
+#                   capture_output=True,
+#                   text=True,
+#                   timeout=5
+#               )
+#               if udev_info.returncode == 0 and 'ID_BUS=usb' in udev_info.stdout:
+#                   return True
+#           except:
+#               pass
 
         return False
 

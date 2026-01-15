@@ -24,8 +24,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dump-lsblk', action='store_true',
                         help='dump parsed lsblk and exit for debugging')
-    parser.add_argument('-F', '--firmware-wipes', action='store_true',
-                        help='enable experimental (alpha) firmware wipes')
     opts = parser.parse_args()
 
     dwipe = None  # Initialize to None so exception handler can reference it
@@ -36,10 +34,7 @@ def main():
 
         prereqs = Prereqs(verbose=True)
         # lsblk is critical for everything; hdparm and nvme only needed for firmware wipes
-        if opts.firmware_wipes:
-            prereqs.check_all(['lsblk', 'hdparm', 'nvme'])
-        else:
-            prereqs.check_all(['lsblk'])
+        prereqs.check_all(['lsblk', 'hdparm', 'nvme'])
         prereqs.report_and_exit_if_failed()
 
         dwipe = DiskWipe(opts=opts)  # opts=opts)

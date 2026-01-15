@@ -16,6 +16,7 @@ import traceback
 
 from .WipeTask import WipeTask
 from .Utils import Utils
+from .SataTool import SataTool
 
 
 class FirmwareWipeTask(WipeTask):
@@ -182,7 +183,7 @@ class FirmwareWipeTask(WipeTask):
         """Get current progress status (thread-safe)
 
         Returns:
-            tuple: (elapsed_str, pct_str, rate_str, eta_str)
+            tuple: (elapsed_str, pct_str, rate_str, eta_str, more_state)
         """
         mono = time.monotonic()
         elapsed_time = mono - self.start_mono
@@ -207,7 +208,7 @@ class FirmwareWipeTask(WipeTask):
 
         elapsed_str = Utils.ago_str(int(round(elapsed_time)))
 
-        return elapsed_str, pct_str, rate_str, eta_str
+        return elapsed_str, pct_str, rate_str, eta_str, self.more_state
 
     def get_summary_dict(self):
         """Generate summary dictionary for structured logging
@@ -310,61 +311,47 @@ class SataWipeTask(FirmwareWipeTask):
 
     Note: Requires setting a temporary password before erase.
     """
+    def __init__(self, device_path, total_size, opts, command_args, wipe_name):
+        self.tool = SataTool(device_path)
+        self.use_enhanced = 'enhanced' in command_args
+        super().__init__(device_path, total_size, opts, command_args, wipe_name)
 
     def _estimate_duration(self):
-        """Estimate SATA wipe duration
-
-        Enhanced erase: 2-10 minutes (varies by vendor)
-        Normal erase: ~1 hour per TB
-        """
-        if 'enhanced' in self.command_args:
-            return 600  # 10 minutes for enhanced
-        else:
-            # Estimate based on size: 1 hour per TB
-            size_tb = self.total_size / (1024**4)
-            hours = max(0.5, size_tb)
-            return int(hours * 3600)
+        """Estimate SATA erase duration from drive's reported time"""
+        self.tool.refresh_secures()
+        if self.tool.secures and self.tool.secures.erase_est_secs:
+            idx = -1 if self.use_enhanced else 0
+            return self.tool.secures.erase_est_secs[idx]
+        return 4 * 60 * 60  # Default 4 hours for SATA
 
     def _build_command(self):
-        """Build hdparm command
-
-        For security erase, we need to:
-        1. Set password: hdparm --user-master u --security-set-pass NULL /dev/sda
-        2. Erase: hdparm --user-master u --security-erase NULL /dev/sda
-
-        We'll just build the erase command - password setting happens in run_task
-        """
-        # Parse: '--user-master u --security-erase-enhanced NULL'
-        parts = self.command_args.split()
-        cmd = ['hdparm'] + parts + [self.device_path]
-        return cmd
-
-    def _set_ata_password(self):
-        """Set temporary ATA password before erase
+        """Build hdparm erase command (sets password first as required for SATA)
 
         Returns:
-            bool: True if successful
+            list: ['hdparm', '--user-master', 'u', '--security-erase', 'NULL', '/dev/sda']
         """
-        try:
-            cmd = ['hdparm', '--user-master', 'u', '--security-set-pass', 'NULL', self.device_path]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-            return result.returncode == 0
-        except Exception as e:
-            self.exception = f"Failed to set ATA password: {e}"
+        # SATA requires pre-flight check and password setup before erase
+        verdict = self.tool.get_wipe_verdict()
+        if verdict != "OK":
+            raise Exception(f"SATA pre-flight failed: {verdict}")
+
+        # Set security password (required before erase)
+        set_pass_res = self.tool.run_cmd(['--user-master', 'u', '--security-set-pass', 'NULL'])
+        if set_pass_res.returncode != 0:
+            raise Exception(f"Failed to set security password: {set_pass_res.stderr.strip()}")
+
+        self.tool.refresh_secures()
+        if not self.tool.secures.enabled:
+            raise Exception("Password set but security not enabled")
+
+        erase_flag = '--security-erase-enhanced' if self.use_enhanced else '--security-erase'
+        return ['hdparm', '--user-master', 'u', erase_flag, 'NULL', self.device_path]
+
+    def _check_completion(self):
+        """Check SATA erase completion and verify result"""
+        if self.process and self.process.poll() is not None:
+            if self.process.returncode == 0:
+                success, _ = self.tool.verify_wipe_result()
+                return success
             return False
-
-    def run_task(self):
-        """Execute SATA firmware wipe (overrides base to add password step)"""
-        try:
-            # Step 1: Set temporary password
-            if not self._set_ata_password():
-                self.exception = "Failed to set ATA security password"
-                self.done = True
-                return
-
-            # Step 2: Execute erase command (base class handles this)
-            super().run_task()
-
-        except Exception:
-            self.exception = traceback.format_exc()
-            self.done = True
+        return None

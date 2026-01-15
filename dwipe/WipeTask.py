@@ -57,6 +57,7 @@ class WipeTask:
         self.do_abort = False
         self.done = False
         self.exception = None
+        self.more_state = ""  # Optional extra status info from derived classes
 
         # Progress tracking
         self.total_written = 0  # Bytes processed (write or verify)
@@ -80,11 +81,12 @@ class WipeTask:
         """Get current progress status (thread-safe, called from main thread)
 
         Returns:
-            tuple: (elapsed_str, pct_str, rate_str, eta_str)
+            tuple: (elapsed_str, pct_str, rate_str, eta_str, more_state)
                 - elapsed_str: e.g., "5m23s"
                 - pct_str: e.g., "45%" or "v23%" (for verify)
                 - rate_str: e.g., "450MB/s"
                 - eta_str: e.g., "2m15s"
+                - more_state: optional extra status from derived class
         """
         mono = time.monotonic()
         elapsed_time = mono - self.start_mono
@@ -116,7 +118,7 @@ class WipeTask:
         else:
             when_str = '0'
 
-        return Utils.ago_str(int(round(elapsed_time))), pct_str, rate_str, when_str
+        return Utils.ago_str(int(round(elapsed_time))), pct_str, rate_str, when_str, self.more_state
 
     def get_summary_dict(self):
         """Get final summary after task completion

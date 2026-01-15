@@ -310,7 +310,9 @@ class VerifyTask(WipeTask):
     def get_status(self):
         """Get current progress status (thread-safe, called from main thread)
 
-        Returns verification percentage with 'v' prefix (e.g., "v45%")
+        Returns:
+            tuple: (elapsed_str, pct_str, rate_str, eta_str, more_state)
+            - pct_str has 'v' prefix (e.g., "v45%")
         """
         mono = time.monotonic()
         elapsed_time = mono - self.start_mono
@@ -347,7 +349,7 @@ class VerifyTask(WipeTask):
         else:
             when_str = '0'
 
-        return Utils.ago_str(int(round(elapsed_time))), pct_str, rate_str, when_str
+        return Utils.ago_str(int(round(elapsed_time))), pct_str, rate_str, when_str, self.more_state
 
     def get_summary_dict(self):
         """Get final summary for this verify task

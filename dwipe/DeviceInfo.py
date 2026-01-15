@@ -72,10 +72,6 @@ class DeviceInfo:
         # Initialize defaults
         ns.hw_caps, ns.hw_nopes = {}, {}
 
-        # Skip hardware checks if firmware wipes are disabled
-        if not getattr(self.opts, 'firmware_wipes', False):
-            return ns.hw_caps, ns.hw_nopes
-
         # 4. Perform the actual Probe
         dev_path = f"/dev/{ns.name}"
         if ns.name.startswith('nv'):

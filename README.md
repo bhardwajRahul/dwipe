@@ -28,7 +28,7 @@
 
 * **Port and Serial number**.  Press `p` to control port and serial number; it adds another line per disk and you may want to use it selectively. You may choose "Off" (not shown), "On" (always shown), or the default "Auto" show if the disk is in a state allowed for wiping (e.g., no mounted partitions).
 * **Fast SATA Release**. If you press `DEL` on a SATA drive in a hot-swap bay (and not mounted or otherwise busy):
-  * it will be removed from the OS managed devices, 
+  * it will be removed from the OS managed devices,
   * when gone from the `dwipe` screen, you can then pull out the device, and insert another one.
   * So, replacing the drive can take just seconds, not minutes awaiting SATA timeouts.
 * **Background device monitoring** - Faster and more efficient hot-swap detection with dedicated monitoring thread:
@@ -41,17 +41,14 @@
   - It prevents wiping w/o first unblocking even if unmounted or otherwise it a wipeable state.
   - It does not system level lock of any type.
 * **Hardware-based firmware wipes (EXPERIMENTAL/ALPHA)** - Full support for firmware-level secure erase operations:
-  - **⚠️ Requires `--firmware-wipes` flag to enable (disabled by default)**
   - **NVMe Sanitize**: Crypto Erase, Block Erase, and Overwrite operations via `nvme-cli`
   - **NVMe Format**: Secure format with optional crypto erase
   - **SATA ATA Security Erase**: Normal and Enhanced erase modes via `hdparm`
   - Automatic capability detection shows only supported methods for each drive
-  - Firmware wipes are much faster than software wipes (seconds to minutes vs hours)
+  - NVMe Firmware wipes are much faster than software wipes (seconds to minutes vs hours)
   - Same user interface - firmware options appear alongside Zero/Rand in wipe confirmation
   - Progress tracking with "FW" indicator to show hardware operation in progress
   - Persistent markers track firmware wipe completion and method used
-  - See [FIRMWARE_WIPES.md](FIRMWARE_WIPES.md) for technical details
-  - **Note**: This feature is experimental; software wipes are recommended for most users
 
 ## **V2 Features**
 
@@ -419,7 +416,22 @@ dwipe includes built-in protections for problematic storage devices:
 *   Consider replacing the disk if errors persist
 
 Note: Some disks are fundamentally broken and cannot be reliably wiped. dwipe will protect itself and your system, but cannot fix hardware failures.
+---
+#### Recommendations for SATA Wiping over USB
+* Requirement 1: SAT (SCSI-ATA Translation) Support
 
+  * The USB bridge must be capable of "passing through" ATA commands.
+  * The Test: If the app can see the "Security" section in the drive details, the bridge supports SAT.
+
+* Requirement 2: Stable Power
+  * Firmware wipes (especially on 3.5" HDDs) draw significant peak power.
+  * The Risk: If a USB-powered "bus-only" cable is used, the voltage might sag during the wipe, causing the bridge to reset and "brick" the drive in a locked state.
+  * The Recommendation: Always use an externally powered USB dock for 3.5" drives.
+
+* Requirement 3: Command Timeout Integrity
+  * The bridge must not have an aggressive "Watchdog Timer."
+  * The Risk: Some bridges disconnect if they don't see "data" for 60 seconds. During a firmware wipe, the drive is busy internally and doesn't send data.
+  * The Recommendation: Use high-quality chipsets like ASMedia (1153E) or JMicron (JMS578).
 ---
 
 ### Contributing

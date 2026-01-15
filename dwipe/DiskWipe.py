@@ -152,6 +152,7 @@ class DiskWipe:
                                               part.size_bytes, opts=self.opts)
                 self.job_cnt += 1
                 self.set_state(part, to='0%')
+                part.hw_nopes, part.hw_caps = {}, {}
             finally:
                 # Restore original wipe_mode
                 self.opts.wipe_mode = old_wipe_mode
@@ -347,8 +348,8 @@ class DiskWipe:
         for  ns in self.partitions.values():
             if ns.parent:
                 continue
-            if ns.port.startswith('USB'):
-                continue
+#           if ns.port.startswith('USB'):
+#               continue
             if ns.name[:2] not in ('nv', 'sd', 'hd'):
                 continue
             if ns.hw_nopes or ns.hw_caps:  # already done
@@ -438,7 +439,6 @@ class DiskWipe:
 
         # Start background lsblk monitor
 
-        self.get_hw_caps_when_needed()
         self.dev_info = info
         pick_range = info.get_pick_range()
         self.win.set_pick_range(pick_range[0], pick_range[1])
@@ -467,7 +467,6 @@ class DiskWipe:
                     # Refresh if: device changes detected OR periodic refresh (3s default)
                     info = DeviceInfo(opts=self.opts, persistent_state=self.persistent_state)
                     self.partitions = info.assemble_partitions(self.partitions, lsblk_output=lsblk_output)
-                    self.get_hw_caps_when_needed()
                     self.dev_info = info
                     # Update pick range to highlight NAME through SIZE fields
                     pick_range = info.get_pick_range()
@@ -532,6 +531,7 @@ class MainScreen(DiskWipeScreen):
                     self.persist_port_serial.discard(name)
 
         # First pass: process jobs and collect visible partitions
+        app.get_hw_caps_when_needed()
         visible_partitions = []
         for name, partition in app.partitions.items():
             partition.line = None
@@ -717,7 +717,7 @@ class MainScreen(DiskWipeScreen):
                         partition.marker_checked = False  # Reset to "dont-know" - will re-read on next scan
                         partition.marker = ''  # Clear stale marker string to avoid showing old data during re-read
             if partition.job:
-                elapsed, pct, rate, until = partition.job.get_status()
+                elapsed, pct, rate, until, more_state = partition.job.get_status()
 
                 # Get task display name (Zero, Rand, Crypto, Verify, etc.)
                 task_name = ""
@@ -731,17 +731,24 @@ class MainScreen(DiskWipeScreen):
                         partition.mounts = [f'{task_name} {pct} {elapsed} -{until} {rate}']
                     else:
                         partition.mounts = [f'{task_name} {pct} {elapsed}']
+                    if more_state:
+                        partition.mounts[0] += f' {more_state}'
                 else:
                     partition.state = pct
                     # Build progress line with task name
                     progress_parts = [task_name, elapsed, f'-{until}', rate]
 
-                    # Only show slowdown/stall if job tracks these metrics
-                    # (WriteTask does, VerifyTask and FirmwareWipeTask don't)
-                    if hasattr(partition.job, 'max_slowdown_ratio') and hasattr(partition.job, 'max_stall_secs'):
+                    # Only show slowdown/stall for WriteTask (not VerifyTask or FirmwareWipeTask)
+                    from .FirmwareWipeTask import FirmwareWipeTask
+                    from .WriteTask import WriteTask
+                    current_task = partition.job.current_task
+                    if current_task and isinstance(current_task, WriteTask) and not isinstance(current_task, FirmwareWipeTask):
                         slowdown = partition.job.max_slowdown_ratio
                         stall = partition.job.max_stall_secs
                         progress_parts.extend([f'÷{slowdown}', f'𝚫{Utils.ago_str(stall)}'])
+
+                    if more_state:
+                        progress_parts.append(more_state)
 
                     partition.mounts = [' '.join(progress_parts)]
 
@@ -797,9 +804,9 @@ class MainScreen(DiskWipeScreen):
             if app.confirmation.active and app.confirmation.identity == partition.name:
                 # Build confirmation message
                 if app.confirmation.action_type == 'wipe':
-                    msg = f'⚠️  WIPE {partition.name}'
+                    msg = f'⚠️ WIPE {partition.name}'
                 else:  # verify
-                    msg = f'⚠️  VERIFY {partition.name} [writes marker]'
+                    msg = f'⚠️ VERIFY {partition.name} [writes marker]'
 
                 # Add mode-specific prompt (base message without input)
                 if app.confirmation.mode == 'yes':
@@ -807,11 +814,11 @@ class MainScreen(DiskWipeScreen):
                 elif app.confirmation.mode == 'identity':
                     msg += f" - Type '{partition.name}': "
                 elif app.confirmation.mode == 'choices':
-                    choices_str = ', '.join(app.confirmation.choices)
-                    msg += f" - Choose ({choices_str}): "
+                    choices_str = ' '.join(app.confirmation.choices)
+                    msg += f": Pick ({choices_str}): "
 
                 # Position message at fixed column (reduced from 28 to 20)
-                msg = ' ' * 20 + msg
+                msg = ' ' * 5 + msg
 
                 # Add confirmation message base as DECOR (non-pickable)
                 app.win.add_body(msg, attr=cs.color_pair(Theme.DANGER) | cs.A_BOLD,
