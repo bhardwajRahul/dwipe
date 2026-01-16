@@ -1,31 +1,85 @@
 #!/usr/bin/env python3
 """ TBD """
 # pylint: disable=invalid-name,multiple-statements,line-too-long
+# pylint: disable=broad-exception-caught,too-many-nested-blocks
+# pylint: disable=too-many-locals,too-many-instance-attributes
+# pylint: disable=too-many-boolean-expressions
 
 import os
-import sys
+import json
+# import sys
 import subprocess
 import re
 import time
 from types import SimpleNamespace
-import signal
+from .Utils import Utils
 
-def signal_handler(sig, frame):
-    print("\n" + "!" * 60)
-    print("CRITICAL WARNING: INTERRUPT DETECTED")
-    print("A firmware wipe is a hardware-level command.")
-    print("If you kill this process, the drive will remain LOCKED.")
-    print("To recover, you must run this tool again and use the 'Rescue' option.")
-    print("!" * 60)
-    
-    # Optional: Logic to decide whether to actually exit
-    confirm = input("\nReally abort and leave the drive locked? (y/N): ")
-    if confirm.lower() == 'y':
-        print("Aborting. Please note the drive is now in a Security Locked state.")
-        sys.exit(1)
-    else:
-        print("Resuming monitoring...")
+#import signal
+#def signal_handler(sig, frame):
+#   print("\n" + "!" * 60)
+#   print("CRITICAL WARNING: INTERRUPT DETECTED")
+#   print("A firmware wipe is a hardware-level command.")
+#   print("If you kill this process, the drive will remain LOCKED.")
+#   print("To recover, you must run this tool again and use the 'Rescue' option.")
+#   print("!" * 60)
+#
+#   # Optional: Logic to decide whether to actually exit
+#   confirm = input("\nReally abort and leave the drive locked? (y/N): ")
+#   if confirm.lower() == 'y':
+#       print("Aborting. Please note the drive is now in a Security Locked state.")
+#       sys.exit(1)
+#   else:
+#       print("Resuming monitoring...")
 
+class WipeIpDb:
+    """Manages the persistent state of in-progress firmware wipes."""
+
+    def __init__(self, directory):
+        self.path = os.path.join(directory, "firmware-wipes-ip.json")
+        self._ensure_file()
+
+    def _ensure_file(self):
+        """Creates an empty JSON set if the file doesn't exist."""
+        if not os.path.exists(self.path):
+            self._write_dict({})
+            Utils.fix_file_ownership(self.path)
+
+    def _read_dict(self):
+        try:
+            now = time.time()
+            with open(self.path, 'r', encoding='utf-8') as f:
+                data, cleaned = json.load(f), {}
+                for key, unixtime in data.items():
+                    if now - unixtime <= 7 * 24 * 3600:
+                        cleaned[key] = unixtime
+                if len(cleaned) != len(data):
+                    self._write_dict(cleaned)
+                return cleaned
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def _write_dict(self, key_dict):
+        with open(self.path, 'w', encoding='utf-8') as f:
+            json.dump(key_dict, f, indent=4)
+
+    def start_wipe(self, key):
+        """Adds a key to the journal."""
+        key_dict = self._read_dict()
+        key_dict[key] = time.time()
+        self._write_dict(key_dict)
+
+    def end_wipe(self, key):
+        """Removes a key from the journal (successful completion)."""
+        self.purge(key)
+
+    def purge(self, key):
+        """Removes key if exists and returns True/False for recovery logic."""
+        key_dict = self._read_dict()
+        if key in key_dict:
+            del key_dict[key]
+            self._write_dict(key_dict)
+            return True
+        return False
 
 class SataTool:
     """ TBD """
@@ -43,6 +97,57 @@ class SataTool:
         self.job.wipe_started_mono = None # set when wipe job started
         self.job.est_secs = 0
         self.original_data = None
+        self.model_serial_key = '<=>'.join(self.get_disk_identifiers())
+        self.wipe_ip_db = WipeIpDb(directory=Utils.get_config_dir())
+
+    def get_disk_identifiers(self):
+        """
+        Non-blocking retrieval of Model and Serial.
+        Works even if the drive is in a 'D' state (SATA Wipe).
+        """
+        model, serial = 'unknown', 'unknown'
+        dev_name = self.device_name
+
+        # 1. Get Model from sysfs (Fast and Safe)
+        model_path = f"/sys/class/block/{dev_name}/device/model"
+        try:
+            with open(model_path, 'r', encoding='utf-8') as f:
+                model = f.read().strip()
+        except Exception:
+            pass
+
+        # 2. Get Serial from /dev/disk/by-id (Kernel Cache)
+        disk_id_path = "/dev/disk/by-id"
+        if os.path.exists(disk_id_path):
+            for link in os.listdir(disk_id_path):
+                # We want the primary link, not the partition links (which have -partX)
+                if "-part" in link:
+                    continue
+
+                # Check if this link points to our device (e.g., ../../sdb)
+                try:
+                    target = os.readlink(os.path.join(disk_id_path, link))
+                    if os.path.basename(target) == dev_name:
+                        # Logic for ATA/SATA
+                        if link.startswith('ata-'):
+                            # Format: ata-MODEL_SERIAL
+                            # Example: ata-ST1000LM035-1RK172_WDE12345
+                            parts = link[4:].split('_')
+                            if len(parts) > 1:
+                                serial = parts[-1]
+                            break
+
+                        # Logic for NVMe
+                        if link.startswith('nvme-'):
+                            # Format: nvme-MODEL_SERIAL
+                            parts = link[5:].split('_')
+                            if len(parts) > 1:
+                                serial = parts[-1]
+                            break
+                except Exception:
+                    continue
+
+        return model, serial
 
     def run_cmd(self, argv, timeout=None):
         """ RUN a command return the output """
@@ -86,8 +191,12 @@ class SataTool:
 
     def refresh_secures(self):
         """ Run a command to get the security values from hdparm """
+        was_secures = self.secures
         output = self.run_cmd('-I')
         secures = self._parse_output_to_secures(output.stdout)
+        if not was_secures and secures:
+            self.rescue_locked_drive() # just in case
+            secures = self.secures # may have been updated
         return secures
 
     # Logic for your App's Verdict
@@ -160,28 +269,33 @@ class SataTool:
         if db:
             self.job.process = self.start_async_wipe(use_enhanced=use_enhanced)
             return self.job
-
-        else:
-            erase_flag = '--security-erase-enhanced' if use_enhanced else '--security-erase'
-            return ['hdparm', '--user-master', 'u', erase_flag, 'NULL', self.device_path]
+        erase_flag = '--security-erase-enhanced' if use_enhanced else '--security-erase'
+        return ['hdparm', '--user-master', 'u', erase_flag, 'NULL', self.device_path]
 
 
 
     def rescue_locked_drive(self, password="NULL", db=False):
         """Attempts to unlock and disable security on a bricked drive."""
-        if db: print(f"Attempting rescue on locked device {self.device_name}...")
 
-        # 1. Unlock
-        self.run_cmd(['--user-master', 'u', '--security-unlock', password])
+        secures = self.secures
+        if secures.supported and not secures.frozen and secures.expired and (
+                    secures.locked or secures.enabled
+                    ) and self.wipe_ip_db.purge(self.model_serial_key):
 
-        # 2. Disable (removes the 'enabled' requirement)
-        self.run_cmd(['--user-master', 'u', '--security-disable', password])
+            if db: print(f"Attempting rescue on locked device {self.device_name}...")
+            if secures.locked:
+                # 1. Unlock
+                self.run_cmd(['--user-master', 'u', '--security-unlock', password])
+            if secures.enabled or secures.locked:
+                # 2. Disable (removes the 'enabled' requirement)
+                self.run_cmd(['--user-master', 'u', '--security-disable', password])
 
-        # 3. Verify
-        self.refresh_secures()
-        if not self.secures.locked and not self.secures.enabled:
-            return True, "Drive successfully rescued and unlocked."
-        return False, "Rescue failed. Password may be incorrect or drive is 'Expired'."
+            # 3. Verify
+            secures = self.refresh_secures()
+            if not secures.locked and not secures.enabled:
+                return True, "Drive successfully rescued and unlocked."
+            return False, "Rescue failed. Password may be incorrect or drive is 'Expired'."
+        return True, "Drive not rescued for any reason"
 
     def verify_wipe_result(self):
         """
@@ -202,7 +316,7 @@ class SataTool:
             return False, "StillLocked"
 
         return False, "SecurityEnabled"
-        
+
     def test_and_restore_block(self, offset=0):
         """
         Reads, Writes a test pattern, Reads, and Restores the original data.
@@ -217,7 +331,7 @@ class SataTool:
                 with open(self.device_path, 'rb') as f:
                     f.seek(offset)
                     self.original_data = f.read(512)
-                
+
                 if len(self.original_data) != 512:
                     self.original_data = None
                     return False, "Could not read full 512 bytes for backup."
@@ -234,11 +348,11 @@ class SataTool:
 
             # Step 3: Clear Cache and Verify Write
             subprocess.run(['blockdev', '--flushbufs', self.device_path], check=True)
-            
+
             with open(self.device_path, 'rb') as f:
                 f.seek(offset)
                 check_write = f.read(512)
-            
+
             if check_write != test_pattern:
                 return False, "Verification failed: Test pattern was not correctly written."
 
@@ -253,41 +367,40 @@ class SataTool:
 
             # Step 5: Final Verification of Restoration
             subprocess.run(['blockdev', '--flushbufs', self.device_path], check=True)
-            
+
             with open(self.device_path, 'rb') as f:
                 f.seek(offset)
                 final_check = f.read(512)
 
             if final_check == self.original_data:
-                return True, f"DevReadyForWrite"
-            else:
-                return False, "CRITICAL: Failed to restore original data correctly!"
+                return True, "DevReadyForWrite"
+            return False, "CRITICAL: Failed to restore original data correctly!"
 
         except Exception as e:
             return False, f"I/O Transaction error: {str(e)}"
-    
-    def finalize_verification(self):
-        """ Orchestrates the wait and the I/O test. """
-        print("Wipe command finished. Entering verification phase...")
-        
-        # 1. Wait for hdparm to see the drive again
-        ready = False
-        for i in range(20): # 100 seconds total
-            if self.is_ready_for_marker(): # The method we defined earlier
-                ready = True
-                break
-            print(f"[{i*5}s] Drive still busy or re-initializing...")
-            time.sleep(5)
-            
-        if not ready:
-            return False, "Timed out waiting for drive to become ready."
 
-        # 2. Perform the Read-Write-Restore test at the start and end
-        # We test Sector 0 (Start) and a block near the end
-        ok, msg = self.test_and_restore_block(offset=0)
-        if not ok: return False, msg
-        
-        return True, "Wipe verified and I/O integrity confirmed."
+#   def finalize_verification(self):
+#       """ Orchestrates the wait and the I/O test. """
+#       print("Wipe command finished. Entering verification phase...")
+
+#       # 1. Wait for hdparm to see the drive again
+#       ready = False
+#       for i in range(20): # 100 seconds total
+#           if self.is_ready_for_marker(): # The method we defined earlier
+#               ready = True
+#               break
+#           print(f"[{i*5}s] Drive still busy or re-initializing...")
+#           time.sleep(5)
+
+#       if not ready:
+#           return False, "Timed out waiting for drive to become ready."
+
+#       # 2. Perform the Read-Write-Restore test at the start and end
+#       # We test Sector 0 (Start) and a block near the end
+#       ok, msg = self.test_and_restore_block(offset=0)
+#       if not ok: return False, msg
+
+#       return True, "Wipe verified and I/O integrity confirmed."
 
 def main():
     """ TBD"""

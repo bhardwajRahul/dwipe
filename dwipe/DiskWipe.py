@@ -543,7 +543,7 @@ class MainScreen(DiskWipeScreen):
             infos = partition.hw_caps if partition.hw_caps else partition.hw_nopes
             key_str = f'   Fw{lead}: ' + ','.join(list(infos.keys()))
         return f'{"":>{wid}}{sep}│   └────── {port:<12} {serial}{key_str}'
-    
+
     def do_job_maintenance(self):
         """ Check all the jobs in progress and advance their state
             appropriately.

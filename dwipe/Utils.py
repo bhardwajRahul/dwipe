@@ -3,6 +3,7 @@ Utils class - Utility functions for dwipe
 """
 import os
 import sys
+import pwd
 import datetime
 from pathlib import Path
 from .StructuredLogger import StructuredLogger
@@ -81,7 +82,6 @@ class Utils:
         real_user = os.environ.get('SUDO_USER')
         if real_user:
             # Running with sudo - get the real user's home directory
-            import pwd
             real_home = pwd.getpwnam(real_user).pw_dir
             config_dir = Path(real_home) / '.config' / 'dwipe'
         else:
@@ -93,7 +93,6 @@ class Utils:
         # Fix ownership if running with sudo
         if real_user:
             try:
-                import pwd
                 pw_record = pwd.getpwnam(real_user)
                 uid, gid = pw_record.pw_uid, pw_record.pw_gid
                 os.chown(config_dir, uid, gid)
@@ -112,7 +111,6 @@ class Utils:
         real_user = os.environ.get('SUDO_USER')
         if real_user:
             try:
-                import pwd
                 pw_record = pwd.getpwnam(real_user)
                 uid, gid = pw_record.pw_uid, pw_record.pw_gid
                 os.chown(file_path, uid, gid)
