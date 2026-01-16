@@ -264,6 +264,11 @@ class WipeJob:
                     summary = task.get_summary_dict()
                     self.verify_result = summary.get('result', None)
 
+                    # Write marker with verify status after verification completes
+                    if not task.exception and not self.do_abort and self.verify_result:
+                        is_random = (self.expected_pattern == "random")
+                        self._write_marker_with_verify_status(is_random)
+
                 # Check for task errors (AFTER proxying state)
                 if task.exception:
                     self.exception = task.exception
@@ -1224,8 +1229,10 @@ class WipeJob:
             # Auto-start verification if enabled and write completed successfully
             verify_pct = getattr(self.opts, 'verify_pct', 0)
             auto_verify = getattr(self.opts, 'wipe_mode', "").endswith('+V')
-            if auto_verify and verify_pct > 0 and not self.do_abort and not self.exception:
-                self.verify_partition(verify_pct)
+            if auto_verify and not self.do_abort and not self.exception:
+                # Default to 2% verification if +V mode enabled but verify_pct not set
+                actual_verify_pct = verify_pct if verify_pct > 0 else 2
+                self.verify_partition(actual_verify_pct)
                 # Write marker with verification status after verification completes
                 # Use desired_mode to determine if random or zero
                 is_random = (desired_mode == 'Rand')

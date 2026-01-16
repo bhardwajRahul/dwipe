@@ -100,7 +100,7 @@ class SataTool:
             self.refresh_secures()
 
         if not self.secures.supported:
-            return "WipeUnsupported"
+            return "Unsupported"
         if self.secures.frozen:
             return "Frozen"
         if self.secures.expired:

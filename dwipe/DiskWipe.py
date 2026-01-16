@@ -105,7 +105,7 @@ class DiskWipe:
                     task_class = SataWipeTask
 
                 # Create firmware task
-                task = task_class(
+                fw_task = task_class(
                     device_path=f'/dev/{part.name}',
                     total_size=part.size_bytes,
                     opts=self.opts,
@@ -116,13 +116,33 @@ class DiskWipe:
                 # Store wipe type for logging
                 part.wipe_type = wipe_type
 
-                # Create WipeJob with single firmware task
+                # Build task list - firmware task plus optional verification
+                tasks = [fw_task]
+
+                # Add auto-verification if +V mode enabled
+                mode = getattr(self.opts, 'wipe_mode', '')
+                if '+V' in mode:
+                    from .VerifyTask import VerifyZeroTask
+                    verify_pct = getattr(self.opts, 'verify_pct', 0)
+                    if verify_pct == 0:
+                        verify_pct = 2  # Default to 2% for firmware wipes
+                    verify_task = VerifyZeroTask(
+                        device_path=f'/dev/{part.name}',
+                        total_size=part.size_bytes,
+                        opts=self.opts,
+                        verify_pct=verify_pct
+                    )
+                    tasks.append(verify_task)
+
+                # Create WipeJob with firmware task (and optional verify task)
                 part.job = WipeJob(
                     device_path=f'/dev/{part.name}',
                     total_size=part.size_bytes,
                     opts=self.opts,
-                    tasks=[task]
+                    tasks=tasks
                 )
+                # Firmware wipes (SATA secure erase, NVMe sanitize) write zeros
+                part.job.expected_pattern = "zeroed"
                 part.job.thread = threading.Thread(target=part.job.run_tasks)
                 part.job.thread.start()
 
@@ -188,6 +208,21 @@ class DiskWipe:
             self.persistent_state.set_device_locked(ns, to == 'Blk')
 
         return result
+
+    def _is_firmware_wipe(self, part):
+        """Check if partition has an active firmware wipe job (unstoppable)."""
+        if not part.job or part.job.done:
+            return False
+        from .FirmwareWipeTask import FirmwareWipeTask
+        current_task = getattr(part.job, 'current_task', None)
+        return current_task and isinstance(current_task, FirmwareWipeTask)
+
+    def _has_any_firmware_wipes(self):
+        """Check if any firmware wipes are currently running."""
+        for part in self.partitions.values():
+            if self._is_firmware_wipe(part):
+                return True
+        return False
 
     def do_key(self, key):
         """Handle keyboard input"""
@@ -273,7 +308,8 @@ class DiskWipe:
             part = ctx.partition
             name = part.name
             self.pick_is_running = bool(part.job)
-            if self.test_state(part, to='STOP'):
+            # Show stop action only for non-firmware wipes
+            if self.test_state(part, to='STOP') and not self._is_firmware_wipe(part):
                 actions['s'] = 'stop'
             elif self.test_state(part, to='0%'):
                 actions['w'] = 'wipe'
@@ -380,22 +416,15 @@ class DiskWipe:
             pick_attr=cs.A_REVERSE,  # Use reverse video for pick highlighting
             ctrl_c_terminates=False,
         )
-        lsblk_monitor = LsblkMonitor(check_interval=0.2)
-        lsblk_monitor.start()
-        print("Starting first lsblk...")
+        device_monitor = LsblkMonitor(check_interval=0.2)
+        device_monitor.start()
+        print("Discovering devices...")
         # Initialize device info and pick range before first draw
         info = DeviceInfo(opts=self.opts, persistent_state=self.persistent_state)
-        lsblk_output = None
-        while not lsblk_output:
-            lsblk_output = lsblk_monitor.get_and_clear()
-            self.partitions = info.assemble_partitions(self.partitions, lsblk_output)
-            if lsblk_output:
-                # print(lsblk_output, '\n\n')
-                print('got ... got lsblk result')
-                if self.opts.dump_lsblk:
-                    DeviceInfo.dump(self.partitions, title="after assemble_partitions")
-                    exit(1)
-            time.sleep(0.2)
+        self.partitions = info.assemble_partitions(self.partitions)
+        if self.opts.dump_lsblk:
+            DeviceInfo.dump(self.partitions, title="after assemble_partitions")
+            exit(1)
 
         self.win = ConsoleWindow(opts=win_opts)
         # Initialize screen stack
@@ -407,7 +436,7 @@ class DiskWipe:
         spin.add_key('port_serial', 'p - disk port info', vals=['Auto', 'On', 'Off'])
         spin.add_key('slowdown_stop', 'W - stop if disk slows Nx', vals=[64, 256, 0, 4, 16])
         spin.add_key('stall_timeout', 'T - stall timeout (sec)', vals=[60, 120, 300, 600, 0,])
-        spin.add_key('verify_pct', 'V - verification %', vals=[0, 2, 5, 10, 25, 50, 100])
+        spin.add_key('verify_pct', 'V - verification %', vals=[2, 5, 10, 20, 40, 70, 100])
         spin.add_key('passes', 'P - wipe pass count', vals=[1, 2, 4])
         spin.add_key('wipe_mode', 'm - wipe mode', vals=['-V', '+V'])
 
@@ -420,7 +449,7 @@ class DiskWipe:
         spin.add_key('verify', 'v - verify device', genre='action')
         spin.add_key('stop', 's - stop wipe', genre='action')
         spin.add_key('block', 'b - block/unblock disk', genre='action')
-        spin.add_key('delete_device', 'DEL - remove disk from lsblk',
+        spin.add_key('delete_device', 'DEL - remove disk from system',
                          genre='action', keys=(cs.KEY_DC))
         spin.add_key('scan_all_devices', '! - rescan all devices', genre='action')
         spin.add_key('stop_all', 'S - stop ALL wipes', genre='action')
@@ -437,7 +466,7 @@ class DiskWipe:
         Theme.set(self.opts.theme)
         self.win.set_handled_keys(self.spin.keys)
 
-        # Start background lsblk monitor
+        # Background device change monitor started above
 
         self.dev_info = info
         pick_range = info.get_pick_range()
@@ -459,14 +488,14 @@ class DiskWipe:
                 # Handle actions using perform_actions
                 self.stack.perform_actions(spin)
 
-                # Check for new lsblk data from background monitor
-                lsblk_output = lsblk_monitor.get_and_clear()
+                # Check for device changes from background monitor
+                devices_changed = device_monitor.get_and_clear()
                 time_since_refresh = time.monotonic() - check_devices_mono
 
-                if lsblk_output or time_since_refresh > 3.0:
+                if devices_changed or time_since_refresh > 3.0:
                     # Refresh if: device changes detected OR periodic refresh (3s default)
                     info = DeviceInfo(opts=self.opts, persistent_state=self.persistent_state)
-                    self.partitions = info.assemble_partitions(self.partitions, lsblk_output=lsblk_output)
+                    self.partitions = info.assemble_partitions(self.partitions)
                     self.dev_info = info
                     # Update pick range to highlight NAME through SIZE fields
                     pick_range = info.get_pick_range()
@@ -480,7 +509,7 @@ class DiskWipe:
                 self.win.clear()
         finally:
             # Clean up monitor thread on exit
-            lsblk_monitor.stop()
+            device_monitor.stop()
 
 class DiskWipeScreen(Screen):
     """ TBD """
@@ -514,26 +543,13 @@ class MainScreen(DiskWipeScreen):
             infos = partition.hw_caps if partition.hw_caps else partition.hw_nopes
             key_str = f'   Fw{lead}: ' + ','.join(list(infos.keys()))
         return f'{"":>{wid}}{sep}│   └────── {port:<12} {serial}{key_str}'
-
-    def draw_screen(self):
-        """Draw the main device list"""
+    
+    def do_job_maintenance(self):
+        """ Check all the jobs in progress and advance their state
+            appropriately.
+        """
         app = self.app
-
-        def wanted(name):
-            return not app.filter or app.filter.search(name)
-
-        app.win.set_pick_mode(True)
-        if app.opts.port_serial != 'Auto':
-            self.persist_port_serial = set() # name of disks
-        else: # if the disk goes away, clear persistence
-            for name in list(self.persist_port_serial):
-                if name not in app.partitions:
-                    self.persist_port_serial.discard(name)
-
-        # First pass: process jobs and collect visible partitions
-        app.get_hw_caps_when_needed()
-        visible_partitions = []
-        for name, partition in app.partitions.items():
+        for _, partition in app.partitions.items():
             partition.line = None
             if partition.job:
                 if partition.job.done:
@@ -756,11 +772,42 @@ class MainScreen(DiskWipeScreen):
                     app.partitions[partition.parent].state == 'Blk'):
                 continue
 
-            if wanted(name) or partition.job:
-                visible_partitions.append(partition)
+
+    def draw_screen(self):
+        """Draw the main device list"""
+        app = self.app
+
+        def wanted(name):
+            return not app.filter or app.filter.search(name)
+
+        self.do_job_maintenance()
+
+        app.win.set_pick_mode(True)
+        if app.opts.port_serial != 'Auto':
+            self.persist_port_serial = set() # name of disks
+        else: # if the disk goes away, clear persistence
+            for name in list(self.persist_port_serial):
+                if name not in app.partitions:
+                    self.persist_port_serial.discard(name)
+
+        # process jobs and collect visible partitions, sorted by disk then partition
+        visible_partitions = []
+        # Get disks sorted alphabetically
+        disks = sorted([p for p in app.partitions.values() if p.parent is None],
+                       key=lambda p: p.name)
+        for disk in disks:
+            if wanted(disk.name) or disk.job:
+                visible_partitions.append(disk)
+            # Add partitions for this disk, sorted alphabetically
+            parts = sorted([p for p in app.partitions.values() if p.parent == disk.name],
+                           key=lambda p: p.name)
+            for part in parts:
+                if wanted(part.name) or part.job:
+                    visible_partitions.append(part)
 
         # Re-infer parent states (like 'Busy') after updating child job states
         DeviceInfo.set_all_states(app.partitions)
+        app.get_hw_caps_when_needed()
 
         # Build mapping of parent -> last visible child
         parent_last_child = {}
@@ -870,9 +917,18 @@ class MainScreen(DiskWipeScreen):
         """Handle quit action (q or x key pressed)"""
         app = self.app
 
+        # Check for firmware wipes - cannot quit while they're running
+        if app._has_any_firmware_wipes():
+            # Show alert - cannot quit during firmware wipe
+            app.filter_bar._text = 'Cannot quit: firmware wipe running'
+            return
+
         def stop_if_idle(part):
             if part.state[-1] == '%':
                 if part.job and not part.job.done:
+                    # Skip firmware wipes - they cannot be stopped
+                    if app._is_firmware_wipe(part):
+                        return 1  # Count as running but don't stop
                     part.job.do_abort = True
             return 1 if part.job else 0
 
@@ -972,7 +1028,7 @@ class MainScreen(DiskWipeScreen):
                     pass
 
     def stop_ACTION(self):
-        """Handle 's' key"""
+        """Handle 's' key - stop current wipe (but not firmware wipes)"""
         app = self.app
         if app.pick_is_running:
             ctx = app.win.get_picked_context()
@@ -980,15 +1036,21 @@ class MainScreen(DiskWipeScreen):
                 part = ctx.partition
                 if part.state[-1] == '%':
                     if part.job and not part.job.done:
+                        # Skip firmware wipes - they cannot be safely stopped
+                        if app._is_firmware_wipe(part):
+                            return
                         part.job.do_abort = True
 
 
     def stop_all_ACTION(self):
-        """Handle 'S' key"""
+        """Handle 'S' key - stop all wipes (but not firmware wipes)"""
         app = self.app
         for part in app.partitions.values():
             if part.state[-1] == '%':
                 if part.job and not part.job.done:
+                    # Skip firmware wipes - they cannot be safely stopped
+                    if app._is_firmware_wipe(part):
+                        continue
                     part.job.do_abort = True
 
     def block_ACTION(self):

@@ -1,26 +1,30 @@
 """
-LsblkMonitor - Background thread for monitoring block device changes
+DeviceChangeMonitor - Background thread for monitoring block device changes
 """
 import os
 import threading
-import subprocess
 
 
 class LsblkMonitor:
-    """Background monitor that checks for block device changes and runs lsblk"""
+    """Background monitor that detects block device changes via /proc and /sys.
+
+    This class monitors for device hot-plug events without using lsblk (which
+    can block on devices undergoing firmware wipe). Device discovery is now
+    done directly via DeviceInfo.discover_devices().
+    """
 
     def __init__(self, check_interval=0.2):
         """
-        Initialize the lsblk monitor.
+        Initialize the device change monitor.
 
         Args:
             check_interval: How often to check for changes (seconds)
         """
         self.check_interval = check_interval
-        self.lsblk_str = ""
         self._lock = threading.Lock()
         self._thread = None
         self._stop_event = threading.Event()
+        self._changes_detected = False
         self.last_fingerprint = None
 
     def start(self):
@@ -38,9 +42,9 @@ class LsblkMonitor:
         if self._thread is not None:
             self._thread.join(timeout=1.0)
 
-    def check_for_changes(self):
+    def _check_for_changes(self):
         """
-        Check if block devices or partitions have changed.
+        Check if block devices or partitions have changed (non-blocking).
 
         Returns:
             True if changes detected, False otherwise
@@ -67,58 +71,34 @@ class LsblkMonitor:
             return True
         return False
 
-    def _run_lsblk(self):
-        """
-        Run lsblk and capture output in JSON format matching DeviceInfo.parse_lsblk requirements.
-
-        Returns:
-            JSON output string from lsblk command
-        """
-        try:
-            result = subprocess.run(
-                ['lsblk', '-J', '--bytes', '-o',
-                 'NAME,MAJ:MIN,FSTYPE,TYPE,LABEL,PARTLABEL,FSUSE%,SIZE,MOUNTPOINTS,UUID,PARTUUID,SERIAL'],
-                capture_output=True,
-                text=True,
-                timeout=5.0,
-                check=False
-            )
-            return result.stdout
-        except Exception:  # pylint: disable=broad-exception-caught
-            return ""  # Return empty string on error
-
     def _monitor_loop(self):
-        """Background thread loop that monitors for changes"""
+        """Background thread loop that monitors for device changes"""
         while not self._stop_event.is_set():
-            if self.check_for_changes():
-                # Changes detected, run lsblk
-                lsblk_output = self._run_lsblk()
-
-                # Store the result in a thread-safe manner
+            if self._check_for_changes():
                 with self._lock:
-                    self.lsblk_str = lsblk_output
+                    self._changes_detected = True
 
             # Sleep for the check interval
             self._stop_event.wait(self.check_interval)
 
     def get_and_clear(self):
         """
-        Get the latest lsblk output and clear it.
+        Check if changes were detected since last call.
 
         Returns:
-            String containing lsblk output, or empty string if no new data
+            True if changes detected, False otherwise
         """
         with self._lock:
-            result = self.lsblk_str
-            self.lsblk_str = ""
+            result = self._changes_detected
+            self._changes_detected = False
             return result
 
     def peek(self):
         """
-        Get the latest lsblk output without clearing it.
+        Check if changes were detected without clearing the flag.
 
         Returns:
-            String containing lsblk output, or empty string if no new data
+            True if changes detected, False otherwise
         """
         with self._lock:
-            return self.lsblk_str
+            return self._changes_detected

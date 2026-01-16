@@ -432,6 +432,12 @@ Note: Some disks are fundamentally broken and cannot be reliably wiped. dwipe wi
   * The bridge must not have an aggressive "Watchdog Timer."
   * The Risk: Some bridges disconnect if they don't see "data" for 60 seconds. During a firmware wipe, the drive is busy internally and doesn't send data.
   * The Recommendation: Use high-quality chipsets like ASMedia (1153E) or JMicron (JMS578).
+  
+##### Unlock Locked Device
+```
+sudo hdparm --user-master u --security-unlock NULL /dev/sdX
+sudo hdparm --user-master u --security-disable NULL /dev/sdX
+```
 ---
 
 ### Contributing

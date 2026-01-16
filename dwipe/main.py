@@ -33,8 +33,8 @@ def main():
             Utils.rerun_module_as_root('dwipe.main')
 
         prereqs = Prereqs(verbose=True)
-        # lsblk is critical for everything; hdparm and nvme only needed for firmware wipes
-        prereqs.check_all(['lsblk', 'hdparm', 'nvme'])
+        # blkid for filesystem detection; hdparm and nvme for firmware wipes
+        prereqs.check_all(['blkid', 'hdparm', 'nvme'])
         prereqs.report_and_exit_if_failed()
 
         dwipe = DiskWipe(opts=opts)  # opts=opts)
