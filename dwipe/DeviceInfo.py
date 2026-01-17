@@ -29,6 +29,38 @@ class DeviceInfo:
     """Class to dig out the info we want from the system."""
     disk_majors = set()  # major devices that are disks
 
+    @staticmethod
+    def clean_partition_label(label):
+        """Clean up partition labels by decoding escape sequences and simplifying common labels.
+
+        Args:
+            label: Raw partition label string (may contain \x20 etc.)
+
+        Returns:
+            Cleaned up label string
+        """
+        if not label:
+            return ''
+
+        # Decode escape sequences (like \x20 for space)
+        try:
+            # Handle common escape sequences
+            cleaned = label.encode('utf-8').decode('unicode_escape')
+        except (UnicodeDecodeError, AttributeError):
+            cleaned = label
+
+        # Simplify common Windows partition labels
+        simplifications = {
+            'Basic data partition': 'MS-Data',
+            'Microsoft reserved partition': 'MS-Reserved',
+            'EFI system partition': 'EFI',
+            'EFI System Partition': 'EFI',
+        }
+
+        cleaned = simplifications.get(cleaned, cleaned)
+
+        return cleaned
+
     def __init__(self, opts, persistent_state=None):
         self.opts = opts
         self.checker = DrivePreChecker()
@@ -319,7 +351,8 @@ class DeviceInfo:
                     elif line.startswith('E:ID_FS_LABEL='):
                         result['label'] = line.split('=', 1)[1].strip()
                     elif line.startswith('E:ID_PART_ENTRY_NAME=') and not result['label']:
-                        result['label'] = line.split('=', 1)[1].strip()
+                        raw_label = line.split('=', 1)[1].strip()
+                        result['label'] = self.clean_partition_label(raw_label)
                     elif line.startswith('E:ID_FS_UUID='):
                         result['uuid'] = line.split('=', 1)[1].strip()
                     elif line.startswith('E:ID_PART_ENTRY_UUID=') and not result['uuid']:
@@ -525,169 +558,6 @@ class DeviceInfo:
 
         return final_entries
 
-    def parse_lsblk(self, dflt, prev_nss=None, lsblk_output=None):
-        """Parse ls_blk for all the goodies we need
-
-        Args:
-            dflt: Default state for new devices
-            prev_nss: Previous device namespaces for merging
-            lsblk_output: Optional lsblk JSON output string. If provided, uses this
-                         instead of running lsblk command. Useful for background monitoring.
-        """
-        def eat_one(device, parent_name=None):
-            entry = self._make_partition_namespace(0, '', '', dflt)
-            entry.name = device.get('name', '')
-            maj_min = device.get('maj:min', (-1, -1))
-            wds = maj_min.split(':', maxsplit=1)
-            entry.major = -1
-            if len(wds) > 0:
-                entry.major = int(wds[0])
-            entry.fstype = device.get('fstype', '')
-            if entry.fstype is None:
-                entry.fstype = ''
-            entry.type = device.get('type', '')
-            entry.label = device.get('label', '')
-            if not entry.label:
-                entry.label = device.get('partlabel', '')
-            if entry.label is None:
-                entry.label = ''
-            entry.size_bytes = int(device.get('size', 0))
-
-            # Get UUID - prefer PARTUUID for partitions, UUID for filesystems
-            entry.uuid = device.get('partuuid', '') or device.get('uuid', '') or ''
-            entry.serial = device.get('serial', '') or ''
-
-            mounts = device.get('mountpoints', [])
-            while len(mounts) >= 1 and mounts[0] is None:
-                del mounts[0]
-            entry.mounts = mounts
-
-            # Check if we should read the marker (3-state model: dont-know, got-marker, no-marker)
-            # Read marker ONCE when:
-            # 1. Not mounted
-            # 2. No filesystem (fstype/label empty)
-            # 3. No active job (on this device OR its parent disk)
-            # 4. Haven't checked yet (marker_checked=False)
-            has_job = prev_nss and entry.name in prev_nss and getattr(prev_nss[entry.name], 'job', None) is not None
-            # Also check if parent disk has a job (e.g., firmware wipe on whole disk blocks partitions)
-            if not has_job and parent_name and prev_nss and parent_name in prev_nss:
-                has_job = getattr(prev_nss[parent_name], 'job', None) is not None
-            has_filesystem = entry.fstype or entry.label
-
-            # Inherit marker_checked from previous scan, or False if new/changed
-            prev_had_filesystem = (prev_nss and entry.name in prev_nss and
-                                   (prev_nss[entry.name].fstype or prev_nss[entry.name].label))
-            filesystem_changed = prev_had_filesystem != bool(has_filesystem)
-
-            if prev_nss and entry.name in prev_nss and not filesystem_changed:
-                entry.marker_checked = prev_nss[entry.name].marker_checked
-
-            # Read marker if haven't checked yet and safe to do so
-            should_read_marker = (not mounts and not has_filesystem and not has_job and
-                                  not entry.marker_checked)
-
-            if should_read_marker:
-                entry.marker_checked = True  # Mark as checked regardless of result
-                marker = WipeJob.read_marker_buffer(entry.name)
-                now = int(round(time.time()))
-                if (marker and marker.size_bytes == entry.size_bytes
-                        and marker.unixtime < now):
-                    # For multi-pass wipes, scrubbed_bytes can exceed size_bytes
-                    # Calculate completion percentage (capped at 100%)
-                    pct = min(100, int(round((marker.scrubbed_bytes / marker.size_bytes) * 100)))
-                    state = 'W' if pct >= 100 else 's'
-                    dt = datetime.datetime.fromtimestamp(marker.unixtime)
-                    # Add verification status prefix
-                    verify_prefix = ''
-                    verify_status = getattr(marker, 'verify_status', None)
-                    if verify_status == 'pass':
-                        verify_prefix = '✓ '
-                    elif verify_status == 'fail':
-                        verify_prefix = '✗ '
-
-                    # Add error suffix if job failed abnormally
-                    error_suffix = ''
-                    abort_reason = getattr(marker, 'abort_reason', None)
-                    if abort_reason:
-                        error_suffix = f' Err[{abort_reason}]'
-
-                    entry.marker = f'{verify_prefix}{state} {pct}% {marker.mode} {dt.strftime("%Y/%m/%d %H:%M")}{error_suffix}'
-                    entry.state = state
-                    entry.dflt = state  # Set dflt so merge logic knows this partition has a marker
-
-            return entry
-
-        # Get lsblk output - either from parameter or by running command
-        if lsblk_output:  # Non-empty string from background monitor
-            # Use provided output string
-            try:
-                parsed_data = json.loads(lsblk_output)
-            except (json.JSONDecodeError, Exception):
-                # Invalid JSON - return empty dict
-                return {}
-        else:
-            # Run the `lsblk` command and get its output in JSON format with additional columns
-            # Use timeout to prevent UI freeze if lsblk hangs on problematic devices
-            try:
-                result = subprocess.run(['lsblk', '-J', '--bytes', '-o',
-                                        'NAME,MAJ:MIN,FSTYPE,TYPE,LABEL,PARTLABEL,FSUSE%,SIZE,MOUNTPOINTS,UUID,PARTUUID,SERIAL'],
-                                       stdout=subprocess.PIPE, text=True, check=False, timeout=10.0)
-                parsed_data = json.loads(result.stdout)
-            except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception):  # pylint: disable=broad-exception-caught
-                # lsblk hung, returned bad JSON, or other error - return empty dict
-                # assemble_partitions will detect this and preserve previous state
-                return {}
-        entries = {}
-
-        # Parse each block device and its properties
-        for device in parsed_data['blockdevices']:
-            parent = eat_one(device)
-            entries[parent.name] = parent
-            for child in device.get('children', []):
-                entry = eat_one(child, parent_name=parent.name)
-                entries[entry.name] = entry
-                entry.parent = parent.name
-                parent.minors.append(entry.name)
-                self.disk_majors.add(entry.major)
-                if entry.mounts:
-                    entry.state = 'Mnt'
-                    parent.state = 'iMnt'
-
-
-        # Final pass: Identify disks, assign ports, and handle superfloppies
-        final_entries = {}
-        for name, entry in entries.items():
-            final_entries[name] = entry
-
-            # Only process top-level physical disks
-            if entry.parent is None:
-                # Hardware Info Gathering
-                entry.model = self._get_device_vendor_model(entry.name)
-                entry.port = self._get_port_from_sysfs(entry.name)
-
-                # The Split (Superfloppy Case)
-                # If it has children, the children already hold the data.
-                # If it has NO children but HAS data, we create the '----' child.
-                if not entry.minors and (entry.fstype or entry.label or entry.mounts):
-                    v_key = f"{name}_data"
-                    v_child = self._make_partition_namespace(entry.major, name, entry.size_bytes, dflt)
-                    v_child.name = "----"
-                    v_child.fstype = entry.fstype
-                    v_child.label = entry.label
-                    v_child.mounts = entry.mounts
-                    v_child.parent = name
-
-                    final_entries[v_key] = v_child
-                    entry.minors.append(v_key)
-
-                # Clean the hardware row of data-specific strings
-                entry.fstype = entry.model if entry.model else 'DISK'
-                entry.label = ''
-                entry.mounts = []
-
-        entries = final_entries
-
-        return entries
 
     @staticmethod
     def set_one_state(nss, ns, to=None, test_to=None):
