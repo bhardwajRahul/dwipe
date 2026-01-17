@@ -479,7 +479,7 @@ class DeviceInfo:
                     entry.label = blkid_info['label']
                     entry.uuid = blkid_info['uuid']
 
-                # Read marker (existing logic, only if safe)
+                # Read marker (non-blocking via worker thread)
                 has_job = is_dark  # Already checked above
                 has_filesystem = entry.fstype or entry.label
 
@@ -488,18 +488,28 @@ class DeviceInfo:
                                        (prev_nss[name].fstype or prev_nss[name].label))
                 filesystem_changed = prev_had_filesystem != bool(has_filesystem)
 
+                # Inherit previous marker state if filesystem hasn't changed
                 if prev_nss and name in prev_nss and not filesystem_changed:
                     entry.marker_checked = prev_nss[name].marker_checked
+                    # Also inherit marker string if we're not about to re-read
+                    entry.marker = getattr(prev_nss[name], 'marker', '')
 
-                # Read marker if haven't checked yet and safe to do so
+                # Determine if we should read marker (non-blocking check)
                 should_read_marker = (not entry.mounts and not has_filesystem and
                                       not has_job and not entry.marker_checked)
 
                 if should_read_marker:
-                    entry.marker_checked = True
-                    marker = WipeJob.read_marker_buffer(name)
+                    # Request marker read from worker (non-blocking)
+                    self.worker_manager.request_marker(name)
+
+                # Get current marker state from worker (non-blocking)
+                marker, marker_checked, marker_state = self.worker_manager.get_marker(name)
+                entry.marker_checked = marker_checked
+
+                # Process marker if ready
+                if marker_state == ProbeState.READY and marker:
                     now = int(round(time.time()))
-                    if (marker and marker.size_bytes == entry.size_bytes
+                    if (marker.size_bytes == entry.size_bytes
                             and marker.unixtime < now):
                         pct = min(100, int(round((marker.scrubbed_bytes / marker.size_bytes) * 100)))
                         state = 'W' if pct >= 100 else 's'
@@ -517,6 +527,9 @@ class DeviceInfo:
                         entry.marker = f'{verify_prefix}{state} {pct}% {marker.mode} {dt.strftime("%Y/%m/%d %H:%M")}{error_suffix}'
                         entry.state = state
                         entry.dflt = state
+                elif marker_state == ProbeState.PROBING:
+                    # Show pending indicator while marker is being read
+                    entry.marker = '...'
 
             entries[name] = entry
 

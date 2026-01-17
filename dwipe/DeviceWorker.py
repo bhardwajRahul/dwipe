@@ -48,6 +48,7 @@ class DeviceWorker(threading.Thread):
             'hw_caps_state': ProbeState.PENDING,
             'serial_state': ProbeState.PENDING,
             'model_state': ProbeState.PENDING,
+            'marker_state': ProbeState.PENDING,
 
             # Cached values
             'hw_caps': {},
@@ -55,6 +56,8 @@ class DeviceWorker(threading.Thread):
             'serial': '',
             'model': '',
             'vendor': '',
+            'marker': None,
+            'marker_checked': False,
 
             # Metadata
             'last_error': None,
@@ -81,6 +84,8 @@ class DeviceWorker(threading.Thread):
                     self._probe_serial()
                 elif task == 'model':
                     self._probe_model()
+                elif task == 'marker':
+                    self._probe_marker()
                 elif task == 'refresh_all':
                     self._probe_serial()
                     self._probe_model()
@@ -101,6 +106,13 @@ class DeviceWorker(threading.Thread):
             if self._state['hw_caps_state'] == ProbeState.PENDING:
                 self._state['hw_caps_state'] = ProbeState.PROBING
                 self._work_queue.put('hw_caps')
+
+    def request_marker(self):
+        """Request marker buffer read (non-blocking)."""
+        with self._lock:
+            if self._state['marker_state'] == ProbeState.PENDING:
+                self._state['marker_state'] = ProbeState.PROBING
+                self._work_queue.put('marker')
 
     def request_refresh(self):
         """Request refresh of dynamic data (non-blocking)."""
@@ -127,6 +139,19 @@ class DeviceWorker(threading.Thread):
                 self._state['hw_nopes'].copy(),
                 self._state['hw_caps_state'],
                 self._state['is_usb']
+            )
+
+    def get_marker(self):
+        """Get marker buffer if ready.
+
+        Returns:
+            tuple: (marker, marker_checked, state) where state is ProbeState
+        """
+        with self._lock:
+            return (
+                self._state['marker'],
+                self._state['marker_checked'],
+                self._state['marker_state']
             )
 
     def _probe_hw_caps(self):
@@ -198,6 +223,33 @@ class DeviceWorker(threading.Thread):
                 self._state['model_state'] = ProbeState.FAILED
                 self._state['last_error'] = f"model: {e}"
 
+    def _probe_marker(self):
+        """Probe marker buffer (runs in worker thread).
+
+        This reads the first 16KB from the device to check for wipe markers.
+        WARNING: This can block indefinitely if device is in firmware wipe.
+        That's why it runs in the worker thread, not main thread.
+        """
+        with self._lock:
+            self._state['marker_state'] = ProbeState.PROBING
+
+        try:
+            # Import here to avoid circular dependency
+            from .WipeJob import WipeJob
+
+            marker = WipeJob.read_marker_buffer(self.device_name)
+
+            with self._lock:
+                self._state['marker'] = marker
+                self._state['marker_checked'] = True
+                self._state['marker_state'] = ProbeState.READY
+
+        except Exception as e:
+            with self._lock:
+                self._state['marker_state'] = ProbeState.FAILED
+                self._state['marker_checked'] = True  # Mark as checked even on failure
+                self._state['last_error'] = f"marker: {e}"
+
     def _read_sysfs_attr(self, attr_path):
         """Read a sysfs attribute for this device.
 
@@ -266,11 +318,11 @@ class DeviceWorkerManager:
 
             # Create workers for new devices
             for name in device_names - current:
-                # Only create workers for whole disks (sd*, nvme*n*, hd*)
-                if self._is_whole_disk(name):
-                    worker = DeviceWorker(name, self.checker)
-                    worker.start()
-                    self._workers[name] = worker
+                # Create workers for all devices (disks and partitions)
+                # Partitions need workers too for marker reading
+                worker = DeviceWorker(name, self.checker)
+                worker.start()
+                self._workers[name] = worker
 
     def request_hw_caps(self, device_name):
         """Request hardware capabilities probe for a device."""
@@ -278,6 +330,13 @@ class DeviceWorkerManager:
             worker = self._workers.get(device_name)
             if worker:
                 worker.request_hw_caps()
+
+    def request_marker(self, device_name):
+        """Request marker buffer read for a device."""
+        with self._lock:
+            worker = self._workers.get(device_name)
+            if worker:
+                worker.request_marker()
 
     def get_hw_caps(self, device_name):
         """Get hardware capabilities for a device.
@@ -290,6 +349,18 @@ class DeviceWorkerManager:
             if worker:
                 return worker.get_hw_caps()
         return ({}, {}, ProbeState.PENDING, False)
+
+    def get_marker(self, device_name):
+        """Get marker buffer for a device.
+
+        Returns:
+            tuple: (marker, marker_checked, state) or (None, False, ProbeState.PENDING) if no worker
+        """
+        with self._lock:
+            worker = self._workers.get(device_name)
+            if worker:
+                return worker.get_marker()
+        return (None, False, ProbeState.PENDING)
 
     def get_state(self, device_name):
         """Get full cached state for a device."""
