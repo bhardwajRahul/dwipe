@@ -15,7 +15,6 @@ import json
 import time
 import subprocess
 import traceback
-# from types import SimpleNamespace
 
 from .WipeTask import WipeTask
 from .Utils import Utils
@@ -411,18 +410,5 @@ class SataWipeTask(FirmwareWipeTask):
                 return None # keep waiting
             self.more_state = True
             return True
-#       # I do not think the stuff below is needed
-#           self.more_state = 'TestWrite'
-#           self.state_mono = time.monotonic()
-#       if self.more_state.startswith('TestWrite'):
-#           if time.monotonic() - self.state_mono < 10.0:
-#               return None
-#           rv, why = self.tool.test_and_restore_block()
-#           if rv:
-#               self.more_state = ''
-#               return True
-#           self.more_state = 'TestWrite:{why}'
-#           self.state_mono = time.monotonic()
-
 
         return False # unexpected state

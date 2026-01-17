@@ -7,29 +7,11 @@
 
 import os
 import json
-# import sys
 import subprocess
 import re
 import time
 from types import SimpleNamespace
 from .Utils import Utils
-
-#import signal
-#def signal_handler(sig, frame):
-#   print("\n" + "!" * 60)
-#   print("CRITICAL WARNING: INTERRUPT DETECTED")
-#   print("A firmware wipe is a hardware-level command.")
-#   print("If you kill this process, the drive will remain LOCKED.")
-#   print("To recover, you must run this tool again and use the 'Rescue' option.")
-#   print("!" * 60)
-#
-#   # Optional: Logic to decide whether to actually exit
-#   confirm = input("\nReally abort and leave the drive locked? (y/N): ")
-#   if confirm.lower() == 'y':
-#       print("Aborting. Please note the drive is now in a Security Locked state.")
-#       sys.exit(1)
-#   else:
-#       print("Resuming monitoring...")
 
 class WipeIpDb:
     """Manages the persistent state of in-progress firmware wipes."""
@@ -383,28 +365,6 @@ class SataTool:
         except Exception as e:
             return False, f"I/O Transaction error: {str(e)}"
 
-#   def finalize_verification(self):
-#       """ Orchestrates the wait and the I/O test. """
-#       print("Wipe command finished. Entering verification phase...")
-
-#       # 1. Wait for hdparm to see the drive again
-#       ready = False
-#       for i in range(20): # 100 seconds total
-#           if self.is_ready_for_marker(): # The method we defined earlier
-#               ready = True
-#               break
-#           print(f"[{i*5}s] Drive still busy or re-initializing...")
-#           time.sleep(5)
-
-#       if not ready:
-#           return False, "Timed out waiting for drive to become ready."
-
-#       # 2. Perform the Read-Write-Restore test at the start and end
-#       # We test Sector 0 (Start) and a block near the end
-#       ok, msg = self.test_and_restore_block(offset=0)
-#       if not ok: return False, msg
-
-#       return True, "Wipe verified and I/O integrity confirmed."
 
 def main():
     """ TBD"""
