@@ -290,40 +290,38 @@ class DeviceInfo:
         return ''
 
     def _probe_blkid(self, device_name, timeout=2.0):
-        """Run blkid with timeout to get fstype, label, uuid (may block briefly).
+        """Get fstype, label, uuid from udev cache (instant, no subprocess).
 
-        ONLY call this for non-dark, non-mounted devices.
+        Reads from /run/udev/data/b<major>:<minor> which is populated by udevd
+        at boot time. Falls back to empty values if cache is unavailable.
 
         Args:
             device_name: Device name (e.g., 'sda1')
-            timeout: Seconds before giving up (default 2s)
+            timeout: Unused, kept for API compatibility
 
         Returns:
-            dict with keys: fstype, label, uuid (empty strings if failed/timeout)
+            dict with keys: fstype, label, uuid (empty strings if not found)
         """
         result = {'fstype': '', 'label': '', 'uuid': ''}
         try:
-            proc = subprocess.run(
-                ['blkid', '-o', 'export', f'/dev/{device_name}'],
-                capture_output=True, text=True, timeout=timeout, check=False
-            )
-            if proc.returncode == 0:
-                for line in proc.stdout.strip().split('\n'):
-                    if '=' in line:
-                        key, value = line.split('=', 1)
-                        if key == 'TYPE':
-                            result['fstype'] = value
-                        elif key == 'LABEL':
-                            result['label'] = value
-                        elif key == 'PARTLABEL' and not result['label']:
-                            result['label'] = value
-                        elif key == 'PARTUUID':
-                            result['uuid'] = value
-                        elif key == 'UUID' and not result['uuid']:
-                            result['uuid'] = value
-        except subprocess.TimeoutExpired:
-            pass  # Return empty values on timeout
-        except (FileNotFoundError, Exception):
+            # Get major:minor from sysfs
+            with open(f'/sys/class/block/{device_name}/dev') as f:
+                major_minor = f.read().strip()
+
+            # Read udev data file
+            with open(f'/run/udev/data/b{major_minor}') as f:
+                for line in f:
+                    if line.startswith('E:ID_FS_TYPE='):
+                        result['fstype'] = line.split('=', 1)[1].strip()
+                    elif line.startswith('E:ID_FS_LABEL='):
+                        result['label'] = line.split('=', 1)[1].strip()
+                    elif line.startswith('E:ID_PART_ENTRY_NAME=') and not result['label']:
+                        result['label'] = line.split('=', 1)[1].strip()
+                    elif line.startswith('E:ID_FS_UUID='):
+                        result['uuid'] = line.split('=', 1)[1].strip()
+                    elif line.startswith('E:ID_PART_ENTRY_UUID=') and not result['uuid']:
+                        result['uuid'] = line.split('=', 1)[1].strip()
+        except (FileNotFoundError, IOError, OSError):
             pass
         return result
 
