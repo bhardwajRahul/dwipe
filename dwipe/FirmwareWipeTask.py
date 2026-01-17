@@ -20,6 +20,7 @@ import traceback
 from .WipeTask import WipeTask
 from .Utils import Utils
 from .SataTool import SataTool
+from .NvmeTool import NvmeTool
 
 
 class FirmwareWipeTask(WipeTask):
@@ -105,7 +106,7 @@ class FirmwareWipeTask(WipeTask):
                 "scrubbed_bytes": self.total_size,
                 "size_bytes": self.total_size,
                 "passes": 1,
-                "mode": self.wipe_name,  # e.g., 'Sanitize-Crypto', 'EnhancedSd'
+                "mode": self.wipe_name,  # e.g., 'Crypto', 'Enhanced'
             }
             json_data = json.dumps(data).encode('utf-8')
 
@@ -233,69 +234,106 @@ class FirmwareWipeTask(WipeTask):
 
 
 class NvmeWipeTask(FirmwareWipeTask):
-    """NVMe firmware wipe using nvme-cli
+    """NVMe firmware wipe using NvmeTool
 
     Supports various sanitize and format operations:
     - Sanitize: Crypto Erase, Block Erase, Overwrite
     - Format: Crypto Erase, User Data Erase
 
     Example command_args:
-    - 'sanitize --action=0x04' (Crypto Erase)
-    - 'format --ses=2' (Format with Crypto Erase)
+    - 'sanitize_crypto' (Sanitize with Crypto Erase)
+    - 'sanitize_block' (Sanitize with Block Erase)
+    - 'format_erase' (Format with Crypto Erase)
     """
+    def __init__(self, device_path, total_size, opts, command_args, wipe_name):
+        self.tool = NvmeTool(device_path)
+        self.wipe_method = command_args  # e.g., 'sanitize_crypto', 'sanitize_block', 'format_erase'
+        self.state_mono = 0
+        super().__init__(device_path, total_size, opts, command_args, wipe_name)
 
     def _estimate_duration(self):
-        """Estimate NVMe wipe duration
+        """Estimate NVMe wipe duration from tool capabilities
 
         Most NVMe sanitize/format operations complete in seconds.
         Crypto erase: 2-10 seconds
         Block erase: 10-30 seconds
         Overwrite: 30-120 seconds
         """
-        if 'sanitize' in self.command_args:
-            if 'crypto' in self.command_args or '0x04' in self.command_args:
-                return 10  # Crypto erase is very fast
-            if 'block' in self.command_args or '0x02' in self.command_args:
-                return 30
-            return 120 # Overwrite
+        if self.tool.job.est_secs:
+            return self.tool.job.est_secs
+
+        # Fallback estimates based on method
+        if 'crypto' in self.wipe_method:
+            return 10
+        if 'block' in self.wipe_method:
+            return 30
+        if 'overwrite' in self.wipe_method:
+            return 120
         return 30
 
     def _build_command(self):
-        """Build nvme command
+        """Build NVMe wipe command using NvmeTool
 
         Returns:
-            list: ['nvme', 'sanitize', '--action=0x04', '/dev/nvme0n1']
+            None (NvmeTool handles command internally)
         """
-        # Parse command_args: 'sanitize --action=0x04'
-        parts = self.command_args.split()
-        cmd = ['nvme'] + parts + [self.device_path]
-        return cmd
+        # Verify capabilities
+        verdict = self.tool.get_wipe_verdict()
+        if verdict != "OK":
+            raise Exception(f"NVMe pre-flight failed: {verdict}")
+
+        # Start wipe using NvmeTool
+        self.tool.start_wipe(method=self.wipe_method)
+        self.process = self.tool.job.process
+        self.more_state = 'nvmeIP'
+
+        # Return empty list since process is already started
+        return []
 
     def _check_completion(self):
-        """Check NVMe wipe completion
+        """Check NVMe wipe completion with real-time progress polling"""
+        if self.more_state == 'nvmeIP':
+            if not self.process:
+                self.more_state = 'no-process'
+                return False
 
-        Can optionally poll 'nvme sanitize-log' for actual progress.
-        For now, just check if process exited.
-        """
-        if self.process and self.process.poll() is not None:
-            return self.process.returncode == 0
-        return None
+            # For sanitize operations, poll sanitize-log for actual progress
+            if 'sanitize' in self.wipe_method:
+                status, percent = self.tool.get_sanitize_status()
+                if status is not None:
+                    # Update progress based on actual sanitize status
+                    self.total_written = int(self.total_size * (percent / 100.0))
 
-    # TODO: Implement real-time progress polling via 'nvme sanitize-log'
-    # def _get_sanitize_progress(self):
-    #     """Query actual sanitize progress from device"""
-    #     try:
-    #         result = subprocess.run(
-    #             ['nvme', 'sanitize-log', self.device_path, '-o', 'json'],
-    #             capture_output=True, text=True, timeout=5
-    #         )
-    #         if result.returncode == 0:
-    #             data = json.loads(result.stdout)
-    #             # Parse progress from data
-    #             return progress_pct
-    #     except:
-    #         pass
-    #     return None
+                    # sstat values: 0=Idle (done or not started), 1=In Progress, 2=Success, 3=Failed
+                    if status == 0 or status == 2:
+                        # Check if process exited successfully
+                        if self.process.poll() is not None:
+                            if self.process.returncode == 0:
+                                self.more_state = 'Complete'
+                                return True
+                            else:
+                                self.more_state = f'rv={self.process.returncode}'
+                                return False
+                    elif status == 3:
+                        self.more_state = 'sanitize-failed'
+                        return False
+                    # status == 1: still in progress
+                    return None
+
+            # For format operations, just check if process completed
+            if self.process.poll() is not None:
+                if self.process.returncode == 0:
+                    self.more_state = 'Complete'
+                    return True
+                else:
+                    self.more_state = f'rv={self.process.returncode}'
+                    return False
+            return None
+
+        if self.more_state == 'Complete':
+            return True
+
+        return False
 
 
 class SataWipeTask(FirmwareWipeTask):

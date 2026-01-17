@@ -50,6 +50,7 @@ class NvmeTool:
             crypto_erase_supported=False,
             block_erase_supported=False,
             overwrite_supported=False,
+            format_supported=False,
             format_crypto_supported=False,
             raw_data=data
         )
@@ -63,10 +64,15 @@ class NvmeTool:
             caps.block_erase_supported = bool(sanicap & 0x02)
             caps.crypto_erase_supported = bool(sanicap & 0x04)
 
+            # Optional NVM Command Support (oncs)
+            # Bit 2: Format NVM command is supported
+            oncs = data.get('oncs', 0)
+            caps.format_supported = bool(oncs & 0x04)
+
             # Format Capabilities (fna)
             # Bit 2 indicates if Crypto Erase is supported via Format command
             fna = data.get('fna', 0)
-            caps.format_crypto_supported = bool(fna & 0x04)
+            caps.format_crypto_supported = bool(fna & 0x04) and caps.format_supported
 
         self.caps = caps
         return caps

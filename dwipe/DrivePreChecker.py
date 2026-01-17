@@ -33,16 +33,17 @@ class DrivePreChecker:
             # 1. Sanitize Support
             sanicap = data.get('sanicap', 0)
             if sanicap > 0:
-                if sanicap & 0x04: result.modes['CryptoNv'] = 'sanitize --action=0x04'
-                if sanicap & 0x02: result.modes['BlockNv'] = 'sanitize --action=0x02'
-                if sanicap & 0x08: result.modes['OvwrNv'] = 'sanitize --action=0x03'
+                if sanicap & 0x04: result.modes['Crypto'] = 'sanitize_crypto'
+                if sanicap & 0x02: result.modes['Block'] = 'sanitize_block'
+                if sanicap & 0x01: result.modes['Ovwr'] = 'sanitize_overwrite'
 
-            # 2. Format Support (Legacy)
-            if 'Format NVM' in id_ctrl.stdout:
+            # 2. Format Support
+            oncs = data.get('oncs', 0)
+            if oncs & 0x04:  # Format NVM command supported
                 fna = data.get('fna', 0)
-                if (fna >> 2) & 0x1:
-                    result.modes['FmtCryptoNv'] = 'format --ses=2'
-                result.modes['FmtEraseNv'] = 'format --ses=1'
+                if fna & 0x04:
+                    result.modes['FCrypto'] = 'format_crypto'
+                result.modes['FErase'] = 'format_erase'
 
             if not result.modes:
                 result.issues['Unsupported'] = "Drive lacks Sanitize or Format NVM capabilities"
@@ -61,8 +62,8 @@ class DrivePreChecker:
                 # Populate Modes only if no fatal issues
                 secures = tool.secures
                 if secures.enhanced_erase_supported:
-                    result.modes['EnhancedSd'] = '--user-master u --security-erase-enhanced NULL'
-                result.modes['EraseSd'] = '--user-master u --security-erase NULL'
+                    result.modes['Enhanced'] = 'enhanced'
+                result.modes['Erase'] = 'normal'
             elif verdict == 'DumbDevice':
                 pass  # No security feature - don't report as error (e.g., USB thumb drive)
             else:
