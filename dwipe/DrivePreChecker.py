@@ -58,14 +58,15 @@ class DrivePreChecker:
             tool = SataTool(device)
             verdict = tool.get_wipe_verdict()
             if verdict == 'OK':
-            # 4. Populate Modes only if no fatal issues
+                # Populate Modes only if no fatal issues
                 secures = tool.secures
                 if secures.enhanced_erase_supported:
                     result.modes['EnhancedSd'] = '--user-master u --security-erase-enhanced NULL'
                 result.modes['EraseSd'] = '--user-master u --security-erase NULL'
+            elif verdict == 'DumbDevice':
+                pass  # No security feature - don't report as error (e.g., USB thumb drive)
             else:
                 result.issues = {verdict: verdict}
-
 
         except Exception as e:
             result.issues['Error'] = f"ATA Probe Exception: {str(e)}"

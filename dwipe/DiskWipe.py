@@ -21,6 +21,7 @@ from console_window import (ConsoleWindow, ConsoleWindowOpts, OptionSpinner,
 
 from .WipeJob import WipeJob
 from .DeviceInfo import DeviceInfo
+from .DeviceWorker import ProbeState
 from .Utils import Utils
 from .PersistentState import PersistentState
 from .StructuredLogger import StructuredLogger
@@ -510,6 +511,9 @@ class DiskWipe:
         finally:
             # Clean up monitor thread on exit
             device_monitor.stop()
+            # Clean up device worker threads
+            if self.dev_info and self.dev_info.worker_manager:
+                self.dev_info.worker_manager.stop_all()
 
 class DiskWipeScreen(Screen):
     """ TBD """
@@ -538,10 +542,18 @@ class MainScreen(DiskWipeScreen):
         wid = wids.state if wids else 5
         sep, key_str = '  ', ''
         port, serial = partition.port, partition.serial
-        if partition.hw_caps or partition.hw_nopes:
-            lead = 'CAPS' if partition.hw_caps else 'ERRS'
-            infos = partition.hw_caps if partition.hw_caps else partition.hw_nopes
-            key_str = f'   Fw{lead}: ' + ','.join(list(infos.keys()))
+        hw_state = getattr(partition, 'hw_caps_state', ProbeState.PENDING)
+        is_usb = getattr(partition, 'is_usb', False)
+        # Show FwCAPS if device has actual capabilities
+        if partition.hw_caps:
+            key_str = '   FwCAPS: ' + ','.join(list(partition.hw_caps.keys()))
+        # Show FwERRS only for non-USB devices (USB without caps = normal, don't show error)
+        elif partition.hw_nopes and not is_usb:
+            key_str = '   FwERRS: ' + ','.join(list(partition.hw_nopes.keys()))
+        # Only show "..." for wipeable devices (not Mnt, Blk, Busy) that aren't USB
+        elif hw_state in (ProbeState.PENDING, ProbeState.PROBING):
+            if partition.state not in ('Mnt', 'iMnt', 'Blk', 'iBlk', 'Busy') and not is_usb:
+                key_str = '   FwCAPS: ...'
         return f'{"":>{wid}}{sep}│   └────── {port:<12} {serial}{key_str}'
 
     def do_job_maintenance(self):
@@ -769,7 +781,7 @@ class MainScreen(DiskWipeScreen):
                     partition.mounts = [' '.join(progress_parts)]
 
             if partition.parent and partition.parent in app.partitions and (
-                    app.partitions[partition.parent].state == 'Blk'):
+                    app.partitions[partition.parent].state in ('Blk', 'iBlk')):
                 continue
 
 
@@ -851,9 +863,9 @@ class MainScreen(DiskWipeScreen):
             if app.confirmation.active and app.confirmation.identity == partition.name:
                 # Build confirmation message
                 if app.confirmation.action_type == 'wipe':
-                    msg = f'⚠️ WIPE {partition.name}'
+                    msg = f'⚠️ WIPE'
                 else:  # verify
-                    msg = f'⚠️ VERIFY {partition.name} [writes marker]'
+                    msg = f'⚠️ VERIFY [writes marker]'
 
                 # Add mode-specific prompt (base message without input)
                 if app.confirmation.mode == 'yes':
@@ -861,8 +873,8 @@ class MainScreen(DiskWipeScreen):
                 elif app.confirmation.mode == 'identity':
                     msg += f" - Type '{partition.name}': "
                 elif app.confirmation.mode == 'choices':
-                    choices_str = ' '.join(app.confirmation.choices)
-                    msg += f": Pick ({choices_str}): "
+                    choices_str = ','.join(app.confirmation.choices)
+                    msg += f" Choice ({choices_str}): "
 
                 # Position message at fixed column (reduced from 28 to 20)
                 msg = ' ' * 5 + msg
@@ -1060,7 +1072,7 @@ class MainScreen(DiskWipeScreen):
         if ctx and hasattr(ctx, 'partition'):
             part = ctx.partition
             self.clear_hotswap_marker(part)
-            app.set_state(part, 'Unbl' if part.state == 'Blk' else 'Blk')
+            app.set_state(part, 'Unbl' if part.state in ('Blk', 'iBlk') else 'Blk')
 
     def help_ACTION(self):
         """Handle '?' key - push help screen"""

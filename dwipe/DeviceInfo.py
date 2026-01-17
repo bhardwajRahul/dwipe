@@ -22,6 +22,7 @@ from dataclasses import asdict
 from .WipeJob import WipeJob
 from .Utils import Utils
 from .DrivePreChecker import DrivePreChecker
+from .DeviceWorker import DeviceWorkerManager, ProbeState
 
 
 class DeviceInfo:
@@ -35,6 +36,7 @@ class DeviceInfo:
         self.head_str = None
         self.partitions = None
         self.persistent_state = persistent_state
+        self.worker_manager = DeviceWorkerManager(self.checker)
 
     @staticmethod
     def _make_partition_namespace(major, name, size_bytes, dflt):
@@ -58,36 +60,37 @@ class DeviceInfo:
                                port='',        # port (for whole disks)
                                hw_caps={},      # hw_wipe capabilities (for whole disks)
                                hw_nopes={},   # hw reasons cannot do hw wipe
+                               hw_caps_state=ProbeState.PENDING,  # probe state for hw_caps
+                               is_usb=False,   # True if device is on USB bus
                                )
 
     def get_hw_capabilities(self, ns):
         """
         Populates and returns hardware wipe capabilities for a disk.
-        Returns cached data if already present.
+        Non-blocking: requests probe from background worker, returns cached state.
 
         IMPORTANT: Skips probing if device has an active job to avoid blocking.
         """
-        # 1. Check if we already have cached results
-        if hasattr(ns, 'hw_caps') and (ns.hw_caps or ns.hw_nopes):
+        # 1. Check if we already have final results
+        if ns.hw_caps_state == ProbeState.READY:
             return ns.hw_caps, ns.hw_nopes
-
-        # Initialize defaults
-        ns.hw_caps, ns.hw_nopes = {}, {}
 
         # 2. Skip probing if device has active job (would block on SATA wipe)
         if ns.job:
             return ns.hw_caps, ns.hw_nopes
 
-        # 3. Perform the actual Probe
-        dev_path = f"/dev/{ns.name}"
-        if ns.name.startswith('nv'):
-            result = self.checker.check_nvme_drive(dev_path)
-        elif ns.name.startswith('sd'):
-            result = self.checker.check_ata_drive(dev_path)
-        else:
-            return ns.hw_caps, ns.hw_nopes
-        # 4. Store Results
-        ns.hw_caps, ns.hw_nopes = result.modes, result.issues
+        # 3. Request probe from worker (non-blocking)
+        self.worker_manager.request_hw_caps(ns.name)
+
+        # 4. Get current state from worker
+        hw_caps, hw_nopes, state, is_usb = self.worker_manager.get_hw_caps(ns.name)
+
+        # 5. Update namespace with worker state
+        ns.hw_caps = hw_caps
+        ns.hw_nopes = hw_nopes
+        ns.hw_caps_state = state
+        ns.is_usb = is_usb
+
         return ns.hw_caps, ns.hw_nopes
 
     def _get_port_from_sysfs(self, device_name):
@@ -425,6 +428,7 @@ class DeviceInfo:
                 entry.marker_checked = prev.marker_checked
                 entry.hw_caps = getattr(prev, 'hw_caps', {})
                 entry.hw_nopes = getattr(prev, 'hw_nopes', {})
+                entry.hw_caps_state = getattr(prev, 'hw_caps_state', ProbeState.PENDING)
                 entry.model = getattr(prev, 'model', '')
                 entry.port = getattr(prev, 'port', '')
             else:
@@ -490,7 +494,7 @@ class DeviceInfo:
                 self.disk_majors.add(entries[name].major)
                 # Propagate mount state to parent
                 if entries[name].mounts:
-                    entries[parent_name].state = 'Mnt'
+                    entries[parent_name].state = 'iMnt'
 
         # Phase 5: Handle superfloppy case and clean disk rows
         final_entries = {}
@@ -647,7 +651,7 @@ class DeviceInfo:
                 self.disk_majors.add(entry.major)
                 if entry.mounts:
                     entry.state = 'Mnt'
-                    parent.state = 'Mnt'
+                    parent.state = 'iMnt'
 
 
         # Final pass: Identify disks, assign ports, and handle superfloppies
@@ -690,7 +694,6 @@ class DeviceInfo:
         """Optionally, update a state, and always set inferred states"""
         ready_states = ('s', 'W', '-', '^')
         job_states = ('*%', 'STOP')
-        inferred_states = ('Busy', 'Mnt',)
 
         def state_in(to, states):
             return to in states or fnmatch(to, states[0])
@@ -707,9 +710,9 @@ class DeviceInfo:
 
         if to == 'STOP' and not state_in(ns.state, job_states):
             return False
-        if to == 'Blk' and not state_in(ns.state, list(ready_states) + ['Mnt']):
+        if to == 'Blk' and not state_in(ns.state, list(ready_states) + ['Mnt', 'iMnt', 'iBlk']):
             return False
-        if to == 'Unbl' and ns.state != 'Blk':
+        if to == 'Unbl' and ns.state not in ('Blk', 'iBlk'):
             return False
 
         if to and fnmatch(to, '*%'):
@@ -728,12 +731,14 @@ class DeviceInfo:
 
         # Here we set inferences that block starting jobs
         #  -- clearing these states will be done on the device refresh
-        if parent and state_in(ns.state, inferred_states):
-            if parent.state != 'Blk':
-                parent.state = ns.state
-        # Propagate Blk from child to parent (blocked partitions block the disk)
-        if parent and ns.state == 'Blk':
-            parent.state = 'Blk'
+        # Propagate Mnt/iMnt from child to parent as iMnt (inherited mount)
+        if parent and ns.state in ('Mnt', 'iMnt'):
+            if parent.state not in ('Blk', 'iBlk', 'Mnt'):
+                parent.state = 'iMnt'
+        # Propagate Blk/iBlk from child to parent as iBlk (inherited block)
+        if parent and ns.state in ('Blk', 'iBlk'):
+            if parent.state != 'Blk':  # Direct Blk trumps inherited
+                parent.state = 'iBlk'
         if state_in(ns.state, job_states):
             if parent:
                 parent.state = 'Busy'
@@ -743,8 +748,13 @@ class DeviceInfo:
 
     @staticmethod
     def clear_inferred_states(nss):
-        """Clear all inferred states (Busy, Mnt) so they can be re-inferred"""
-        inferred_states = ('Busy', 'Mnt')
+        """Clear all inferred states so they can be re-inferred.
+
+        Inherited states (iBlk, iMnt, Busy) are cleared.
+        Direct states (Blk, Mnt) are preserved - they're set based on
+        persistent state or actual mounts, not inheritance.
+        """
+        inferred_states = ('Busy', 'iMnt', 'iBlk')
         for ns in nss.values():
             if ns.state in inferred_states:
                 ns.state = ns.dflt
@@ -892,7 +902,7 @@ class DeviceInfo:
         # Check for newly inserted flag first (hot-swapped devices should always show orange)
         if getattr(ns, 'newly_inserted', False):
             # Newly inserted device - orange/bright
-            if ns.state in ('Mnt', 'Blk'):
+            if ns.state in ('Mnt', 'iMnt', 'Blk', 'iBlk'):
                 # Dim the orange for mounted/blocked devices
                 attr = curses.color_pair(Theme.HOTSWAP) | curses.A_DIM
             else:
@@ -912,7 +922,7 @@ class DeviceInfo:
         elif ns.state == '^':
             # Newly inserted device (hot-swapped) - orange/bright
             attr = curses.color_pair(Theme.HOTSWAP) | curses.A_BOLD
-        elif ns.state in ('Mnt', 'Blk'):
+        elif ns.state in ('Mnt', 'iMnt', 'Blk', 'iBlk'):
             # Dim mounted or blocked devices
             attr = curses.A_DIM
 
@@ -950,6 +960,13 @@ class DeviceInfo:
                 if hasattr(prev_ns, 'marker') and not new_ns.marker:
                     new_ns.marker = prev_ns.marker
 
+                # Preserve hw_caps state - once probed, it's permanent for the device
+                prev_hw_state = getattr(prev_ns, 'hw_caps_state', ProbeState.PENDING)
+                if prev_hw_state == ProbeState.READY:
+                    new_ns.hw_caps = getattr(prev_ns, 'hw_caps', {})
+                    new_ns.hw_nopes = getattr(prev_ns, 'hw_nopes', {})
+                    new_ns.hw_caps_state = ProbeState.READY
+
                 # Preserve verify failure message ONLY for unmarked disks
                 # Clear if: filesystem appeared OR partition now has a marker
                 if hasattr(prev_ns, 'verify_failed_msg'):
@@ -983,8 +1000,8 @@ class DeviceInfo:
                     new_ns.state = 'Blk'
                 elif new_ns.state not in ('s', 'W'):
                     new_ns.state = new_ns.dflt
-                    # Don't copy forward percentage states (like "v96%") - only persistent states
-                    if prev_ns.state not in ('s', 'W', 'Busy', 'Unbl') and not prev_ns.state.endswith('%'):
+                    # Don't copy forward percentage states or inherited states - only persistent states
+                    if prev_ns.state not in ('s', 'W', 'Busy', 'Unbl', 'iBlk', 'iMnt') and not prev_ns.state.endswith('%'):
                         new_ns.state = prev_ns.state  # re-infer these
             elif prev_ns.job:
                 # unplugged device with job..
@@ -1021,6 +1038,9 @@ class DeviceInfo:
         nss = self.get_disk_partitions(nss)
 
         nss = self.merge_dev_infos(nss, prev_nss)
+
+        # Update device workers for background probing
+        self.worker_manager.update_devices(nss.keys())
 
         # Apply persistent blocked states
         if self.persistent_state:

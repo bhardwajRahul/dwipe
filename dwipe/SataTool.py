@@ -163,7 +163,8 @@ class SataTool:
     def _make_ns():
         return SimpleNamespace(supported=False, enabled=False,
                 frozen=False, locked=False, expired=False,
-                enhanced_erase_supported=False, erase_est_secs=[4*60*60])
+                enhanced_erase_supported=False, erase_est_secs=[4*60*60],
+                has_security_feature=False)  # True if hdparm found a Security block
 
     def _parse_output_to_secures(self, output):
         secures = self._make_ns()
@@ -171,8 +172,9 @@ class SataTool:
         # Look specifically for the security block
         security_match = re.search(r"(?i)Security:.*?(?=\n\w|\Z)", output, re.DOTALL)
         if not security_match:
-            return secures
+            return secures  # has_security_feature stays False
 
+        secures.has_security_feature = True
         sec_block = security_match.group(0)
 
         # Better logic: Check if the keyword exists AND is not preceded by 'not'
@@ -208,6 +210,8 @@ class SataTool:
         if not self.secures:
             self.refresh_secures()
 
+        if not self.secures.has_security_feature:
+            return "DumbDevice"  # No ATA security feature (e.g., USB thumb drive)
         if not self.secures.supported:
             return "Unsupported"
         if self.secures.frozen:
