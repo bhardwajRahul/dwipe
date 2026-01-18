@@ -494,42 +494,34 @@ class DeviceInfo:
                     # Also inherit marker string if we're not about to re-read
                     entry.marker = getattr(prev_nss[name], 'marker', '')
 
-                # Determine if we should read marker (non-blocking check)
-                should_read_marker = (not entry.mounts and not has_filesystem and
-                                      not has_job and not entry.marker_checked)
-
-                if should_read_marker:
-                    # Request marker read from worker (non-blocking)
-                    self.worker_manager.request_marker(name)
-
-                # Get current marker state from worker (non-blocking)
-                marker, marker_checked, marker_state = self.worker_manager.get_marker(name)
-                entry.marker_checked = marker_checked
-
-                # Process marker if ready
-                if marker_state == ProbeState.READY and marker:
-                    now = int(round(time.time()))
-                    if (marker.size_bytes == entry.size_bytes
-                            and marker.unixtime < now):
-                        pct = min(100, int(round((marker.scrubbed_bytes / marker.size_bytes) * 100)))
-                        state = 'W' if pct >= 100 else 's'
-                        dt = datetime.datetime.fromtimestamp(marker.unixtime)
-                        verify_prefix = ''
-                        verify_status = getattr(marker, 'verify_status', None)
-                        if verify_status == 'pass':
-                            verify_prefix = '✓ '
-                        elif verify_status == 'fail':
-                            verify_prefix = '✗ '
-                        error_suffix = ''
-                        abort_reason = getattr(marker, 'abort_reason', None)
-                        if abort_reason:
-                            error_suffix = f' Err[{abort_reason}]'
-                        entry.marker = f'{verify_prefix}{state} {pct}% {marker.mode} {dt.strftime("%Y/%m/%d %H:%M")}{error_suffix}'
-                        entry.state = state
-                        entry.dflt = state
-                elif marker_state == ProbeState.PROBING:
-                    # Show pending indicator while marker is being read
-                    entry.marker = '...'
+                # Read marker synchronously on startup for clean devices
+                if (not entry.mounts and not has_filesystem and
+                        not has_job and not entry.marker_checked):
+                    try:
+                        marker = WipeJob.read_marker_buffer(name)
+                        entry.marker_checked = True
+                        if marker:
+                            now = int(round(time.time()))
+                            if (marker.size_bytes == entry.size_bytes
+                                    and marker.unixtime < now):
+                                pct = min(100, int(round((marker.scrubbed_bytes / marker.size_bytes) * 100)))
+                                state = 'W' if pct >= 100 else 's'
+                                dt = datetime.datetime.fromtimestamp(marker.unixtime)
+                                verify_prefix = ''
+                                verify_status = getattr(marker, 'verify_status', None)
+                                if verify_status == 'pass':
+                                    verify_prefix = '✓ '
+                                elif verify_status == 'fail':
+                                    verify_prefix = '✗ '
+                                error_suffix = ''
+                                abort_reason = getattr(marker, 'abort_reason', None)
+                                if abort_reason:
+                                    error_suffix = f' Err[{abort_reason}]'
+                                entry.marker = f'{verify_prefix}{state} {pct}% {marker.mode} {dt.strftime("%Y/%m/%d %H:%M")}{error_suffix}'
+                                entry.state = state
+                                entry.dflt = state
+                    except Exception:
+                        entry.marker_checked = True
 
             entries[name] = entry
 
