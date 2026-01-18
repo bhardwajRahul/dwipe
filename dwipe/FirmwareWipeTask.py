@@ -132,13 +132,14 @@ class FirmwareWipeTask(WipeTask):
             # Build command
             cmd = self._build_command()
 
-            # Start subprocess (non-blocking)
-            self.process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
+            # Start subprocess (non-blocking) - skip if process already started (e.g., NVMe)
+            if cmd:
+                self.process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
 
             # Monitor progress with polling loop
             check_interval = 2  # Check every 2 seconds
@@ -225,7 +226,7 @@ class FirmwareWipeTask(WipeTask):
             "step": f"firmware {self.wipe_name} {self.device_path}",
             "elapsed": Utils.ago_str(int(elapsed)),
             "rate": "Firmware",
-            "command": ' '.join(self._build_command()),
+            "command": self.command_args,
             "bytes_written": self.total_written,
             "bytes_total": self.total_size,
             "result": "completed" if self.total_written == self.total_size else "partial"
@@ -276,8 +277,8 @@ class NvmeWipeTask(FirmwareWipeTask):
         Returns:
             None (NvmeTool handles command internally)
         """
-        # Verify capabilities
-        verdict = self.tool.get_wipe_verdict()
+        # Verify capabilities for the specific wipe method
+        verdict = self.tool.get_wipe_verdict(method=self.wipe_method)
         if verdict != "OK":
             raise Exception(f"NVMe pre-flight failed: {verdict}")
 
@@ -368,12 +369,7 @@ class SataWipeTask(FirmwareWipeTask):
         Returns:
             list: ['hdparm', '--user-master', 'u', '--security-erase', 'NULL', '/dev/sda']
         """
-        # SATA requires pre-flight check and password setup before erase
-        verdict = self.tool.get_wipe_verdict()
-        if verdict != "OK":
-            raise Exception(f"SATA pre-flight failed: {verdict}")
-
-        # Set security password (required before erase)
+        # Set security password (required before erase; capability already verified during task creation)
         set_pass_res = self.tool.run_cmd(['--user-master', 'u', '--security-set-pass', 'NULL'])
         if set_pass_res.returncode != 0:
             raise Exception(f"Failed to set security password: {set_pass_res.stderr.strip()}")

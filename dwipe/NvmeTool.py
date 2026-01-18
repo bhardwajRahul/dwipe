@@ -38,6 +38,41 @@ class NvmeTool:
         except Exception as e:
             return None
 
+    def get_supported_lbaf(self):
+        """Get a supported LBA format index.
+
+        Queries the namespace to find supported LBA formats and returns
+        one that should work. Returns the currently active format as first choice.
+
+        Returns:
+            int: LBAF index (0-15)
+        """
+        try:
+            # Query namespace
+            data = self.run_nvme_cmd(['id-ns', self.device_path])
+            if data:
+                # Get currently active format
+                flbas = data.get('flbas', 0)
+                if isinstance(flbas, dict):
+                    current_lbaf = flbas.get('format', 0)
+                else:
+                    current_lbaf = int(flbas) & 0x0F
+
+                # Try to get list of supported formats
+                lbafs = data.get('lbafs', [])
+                if lbafs and isinstance(lbafs, list):
+                    # Check if current format is in supported list
+                    if current_lbaf < len(lbafs):
+                        return current_lbaf
+                    # Otherwise return first supported format
+                    if len(lbafs) > 0:
+                        return 0
+
+                return current_lbaf
+        except Exception:
+            pass
+        return 0  # Default to format 0
+
     def refresh_capabilities(self):
         """
         Detects if Sanitize and Format (Crypto/Erase) are supported.
@@ -77,29 +112,60 @@ class NvmeTool:
         self.caps = caps
         return caps
 
-    def get_wipe_verdict(self):
-        """Determines if the drive can be wiped."""
+    def get_wipe_verdict(self, method='sanitize_block'):
+        """Determines if the drive can be wiped with the specified method.
+
+        Args:
+            method: Wipe method ('sanitize_block', 'sanitize_crypto', 'sanitize_overwrite',
+                               'format_erase', 'format_crypto')
+
+        Returns:
+            'OK' if supported, or error reason string
+        """
         if not self.caps:
             self.refresh_capabilities()
-        
-        if not self.caps.has_sanitize and not self.caps.format_crypto_supported:
-            return "Unsupported"
-        
+
+        # Check if the specific method is supported
+        if method == 'sanitize_block':
+            if not self.caps.block_erase_supported:
+                return "Block Erase not supported"
+        elif method == 'sanitize_crypto':
+            if not self.caps.crypto_erase_supported:
+                return "Crypto Erase not supported"
+        elif method == 'sanitize_overwrite':
+            if not self.caps.overwrite_supported:
+                return "Overwrite not supported"
+        elif method in ('format_erase', 'format_crypto'):
+            if not self.caps.format_supported:
+                return "Format not supported"
+        else:
+            return f"Unknown method: {method}"
+
         # NVMe drives don't 'freeze' like SATA, but they can be Read-Only
-        # or have Namespace management locks. 
+        # or have Namespace management locks.
         return "OK"
 
     def start_wipe(self, method='sanitize_block'):
         """
-        Executes the wipe. 
-        Methods: 'sanitize_block', 'sanitize_crypto', 'format_erase'
+        Executes the wipe.
+        Methods: 'sanitize_block', 'sanitize_crypto', 'sanitize_overwrite', 'format_erase', 'format_crypto'
         """
         if method == 'sanitize_block':
             cmd = ['nvme', 'sanitize', '-a', 'start-block-erase', self.device_path]
         elif method == 'sanitize_crypto':
             cmd = ['nvme', 'sanitize', '-a', 'start-crypto-erase', self.device_path]
-        else: # Default to standard format
-            cmd = ['nvme', 'format', '-e', '1', self.device_path]
+        elif method == 'sanitize_overwrite':
+            cmd = ['nvme', 'sanitize', '-a', 'overwrite', self.device_path]
+        elif method == 'format_erase':
+            # Format with user data erase - use supported LBAF
+            lbaf = self.get_supported_lbaf()
+            cmd = ['nvme', 'format', f'--lbaf={lbaf}', '--force', self.device_path]
+        elif method == 'format_crypto':
+            # Format with crypto erase - use supported LBAF
+            lbaf = self.get_supported_lbaf()
+            cmd = ['nvme', 'format', f'--lbaf={lbaf}', '--ses=2', '--force', self.device_path]
+        else:
+            raise ValueError(f"Unknown wipe method: {method}")
 
         self.job.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.job.wipe_started_mono = time.monotonic()
