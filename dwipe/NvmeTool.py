@@ -1,9 +1,11 @@
 import os
 import json
 import subprocess
+import io
 import re
 import time
 from types import SimpleNamespace
+
 
 class NvmeTool:
     """NVMe equivalent of SataTool using nvme-cli."""
@@ -145,31 +147,63 @@ class NvmeTool:
         # or have Namespace management locks.
         return "OK"
 
-    def start_wipe(self, method='sanitize_block'):
-        """
-        Executes the wipe.
-        Methods: 'sanitize_block', 'sanitize_crypto', 'sanitize_overwrite', 'format_erase', 'format_crypto'
-        """
-        if method == 'sanitize_block':
-            cmd = ['nvme', 'sanitize', '-a', 'start-block-erase', self.device_path]
-        elif method == 'sanitize_crypto':
-            cmd = ['nvme', 'sanitize', '-a', 'start-crypto-erase', self.device_path]
-        elif method == 'sanitize_overwrite':
-            cmd = ['nvme', 'sanitize', '-a', 'overwrite', self.device_path]
-        elif method == 'format_erase':
-            # Format with user data erase - use supported LBAF
-            lbaf = self.get_supported_lbaf()
-            cmd = ['nvme', 'format', f'--lbaf={lbaf}', '--force', self.device_path]
-        elif method == 'format_crypto':
-            # Format with crypto erase - use supported LBAF
-            lbaf = self.get_supported_lbaf()
-            cmd = ['nvme', 'format', f'--lbaf={lbaf}', '--ses=2', '--force', self.device_path]
-        else:
-            raise ValueError(f"Unknown wipe method: {method}")
 
-        self.job.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        self.job.wipe_started_mono = time.monotonic()
-        return self.job.process
+
+    def start_wipe(self, method='format_crypto'):
+        ctrl_path = re.sub(r'n\d+$', '', self.device_path)
+        
+        # 1. Determine the Best Command
+        # If the drive supports Sanitize, it's MUCH more 'general' than Format
+        if method.startswith('sanitize'):
+            mode_map = {'sanitize_block': 'start-block-erase', 
+                        'sanitize_crypto': 'start-crypto-erase', 
+                        'sanitize_overwrite': 'overwrite'}
+            cmd = ['nvme', 'sanitize', '-a', mode_map[method], ctrl_path]
+        else:
+            # For 'Format', we send the BARE MINIMUM. 
+            # No --lbaf, no --ms, no --pi. 
+            # This forces the drive to use its current valid hardware configuration.
+            ses_type = '2' if method == 'format_crypto' else '1'
+            cmd = [
+                'nvme', 'format', ctrl_path,
+                '--namespace-id=0xffffffff', # Target all namespaces (prevents locks)
+                f'--ses={ses_type}',
+                '--force'
+            ]
+
+        try:
+            # We run synchronously for the format command because it's fast
+            # and we need to check for that 0x410a immediately.
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+
+            # FALLBACK: If 0xffffffff (all namespaces) is rejected, try just the specific one
+            if res.returncode != 0 and '0x410a' in (res.stdout + res.stderr):
+                nsid_match = re.search(r'n(\d+)$', self.device_path)
+                nsid = nsid_match.group(1) if nsid_match else "1"
+                cmd[3] = f'--namespace-id={nsid}'
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+
+            # 2. Wrap the result to fix your 'AttributeError'
+            # We use io.StringIO so that .read() works in your Task manager
+            self.job.process = SimpleNamespace(
+                poll=lambda: 0, # Marks it as finished
+                returncode=res.returncode,
+                stdout=io.StringIO(res.stdout),
+                stderr=io.StringIO(res.stderr),
+                communicate=lambda: (res.stdout, res.stderr)
+            )
+            self.job.wipe_started_mono = time.monotonic()
+            return self.job.process
+
+        except Exception as e:
+            self.job.process = SimpleNamespace(
+                poll=lambda: 1,
+                returncode=1,
+                stdout=io.StringIO(""),
+                stderr=io.StringIO(str(e)),
+                communicate=lambda: ("", str(e))
+            )
+            return self.job.process
 
     def get_sanitize_status(self):
         """
