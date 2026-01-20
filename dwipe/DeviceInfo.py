@@ -472,10 +472,13 @@ class DeviceInfo:
                     entry.model = self._get_device_vendor_model(name)
                     entry.port = self._get_port_from_sysfs(name)
 
-                # Get fstype/label/uuid via blkid (only if not mounted and not dark)
-                if not entry.mounts and not is_dark:
+                # Get fstype/label/uuid via blkid (skip only if dark device)
+                if not is_dark:
                     blkid_info = self._probe_blkid(name)
-                    entry.fstype = blkid_info['fstype']
+                    # If not mounted, use blkid fstype; if mounted, use mount fstype
+                    if not entry.mounts:
+                        entry.fstype = blkid_info['fstype']
+                    # Always get label and uuid from blkid
                     entry.label = blkid_info['label']
                     entry.uuid = blkid_info['uuid']
 
