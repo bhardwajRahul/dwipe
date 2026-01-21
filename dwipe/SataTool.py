@@ -232,8 +232,19 @@ class SataTool:
     def start_wipe(self, use_enhanced=False, password="NULL", db=False):
         """
         Executes the two-stage ATA Security Erase process.
-        Returns (success_bool, message)
+        Returns structured dict with commands_executed list and final process.
+
+        Example return:
+        {
+            'commands_executed': [
+                {'cmd': ['hdparm', ...], 'returncode': 0, 'sleep_after': 0},
+                {'cmd': ['hdparm', ...], 'returncode': 0, 'sleep_after': 5}
+            ],
+            'process': <Popen object>
+        }
         """
+        commands_executed = []
+
         # 1. Pre-flight check: Re-verify not frozen
         self.refresh_secures()
         verdict = self.get_wipe_verdict()
@@ -242,10 +253,17 @@ class SataTool:
 
         # 2. Set the Security Password
         # This moves the drive from 'not enabled' to 'enabled'
-        set_pass_argv = ['--user-master', 'u', '--security-set-pass', password]
+        set_pass_argv = ['hdparm'] + ['--user-master', 'u', '--security-set-pass', password]
         if db: print(f"Setting security password for {self.device_name}...")
-        res = self.run_cmd(set_pass_argv)
-        
+        res = self.run_cmd(['--user-master', 'u', '--security-set-pass', password])
+
+        # Record command execution
+        commands_executed.append({
+            'cmd': ' '.join(set_pass_argv),
+            'returncode': res.returncode,
+            'sleep_after': self.tunables.post_password_delay
+        })
+
         time.sleep(self.tunables.post_password_delay)
 
         if res.returncode != 0:
@@ -257,12 +275,22 @@ class SataTool:
             return False, "Password command accepted but drive is not 'enabled'."
         time.sleep(self.tunables.post_unlock_delay)
 
-        # NOTE: This command will run until finished or timeout.
-        if db:
-            self.job.process = self.start_async_wipe(use_enhanced=use_enhanced)
-            return self.job
+        # 4. Build erase command (to be executed asynchronously)
         erase_flag = '--security-erase-enhanced' if use_enhanced else '--security-erase'
-        return ['hdparm', '--user-master', 'u', erase_flag, 'NULL', self.device_path]
+        erase_cmd = ['hdparm', '--user-master', 'u', erase_flag, 'NULL', self.device_path]
+
+        # Start async wipe process
+        if db:
+            process = self.start_async_wipe(use_enhanced=use_enhanced)
+        else:
+            # When not in db mode, return structured info for logging
+            process = None  # Will be started by caller
+
+        return {
+            'commands_executed': commands_executed,
+            'erase_command': erase_cmd,  # The final command to be executed
+            'process': process
+        }
 
 
 

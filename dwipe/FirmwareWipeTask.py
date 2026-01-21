@@ -232,7 +232,7 @@ class FirmwareWipeTask(WipeTask):
         """Generate summary dictionary for structured logging
 
         Returns:
-            dict: Summary with step details including actual command and return code
+            dict: Summary with step details including command sequence and return codes
         """
         summary = {
             "step": f"firmware {self.wipe_name} {self.device_path}",
@@ -374,6 +374,7 @@ class SataWipeTask(FirmwareWipeTask):
         self.tool = SataTool(device_path)
         self.use_enhanced = 'enhanced' in command_args
         self.state_mono = 0
+        self.commands_executed = []  # Store pre-erase commands for logging
         super().__init__(device_path, total_size, opts, command_args, wipe_name)
 
     def _estimate_duration(self):
@@ -387,21 +388,44 @@ class SataWipeTask(FirmwareWipeTask):
     def _build_command(self):
         """Build hdparm erase command (sets password first as required for SATA)
 
+        Uses SataTool.start_wipe() to execute pre-erase commands and get the final erase command.
+
         Returns:
             list: ['hdparm', '--user-master', 'u', '--security-erase', 'NULL', '/dev/sda']
         """
-        # Set security password (required before erase; capability already verified during task creation)
-        set_pass_res = self.tool.run_cmd(['--user-master', 'u', '--security-set-pass', 'NULL'])
-        if set_pass_res.returncode != 0:
-            raise Exception(f"Failed to set security password: {set_pass_res.stderr.strip()}")
+        # Call start_wipe which handles password setting and pre-erase setup
+        result = self.tool.start_wipe(use_enhanced=self.use_enhanced, password='NULL', db=False)
 
-        self.tool.refresh_secures()
-        if not self.tool.secures.enabled:
-            raise Exception("Password set but security not enabled")
+        # Handle error case (returns tuple)
+        if isinstance(result, tuple):
+            _, message = result
+            raise Exception(f"SATA wipe setup failed: {message}")
 
-        erase_flag = '--security-erase-enhanced' if self.use_enhanced else '--security-erase'
-        self.more_state = 'hdparmIP'
-        return ['hdparm', '--user-master', 'u', erase_flag, 'NULL', self.device_path]
+        # Handle success case (returns dict with command sequence)
+        if isinstance(result, dict):
+            # Capture pre-erase commands for logging
+            self.commands_executed = result.get('commands_executed', [])
+            erase_cmd = result.get('erase_command', [])
+
+            # Check if we got valid erase command
+            if not erase_cmd:
+                raise Exception("start_wipe() did not return erase command")
+
+            self.more_state = 'hdparmIP'
+            return erase_cmd
+
+        # Fallback for unexpected return type
+        raise Exception(f"Unexpected return from start_wipe(): {type(result)}")
+
+    def get_summary_dict(self):
+        """Generate summary dict with SATA pre-erase command sequence included"""
+        summary = super().get_summary_dict()
+
+        # Add pre-erase commands executed (for convincing evidence)
+        if self.commands_executed:
+            summary["commands_executed"] = self.commands_executed
+
+        return summary
 
     def _check_completion(self):
         """Check SATA erase completion and verify result"""
@@ -429,6 +453,73 @@ class SataWipeTask(FirmwareWipeTask):
             return True
 
         return False # unexpected state
+
+
+class StandardPrecheckTask(WipeTask):
+    """Precheck firmware wipe capabilities before proceeding
+
+    Validates that the selected wipe method is available on the device.
+    Applies to both NVMe and SATA firmware wipes.
+    """
+
+    def __init__(self, device_path, total_size, opts, selected_wipe_type):
+        super().__init__(device_path, total_size, opts)
+        self.selected_wipe_type = selected_wipe_type
+        self.capabilities_found = {}
+        self.method_available = False
+        self.elapsed_secs = 0
+
+    def get_display_name(self):
+        """Get display name for precheck task"""
+        return "Precheck"
+
+    def run_task(self):
+        """Validate that selected wipe method is available on device"""
+        try:
+            # Determine device type and check capabilities
+            if self.device_path.startswith('/dev/nvme'):
+                # NVMe device
+                tool = NvmeTool(self.device_path)
+                # Check if selected method is available
+                verdict = tool.get_wipe_verdict(method=self.selected_wipe_type)
+                if verdict == "OK":
+                    self.capabilities_found[self.selected_wipe_type] = "available"
+                    self.method_available = True
+                else:
+                    self.capabilities_found[self.selected_wipe_type] = verdict
+                    self.method_available = False
+            else:
+                # SATA device
+                tool = SataTool(self.device_path)
+                tool.refresh_secures()
+                if tool.secures and tool.secures.supported:
+                    self.capabilities_found[self.selected_wipe_type] = "available"
+                    self.method_available = True
+                else:
+                    self.capabilities_found[self.selected_wipe_type] = "not_available"
+                    self.method_available = False
+
+            if not self.method_available:
+                self.exception = f"Selected wipe method '{self.selected_wipe_type}' not available"
+
+        except Exception:
+            if not self.exception:
+                self.exception = traceback.format_exc()
+        finally:
+            # Capture elapsed time when task completes
+            self.elapsed_secs = int(time.monotonic() - self.start_mono)
+            self.done = True
+
+    def get_summary_dict(self):
+        """Generate summary dictionary for structured logging"""
+        return {
+            "step": f"precheck firmware capabilities {self.device_path}",
+            "elapsed": Utils.ago_str(self.elapsed_secs),
+            "rate": "Precheck",
+            "capabilities_found": self.capabilities_found,
+            "selected_method": self.selected_wipe_type,
+            "result": "passed" if self.method_available else "failed"
+        }
 
 
 class FirmwarePreVerifyTask(WipeTask):
@@ -525,6 +616,51 @@ class FirmwarePostVerifyTask(WipeTask):
         """Get display name for post-verify task"""
         return "Post-verify"
 
+    def _update_marker_verify_status(self, verify_status):
+        """Update the wipe marker with verification status (pass/fail)
+
+        Reads the existing marker written by FirmwareWipeTask, updates it with
+        the verification result, and writes it back. This provides the checkmark
+        display in the UI when verification passes.
+        """
+        try:
+            device_name = self.device_path.replace('/dev/', '')
+
+            # Read existing marker
+            from .WipeJob import WipeJob
+            marker = WipeJob.read_marker_buffer(device_name)
+            if not marker:
+                return  # No marker to update
+
+            # Prepare updated marker data
+            data = {
+                "unixtime": marker.unixtime,
+                "scrubbed_bytes": marker.scrubbed_bytes,
+                "size_bytes": marker.size_bytes,
+                "passes": marker.passes,
+                "mode": marker.mode,
+                "verify_status": verify_status,  # "pass" or "fail"
+            }
+
+            json_data = json.dumps(data).encode('utf-8')
+
+            # Build marker buffer (16KB)
+            buffer = bytearray(WipeTask.MARKER_SIZE)
+            buffer[:WipeTask.STATE_OFFSET] = b'\x00' * WipeTask.STATE_OFFSET
+            buffer[WipeTask.STATE_OFFSET:WipeTask.STATE_OFFSET + len(json_data)] = json_data
+            remaining = WipeTask.MARKER_SIZE - (WipeTask.STATE_OFFSET + len(json_data))
+            buffer[WipeTask.STATE_OFFSET + len(json_data):] = b'\x00' * remaining
+
+            # Write updated marker to beginning of device
+            with open(self.device_path, 'wb') as f:
+                f.write(buffer)
+                f.flush()
+                os.fsync(f.fileno())
+
+        except Exception:
+            # Don't fail the job if marker update fails
+            pass
+
     def run_task(self):
         """Read test blocks and verify they differ from originals by 95%+"""
         try:
@@ -571,6 +707,10 @@ class FirmwarePostVerifyTask(WipeTask):
                 self.exception = (f"Firmware wipe verification FAILED: "
                                 f"Test block changed only {min_pct}% "
                                 f"(threshold: {self.THRESHOLD_PCT}%)")
+
+            # Update marker with verification status
+            verify_status = "pass" if self.verification_passed else "fail"
+            self._update_marker_verify_status(verify_status)
 
         except Exception:
             if not self.exception:

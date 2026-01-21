@@ -99,6 +99,7 @@ class DiskWipe:
 
                 # Import firmware task classes
                 from .FirmwareWipeTask import (NvmeWipeTask, SataWipeTask,
+                                               StandardPrecheckTask,
                                                FirmwarePreVerifyTask, FirmwarePostVerifyTask)
 
                 # Determine task type based on device name
@@ -119,8 +120,15 @@ class DiskWipe:
                 # Store wipe type for logging
                 part.wipe_type = wipe_type
 
-                # Build task list with pre/post firmware verification
+                # Build task list with precheck, pre/post firmware verification
                 # (Software verify is not supported for firmware wipes)
+                precheck = StandardPrecheckTask(
+                    device_path=f'/dev/{part.name}',
+                    total_size=part.size_bytes,
+                    opts=self.opts,
+                    selected_wipe_type=wipe_type
+                )
+
                 pre_verify = FirmwarePreVerifyTask(
                     device_path=f'/dev/{part.name}',
                     total_size=part.size_bytes,
@@ -133,7 +141,7 @@ class DiskWipe:
                     opts=self.opts
                 )
 
-                tasks = [pre_verify, fw_task, post_verify]
+                tasks = [precheck, pre_verify, fw_task, post_verify]
 
                 # Create WipeJob with firmware task (and optional verify task)
                 part.job = WipeJob(
@@ -186,6 +194,14 @@ class DiskWipe:
         """Start the verify job after confirmation"""
         if self.confirmation.identity and self.confirmation.identity in self.partitions:
             part = self.partitions[self.confirmation.identity]
+
+            # Safety check: Firmware wipes have built-in verification - prevent manual verify
+            if self._is_firmware_wipe_marker(part):
+                part.mounts = ['⚠ Firmware wipes have built-in verification - standard verify not allowed']
+                self.confirmation.cancel()
+                self.win.passthrough_mode = False
+                return
+
             # Clear any previous verify failure message when starting verify
             if hasattr(part, 'verify_failed_msg'):
                 delattr(part, 'verify_failed_msg')
@@ -217,6 +233,23 @@ class DiskWipe:
         from .FirmwareWipeTask import FirmwareWipeTask
         current_task = getattr(part.job, 'current_task', None)
         return current_task and isinstance(current_task, FirmwareWipeTask)
+
+    def _is_firmware_wipe_marker(self, part):
+        """Check if partition's wipe marker indicates a firmware wipe.
+
+        Firmware wipes have modes like 'Crypto', 'Enhanced', 'Sanitize-Crypto', etc.
+        Software wipes have modes like 'Zero' or 'Rand'.
+        """
+        if part.state not in ('s', 'W'):
+            return False
+
+        marker = WipeJob.read_marker_buffer(part.name)
+        if not marker:
+            return False
+
+        # Check if mode is a firmware wipe (not 'Zero' or 'Rand')
+        mode = getattr(marker, 'mode', None)
+        return mode and mode not in ('Zero', 'Rand')
 
     def _has_any_firmware_wipes(self):
         """Check if any firmware wipes are currently running."""
@@ -317,15 +350,18 @@ class DiskWipe:
                 if part.parent is None:
                     actions['DEL'] = 'DEL'
             # Can verify:
-            # 1. Anything with wipe markers (states 's' or 'W')
+            # 1. Anything with wipe markers (states 's' or 'W') - EXCEPT firmware wipes
             # 2. Unmarked whole disks (no parent, state '-' or '^') WITHOUT partitions that have filesystems
             # 3. Unmarked partitions without filesystems (has parent, state '-' or '^', no fstype)
             # 4. Only if verify_pct > 0
             # This prevents verifying filesystems which is nonsensical
+            # NOTE: Firmware wipes have built-in pre/post verification, so manual verify is disallowed
             verify_pct = getattr(self.opts, 'verify_pct', 0)
             if not part.job and verify_pct > 0:
                 if part.state in ('s', 'W'):
-                    actions['v'] = 'verify'
+                    # Do NOT allow verify on firmware wipes - they have built-in verification
+                    if not self._is_firmware_wipe_marker(part):
+                        actions['v'] = 'verify'
                 elif part.state in ('-', '^'):
                     # For whole disks (no parent), only allow verify if no partitions have filesystems
                     # For partitions, only allow if no filesystem
@@ -1035,6 +1071,12 @@ class MainScreen(DiskWipeScreen):
             # Use get_actions() to ensure we use the same logic as the header display
             _, actions = app.get_actions(part)
             if 'v' in actions:
+                # Safety check: Prevent verification on firmware wipes
+                # (Firmware wipes have built-in pre/post verification)
+                if self._is_firmware_wipe_marker(part):
+                    part.mounts = ['⚠ Firmware wipes have built-in verification - standard verify not allowed']
+                    return
+
                 self.clear_hotswap_marker(part)
                 # Check if this is an unmarked disk/partition (potential data loss risk)
                 # Whole disks (no parent) or partitions without filesystems need confirmation
