@@ -382,6 +382,7 @@ class DiskWipe:
         """ Look for wipeable disks w/o hardware info """
         if not self.dev_info:
             return
+        from .DeviceWorker import ProbeState
         for  ns in self.partitions.values():
             if ns.parent:
                 continue
@@ -389,11 +390,39 @@ class DiskWipe:
 #               continue
             if ns.name[:2] not in ('nv', 'sd', 'hd'):
                 continue
-            if ns.hw_nopes or ns.hw_caps:  # already done
+            # Skip if already successfully probed (READY state) with actual results
+            # But re-probe if results are empty (unknown after wipe) or if probe FAILED
+            if ns.hw_caps_state == ProbeState.READY and (ns.hw_caps or ns.hw_nopes):
+                continue  # Already have results
+            # Device must not be actively wiping (to avoid blocking)
+            if ns.job:
                 continue
-            if self.test_state(ns, to='0%'):
-                self.dev_info.get_hw_capabilities(ns)
+            # Don't probe mounted/blocked devices
+            if ns.state in ('Mnt', 'iMnt', 'Blk', 'iBlk'):
+                continue
+            # Reset state to PENDING to force a re-probe if needed
+            # (state stays READY even after wipe clears results)
+            if not (ns.hw_caps or ns.hw_nopes):
+                ns.hw_caps_state = ProbeState.PENDING
+            # Probe any device that might be ready (s, W, -, ^, or wipeable state)
+            self.dev_info.get_hw_capabilities(ns)
 
+    def _poll_hw_caps_updates(self):
+        """Poll for hw_caps probe completion without full device refresh.
+
+        Called every 0.25 seconds in main loop to quickly show hw_caps
+        results as soon as worker threads complete probes.
+        """
+        if not self.dev_info:
+            return
+        from .DeviceWorker import ProbeState
+        # Only update devices that are still probing
+        for ns in self.partitions.values():
+            if ns.parent:
+                continue
+            # Update any device that's still PENDING or PROBING
+            if ns.hw_caps_state in (ProbeState.PENDING, ProbeState.PROBING):
+                self.dev_info.get_hw_capabilities(ns)
 
     def main_loop(self):
         """Main event loop"""
@@ -417,12 +446,21 @@ class DiskWipe:
             pick_attr=cs.A_REVERSE,  # Use reverse video for pick highlighting
             ctrl_c_terminates=False,
         )
-        device_monitor = LsblkMonitor(check_interval=0.2)
+        device_monitor = LsblkMonitor(check_interval=1.0)
         device_monitor.start()
         print("Discovering devices...")
+        # Create persistent worker manager for hw_caps probing
+        # This is reused across device refreshes to allow probes to complete
+        from .DeviceWorker import DeviceWorkerManager
+        from .DrivePreChecker import DrivePreChecker
+        worker_manager = DeviceWorkerManager(DrivePreChecker())
         # Initialize device info and pick range before first draw
-        info = DeviceInfo(opts=self.opts, persistent_state=self.persistent_state)
+        info = DeviceInfo(opts=self.opts, persistent_state=self.persistent_state,
+                         worker_manager=worker_manager)
         self.partitions = info.assemble_partitions(self.partitions)
+        # Start probing hw_caps immediately instead of waiting for first 3s refresh
+        self.dev_info = info
+        self.get_hw_caps_when_needed()
         if self.opts.dump_lsblk:
             DeviceInfo.dump(self.partitions, title="after assemble_partitions")
             exit(1)
@@ -469,7 +507,8 @@ class DiskWipe:
 
         # Background device change monitor started above
 
-        self.dev_info = info
+        # self.dev_info already set during startup probe above
+        self.worker_manager = worker_manager
         pick_range = info.get_pick_range()
         self.win.set_pick_range(pick_range[0], pick_range[1])
 
@@ -489,18 +528,25 @@ class DiskWipe:
                 # Handle actions using perform_actions
                 self.stack.perform_actions(spin)
 
+                # Poll for hw_caps completion without full device refresh (every 0.25s)
+                # This lets us show results quickly even though commands take 1-3 seconds
+                self._poll_hw_caps_updates()
+
                 # Check for device changes from background monitor
                 devices_changed = device_monitor.get_and_clear()
                 time_since_refresh = time.monotonic() - check_devices_mono
 
                 if devices_changed or time_since_refresh > 3.0:
                     # Refresh if: device changes detected OR periodic refresh (3s default)
-                    info = DeviceInfo(opts=self.opts, persistent_state=self.persistent_state)
+                    info = DeviceInfo(opts=self.opts, persistent_state=self.persistent_state,
+                                     worker_manager=self.worker_manager)
                     self.partitions = info.assemble_partitions(self.partitions)
                     self.dev_info = info
                     # Update pick range to highlight NAME through SIZE fields
                     pick_range = info.get_pick_range()
                     self.win.set_pick_range(pick_range[0], pick_range[1])
+                    # Probe hw_caps for devices that need it (only once per refresh, not every draw)
+                    self.get_hw_caps_when_needed()
                     check_devices_mono = time.monotonic()
 
                 # Save any persistent state changes
@@ -511,9 +557,9 @@ class DiskWipe:
         finally:
             # Clean up monitor thread on exit
             device_monitor.stop()
-            # Clean up device worker threads
-            if self.dev_info and self.dev_info.worker_manager:
-                self.dev_info.worker_manager.stop_all()
+            # Clean up persistent worker manager
+            if hasattr(self, 'worker_manager') and self.worker_manager:
+                self.worker_manager.stop_all()
 
 class DiskWipeScreen(Screen):
     """ TBD """
@@ -819,7 +865,6 @@ class MainScreen(DiskWipeScreen):
 
         # Re-infer parent states (like 'Busy') after updating child job states
         DeviceInfo.set_all_states(app.partitions)
-        app.get_hw_caps_when_needed()
 
         # Build mapping of parent -> last visible child
         parent_last_child = {}

@@ -61,14 +61,19 @@ class DeviceInfo:
 
         return cleaned
 
-    def __init__(self, opts, persistent_state=None):
+    def __init__(self, opts, persistent_state=None, worker_manager=None):
         self.opts = opts
         self.checker = DrivePreChecker()
         self.wids = SimpleNamespace(state=5, name=4, human=7, fstype=4, label=5)
         self.head_str = None
         self.partitions = None
         self.persistent_state = persistent_state
-        self.worker_manager = DeviceWorkerManager(self.checker)
+        # Use provided worker_manager or create a new one
+        # Reusing allows hw_caps probing to continue across device refreshes
+        if worker_manager is not None:
+            self.worker_manager = worker_manager
+        else:
+            self.worker_manager = DeviceWorkerManager(self.checker)
 
     @staticmethod
     def _make_partition_namespace(major, name, size_bytes, dflt):
