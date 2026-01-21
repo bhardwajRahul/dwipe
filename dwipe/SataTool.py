@@ -12,6 +12,7 @@ import re
 import time
 from types import SimpleNamespace
 from .Utils import Utils
+from .Tunables import Tunables
 
 class WipeIpDb:
     """Manages the persistent state of in-progress firmware wipes."""
@@ -65,6 +66,8 @@ class WipeIpDb:
 
 class SataTool:
     """ TBD """
+    tunables = Tunables()
+
     def __init__(self, device_name, timeout=10):
         self.timeout = timeout
         if device_name.startswith('/dev/'):
@@ -242,6 +245,8 @@ class SataTool:
         set_pass_argv = ['--user-master', 'u', '--security-set-pass', password]
         if db: print(f"Setting security password for {self.device_name}...")
         res = self.run_cmd(set_pass_argv)
+        
+        time.sleep(self.tunables.post_password_delay)
 
         if res.returncode != 0:
             return False, f"Failed to set password: {res.stderr.strip()}"
@@ -250,6 +255,7 @@ class SataTool:
         self.refresh_secures()
         if not self.secures.enabled:
             return False, "Password command accepted but drive is not 'enabled'."
+        time.sleep(self.tunables.post_unlock_delay)
 
         # NOTE: This command will run until finished or timeout.
         if db:

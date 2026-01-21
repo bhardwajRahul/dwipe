@@ -54,6 +54,9 @@ class FirmwareWipeTask(WipeTask):
         self.wipe_name = wipe_name
         self.process = None
         self.finish_mono = None
+        self.actual_command = None  # Store actual command that was executed
+        self.return_code = None     # Store process return code
+        self.elapsed_secs = 0       # Capture elapsed time when task completes
 
         # Estimated duration for progress reporting
         self.estimated_duration = self._estimate_duration()
@@ -132,6 +135,7 @@ class FirmwareWipeTask(WipeTask):
         try:
             # Build command
             cmd = self._build_command()
+            self.actual_command = cmd  # Store command for logging
 
             # Start subprocess (non-blocking) - skip if process already started (e.g., NVMe)
             if cmd:
@@ -154,6 +158,10 @@ class FirmwareWipeTask(WipeTask):
                     self.total_written = self.total_size
                     self.finish_mono = time.monotonic()
 
+                    # Capture return code
+                    if self.process:
+                        self.return_code = self.process.returncode
+
                     # Write marker after successful firmware wipe
                     self._write_marker()
                     break
@@ -162,6 +170,10 @@ class FirmwareWipeTask(WipeTask):
                     # Failed
                     stderr = self.process.stderr.read() if self.process.stderr else ""
                     self.exception = f"Firmware wipe failed: {stderr}"
+
+                    # Capture return code on failure too
+                    if self.process:
+                        self.return_code = self.process.returncode
                     break
 
                 # Still running - update estimated progress
@@ -181,6 +193,8 @@ class FirmwareWipeTask(WipeTask):
         except Exception:
             self.exception = traceback.format_exc()
         finally:
+            # Capture elapsed time when task completes
+            self.elapsed_secs = int(time.monotonic() - self.start_mono)
             self.done = True
 
     def get_status(self):
@@ -218,20 +232,26 @@ class FirmwareWipeTask(WipeTask):
         """Generate summary dictionary for structured logging
 
         Returns:
-            dict: Summary with step details
+            dict: Summary with step details including actual command and return code
         """
-        mono = time.monotonic()
-        elapsed = mono - self.start_mono
-
-        return {
+        summary = {
             "step": f"firmware {self.wipe_name} {self.device_path}",
-            "elapsed": Utils.ago_str(int(elapsed)),
+            "elapsed": Utils.ago_str(self.elapsed_secs),
             "rate": "Firmware",
-            "command": self.command_args,
             "bytes_written": self.total_written,
             "bytes_total": self.total_size,
             "result": "completed" if self.total_written == self.total_size else "partial"
         }
+
+        # Include actual command if available
+        if self.actual_command:
+            summary["command"] = ' '.join(self.actual_command) if isinstance(self.actual_command, list) else str(self.actual_command)
+
+        # Include return code if process completed
+        if self.return_code is not None:
+            summary["return_code"] = self.return_code
+
+        return summary
 
 
 class NvmeWipeTask(FirmwareWipeTask):
@@ -430,6 +450,7 @@ class FirmwarePreVerifyTask(WipeTask):
         self.blocks_written = 0
         self.original_blocks = []  # Stores 3 x 4KB test blocks
         self.test_locations = []   # Stores 3 offsets
+        self.elapsed_secs = 0      # Capture elapsed time when task completes
 
     def get_display_name(self):
         """Get display name for pre-verify task"""
@@ -468,16 +489,15 @@ class FirmwarePreVerifyTask(WipeTask):
         except Exception:
             self.exception = traceback.format_exc()
         finally:
+            # Capture elapsed time when task completes (not when logged later)
+            self.elapsed_secs = int(time.monotonic() - self.start_mono)
             self.done = True
 
     def get_summary_dict(self):
         """Generate summary dictionary for structured logging"""
-        mono = time.monotonic()
-        elapsed = mono - self.start_mono
-
         return {
             "step": "pre-verify test blocks",
-            "elapsed": Utils.ago_str(int(elapsed)),
+            "elapsed": Utils.ago_str(self.elapsed_secs),
             "rate": "Test",
             "blocks_written": self.blocks_written,
             "result": "completed" if self.blocks_written == self.NUM_BLOCKS else "partial"
@@ -499,6 +519,7 @@ class FirmwarePostVerifyTask(WipeTask):
         super().__init__(device_path, total_size, opts)
         self.diff_percentages = []
         self.verification_passed = False
+        self.elapsed_secs = 0      # Capture elapsed time when task completes
 
     def get_display_name(self):
         """Get display name for post-verify task"""
@@ -555,16 +576,15 @@ class FirmwarePostVerifyTask(WipeTask):
             if not self.exception:
                 self.exception = traceback.format_exc()
         finally:
+            # Capture elapsed time when task completes (not when logged later)
+            self.elapsed_secs = int(time.monotonic() - self.start_mono)
             self.done = True
 
     def get_summary_dict(self):
         """Generate summary dictionary for structured logging"""
-        mono = time.monotonic()
-        elapsed = mono - self.start_mono
-
         return {
             "step": "post-verify test blocks",
-            "elapsed": Utils.ago_str(int(elapsed)),
+            "elapsed": Utils.ago_str(self.elapsed_secs),
             "rate": "Test",
             "diff_pct": self.diff_percentages,
             "result": "pass" if self.verification_passed else "fail"

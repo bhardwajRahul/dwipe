@@ -15,6 +15,7 @@ import threading
 import json
 import curses as cs
 from types import SimpleNamespace
+from datetime import datetime
 from console_window import (ConsoleWindow, ConsoleWindowOpts, OptionSpinner,
             IncrementalSearchBar, InlineConfirmation, Theme,
             Screen, ScreenStack, Context)
@@ -477,6 +478,8 @@ class DiskWipe:
         spin.add_key('verify_pct', 'V - verification %', vals=[2, 5, 10, 20, 40, 70, 100])
         spin.add_key('passes', 'P - wipe pass count', vals=[1, 2, 4])
         spin.add_key('wipe_mode', 'm - wipe mode', vals=['-V', '+V'])
+        spin.add_key('hist_time_format', 'a - time format',
+                     vals=['ago+time', 'ago', 'time'], scope=LOG_ST)
 
         spin.add_key('quit', 'q,x - quit program', keys='qx', genre='action')
         spin.add_key('screen_escape', 'ESC- back one screen',
@@ -1212,6 +1215,15 @@ class HistoryScreen(DiskWipeScreen):
 
     def draw_screen(self):
         """Draw the history screen with structured log entries"""
+
+        def format_ago(timestamp):
+            nonlocal now_dt
+            ts = datetime.fromisoformat(timestamp)
+            delta = now_dt - ts
+            return Utils.ago_str(int(round(delta.total_seconds())))
+
+
+        now_dt = datetime.now()
         app = self.app
         win = app.win
         win.set_pick_mode(True)
@@ -1266,8 +1278,17 @@ class HistoryScreen(DiskWipeScreen):
             # Get display summary from entry
             summary = entry.display_summary
 
-            # Format timestamp (just date and time)
-            timestamp_display = timestamp[:19]  # YYYY-MM-DD HH:MM:SS
+            # Format timestamp based on spinner setting
+            time_format = app.opts.hist_time_format 
+
+            if time_format == 'ago':
+                timestamp_display = f"{format_ago(timestamp):>6}"
+            elif time_format == 'ago+time':
+                ago = format_ago(timestamp)
+                time_str = timestamp[:19]
+                timestamp_display = f"{ago:>6} {time_str}"
+            else:  # 'time'
+                timestamp_display = timestamp[:19]  # Just the date and time part (YYYY-MM-DD HH:MM:SS)
 
             level = entry.level
 
