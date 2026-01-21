@@ -97,7 +97,8 @@ class DiskWipe:
                 command_args = part.hw_caps[wipe_type]
 
                 # Import firmware task classes
-                from .FirmwareWipeTask import NvmeWipeTask, SataWipeTask
+                from .FirmwareWipeTask import (NvmeWipeTask, SataWipeTask,
+                                               FirmwarePreVerifyTask, FirmwarePostVerifyTask)
 
                 # Determine task type based on device name
                 if part.name.startswith('nvme'):
@@ -117,23 +118,21 @@ class DiskWipe:
                 # Store wipe type for logging
                 part.wipe_type = wipe_type
 
-                # Build task list - firmware task plus optional verification
-                tasks = [fw_task]
+                # Build task list with pre/post firmware verification
+                # (Software verify is not supported for firmware wipes)
+                pre_verify = FirmwarePreVerifyTask(
+                    device_path=f'/dev/{part.name}',
+                    total_size=part.size_bytes,
+                    opts=self.opts
+                )
 
-                # Add auto-verification if +V mode enabled
-                mode = getattr(self.opts, 'wipe_mode', '')
-                if '+V' in mode:
-                    from .VerifyTask import VerifyZeroTask
-                    verify_pct = getattr(self.opts, 'verify_pct', 0)
-                    if verify_pct == 0:
-                        verify_pct = 2  # Default to 2% for firmware wipes
-                    verify_task = VerifyZeroTask(
-                        device_path=f'/dev/{part.name}',
-                        total_size=part.size_bytes,
-                        opts=self.opts,
-                        verify_pct=verify_pct
-                    )
-                    tasks.append(verify_task)
+                post_verify = FirmwarePostVerifyTask(
+                    device_path=f'/dev/{part.name}',
+                    total_size=part.size_bytes,
+                    opts=self.opts
+                )
+
+                tasks = [pre_verify, fw_task, post_verify]
 
                 # Create WipeJob with firmware task (and optional verify task)
                 part.job = WipeJob(

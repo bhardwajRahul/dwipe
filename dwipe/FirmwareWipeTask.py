@@ -13,6 +13,7 @@ Includes:
 import os
 import json
 import time
+import random
 import subprocess
 import traceback
 
@@ -391,7 +392,7 @@ class SataWipeTask(FirmwareWipeTask):
             if self.process.poll() is None:
                 return None # still running, same state
             if self.process.returncode != 0:
-                self.more_state = f'rv={self.process.return_code}'
+                self.more_state = f'rv={self.process.returncode}'
                 return False
             self.more_state = 'NotReady' # move on
         if self.more_state == 'NotReady':
@@ -404,7 +405,167 @@ class SataWipeTask(FirmwareWipeTask):
         if self.more_state == 'Pause':
             if time.monotonic() - self.state_mono < 5.0:
                 return None # keep waiting
-            self.more_state = True
+            self.more_state = 'Complete'
             return True
 
         return False # unexpected state
+
+
+class FirmwarePreVerifyTask(WipeTask):
+    """Write test blocks before firmware wipe for later verification
+
+    Writes 3 x 4KB blocks of pseudo-random data at:
+    - Front: 16KB after marker area
+    - Middle: total_size // 2
+    - End: total_size - 4096
+
+    Stores blocks in self.original_blocks for post-verify to compare against.
+    """
+
+    BLOCK_SIZE = 4096
+    NUM_BLOCKS = 3
+
+    def __init__(self, device_path, total_size, opts):
+        super().__init__(device_path, total_size, opts)
+        self.blocks_written = 0
+        self.original_blocks = []  # Stores 3 x 4KB test blocks
+        self.test_locations = []   # Stores 3 offsets
+
+    def get_display_name(self):
+        """Get display name for pre-verify task"""
+        return "Pre-verify"
+
+    def run_task(self):
+        """Write 3 test blocks at front/middle/end and save for later verification"""
+        try:
+            # Calculate locations (skip marker area at front)
+            self.test_locations = [
+                WipeTask.MARKER_SIZE + 16384,    # Front: 16KB after marker
+                self.total_size // 2,             # Middle
+                self.total_size - self.BLOCK_SIZE # End
+            ]
+
+            # Generate pseudo-random test data
+            random.seed(int(time.time()))
+            for i in range(self.NUM_BLOCKS):
+                block = bytes([random.randint(0, 255) for _ in range(self.BLOCK_SIZE)])
+                self.original_blocks.append(block)
+
+            # Write blocks to device
+            with open(self.device_path, 'r+b') as device:
+                for i, offset in enumerate(self.test_locations):
+                    if self.do_abort:
+                        break
+
+                    device.seek(offset)
+                    device.write(self.original_blocks[i])
+                    device.flush()
+                    self.blocks_written += 1
+                    self.total_written = self.blocks_written * self.BLOCK_SIZE
+
+                os.fsync(device.fileno())
+
+        except Exception:
+            self.exception = traceback.format_exc()
+        finally:
+            self.done = True
+
+    def get_summary_dict(self):
+        """Generate summary dictionary for structured logging"""
+        mono = time.monotonic()
+        elapsed = mono - self.start_mono
+
+        return {
+            "step": "pre-verify test blocks",
+            "elapsed": Utils.ago_str(int(elapsed)),
+            "rate": "Test",
+            "blocks_written": self.blocks_written,
+            "result": "completed" if self.blocks_written == self.NUM_BLOCKS else "partial"
+        }
+
+
+class FirmwarePostVerifyTask(WipeTask):
+    """Verify firmware wipe effectiveness by checking if test blocks changed
+
+    Reads the 3 test blocks written by FirmwarePreVerifyTask and verifies
+    that at least 95% of bytes have changed (indicating effective wipe).
+
+    Reads block data from the pre-verify task via self.job.tasks.
+    """
+
+    THRESHOLD_PCT = 95.0  # Require 95%+ bytes different
+
+    def __init__(self, device_path, total_size, opts):
+        super().__init__(device_path, total_size, opts)
+        self.diff_percentages = []
+        self.verification_passed = False
+
+    def get_display_name(self):
+        """Get display name for post-verify task"""
+        return "Post-verify"
+
+    def run_task(self):
+        """Read test blocks and verify they differ from originals by 95%+"""
+        try:
+            # Find pre-verify task in job's task list
+            pre_verify_task = None
+            for task in self.job.tasks:
+                if isinstance(task, FirmwarePreVerifyTask):
+                    pre_verify_task = task
+                    break
+
+            if not pre_verify_task or not pre_verify_task.original_blocks:
+                raise Exception("No pre-verify test blocks found")
+
+            original_blocks = pre_verify_task.original_blocks
+            test_locations = pre_verify_task.test_locations
+            block_size = FirmwarePreVerifyTask.BLOCK_SIZE
+
+            # Read current blocks from device
+            with open(self.device_path, 'rb') as device:
+                for i, offset in enumerate(test_locations):
+                    if self.do_abort:
+                        break
+
+                    device.seek(offset)
+                    current_block = device.read(block_size)
+
+                    if len(current_block) != block_size:
+                        raise Exception(f"Failed to read block {i} at offset {offset}")
+
+                    # Calculate bytes that differ
+                    diff_bytes = sum(1 for j in range(block_size)
+                                    if current_block[j] != original_blocks[i][j])
+
+                    diff_pct = (diff_bytes / block_size) * 100.0
+                    self.diff_percentages.append(round(diff_pct, 1))
+                    self.total_written = (i + 1) * block_size
+
+            # Check if all blocks meet threshold
+            self.verification_passed = all(pct >= self.THRESHOLD_PCT
+                                          for pct in self.diff_percentages)
+
+            if not self.verification_passed:
+                min_pct = min(self.diff_percentages)
+                self.exception = (f"Firmware wipe verification FAILED: "
+                                f"Test block changed only {min_pct}% "
+                                f"(threshold: {self.THRESHOLD_PCT}%)")
+
+        except Exception:
+            if not self.exception:
+                self.exception = traceback.format_exc()
+        finally:
+            self.done = True
+
+    def get_summary_dict(self):
+        """Generate summary dictionary for structured logging"""
+        mono = time.monotonic()
+        elapsed = mono - self.start_mono
+
+        return {
+            "step": "post-verify test blocks",
+            "elapsed": Utils.ago_str(int(elapsed)),
+            "rate": "Test",
+            "diff_pct": self.diff_percentages,
+            "result": "pass" if self.verification_passed else "fail"
+        }

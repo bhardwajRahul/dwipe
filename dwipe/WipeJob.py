@@ -230,6 +230,9 @@ class WipeJob:
                 self.current_task = task
                 self.current_task_index = i
 
+                # Set job reference so tasks can access shared state (e.g., for firmware verify)
+                task.job = self
+
                 # Run the task
                 task.run_task()
 
