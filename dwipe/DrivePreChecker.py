@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 import subprocess
-import os
 import json
-from typing import Dict, List, Optional
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from .SataTool import SataTool
 
 @dataclass
 class PreCheckResult:
-    # Key = Short Code (Frozen, Locked), Value = Long Description
-    issues: Dict[str, str] = field(default_factory=dict)
-    modes: Dict[str, str] = field(default_factory=dict)
+    # Comma-separated strings of capabilities and issues
+    issues: str = ""  # e.g. "Frozen, Locked"
+    modes: str = ""   # e.g. "Crypto, Block, Ovwr"
 
 class DrivePreChecker:
     def __init__(self, timeout: int = 10):
@@ -25,31 +23,34 @@ class DrivePreChecker:
             )
 
             if id_ctrl.returncode != 0:
-                result.issues['Unresponsive'] = "NVMe controller did not respond to id-ctrl"
+                result.issues = "Unresponsive"
                 return result
 
             data = json.loads(id_ctrl.stdout)
 
             # 1. Sanitize Support
+            modes = []
             sanicap = data.get('sanicap', 0)
             if sanicap > 0:
-                if sanicap & 0x04: result.modes['Crypto'] = 'sanitize_crypto'
-                if sanicap & 0x02: result.modes['Block'] = 'sanitize_block'
-                if sanicap & 0x01: result.modes['Ovwr'] = 'sanitize_overwrite'
+                if sanicap & 0x04: modes.append('Crypto')
+                if sanicap & 0x02: modes.append('Block')
+                if sanicap & 0x01: modes.append('Ovwr')
 
             # 2. Format Support
             oncs = data.get('oncs', 0)
             if oncs & 0x04:  # Format NVM command supported
                 fna = data.get('fna', 0)
                 if fna & 0x04:
-                    result.modes['FCrypto'] = 'format_crypto'
-                result.modes['FErase'] = 'format_erase'
+                    modes.append('FCrypto')
+                modes.append('FErase')
 
-            if not result.modes:
-                result.issues['Unsupported'] = "Drive lacks Sanitize or Format NVM capabilities"
+            if modes:
+                result.modes = ', '.join(modes)
+            else:
+                result.issues = "Unsupported"
 
         except Exception as e:
-            result.issues['Error'] = f"NVMe Probe Exception: {str(e)}"
+            result.issues = f"Error: {str(e)}"
 
         return result
 
@@ -60,16 +61,18 @@ class DrivePreChecker:
             verdict = tool.get_wipe_verdict()
             if verdict == 'OK':
                 # Populate Modes only if no fatal issues
+                modes = []
                 secures = tool.secures
                 if secures.enhanced_erase_supported:
-                    result.modes['Enhanced'] = 'enhanced'
-                result.modes['Erase'] = 'normal'
+                    modes.append('Enhanced')
+                modes.append('Erase')
+                result.modes = ', '.join(modes)
             elif verdict == 'DumbDevice':
                 pass  # No security feature - don't report as error (e.g., USB thumb drive)
             else:
-                result.issues = {verdict: verdict}
+                result.issues = verdict
 
         except Exception as e:
-            result.issues['Error'] = f"ATA Probe Exception: {str(e)}"
+            result.issues = f"Error: {str(e)}"
 
         return result

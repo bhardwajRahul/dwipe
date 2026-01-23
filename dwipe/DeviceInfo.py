@@ -99,8 +99,8 @@ class DeviceInfo:
                                uuid='',        # filesystem UUID or PARTUUID
                                serial='',      # disk serial number (for whole disks)
                                port='',        # port (for whole disks)
-                               hw_caps={},      # hw_wipe capabilities (for whole disks)
-                               hw_nopes={},   # hw reasons cannot do hw wipe
+                               hw_caps='',      # hw_wipe capabilities (comma-separated string)
+                               hw_nopes='',   # hw reasons cannot do hw wipe (comma-separated string)
                                hw_caps_state=ProbeState.PENDING,  # probe state for hw_caps
                                is_usb=False,   # True if device is on USB bus
                                )
@@ -471,8 +471,8 @@ class DeviceInfo:
                 entry.serial = prev.serial
                 entry.marker = prev.marker
                 entry.marker_checked = prev.marker_checked
-                entry.hw_caps = getattr(prev, 'hw_caps', {})
-                entry.hw_nopes = getattr(prev, 'hw_nopes', {})
+                entry.hw_caps = getattr(prev, 'hw_caps', '')
+                entry.hw_nopes = getattr(prev, 'hw_nopes', '')
                 entry.hw_caps_state = getattr(prev, 'hw_caps_state', ProbeState.PENDING)
                 entry.model = getattr(prev, 'model', '')
                 entry.port = getattr(prev, 'port', '')
@@ -997,8 +997,8 @@ class DeviceInfo:
                 # Preserve hw_caps state - once probed, it's permanent for the device
                 prev_hw_state = getattr(prev_ns, 'hw_caps_state', ProbeState.PENDING)
                 if prev_hw_state == ProbeState.READY:
-                    new_ns.hw_caps = getattr(prev_ns, 'hw_caps', {})
-                    new_ns.hw_nopes = getattr(prev_ns, 'hw_nopes', {})
+                    new_ns.hw_caps = getattr(prev_ns, 'hw_caps', '')
+                    new_ns.hw_nopes = getattr(prev_ns, 'hw_nopes', '')
                     new_ns.hw_caps_state = ProbeState.READY
 
                 # Preserve verify failure message ONLY for unmarked disks
@@ -1123,8 +1123,7 @@ class DeviceInfo:
 
             # Hardware capabilities
             if disk.hw_caps:
-                caps = ', '.join(disk.hw_caps.keys())
-                print(f'│  Hardware: {caps}')
+                print(f'│  Hardware: {disk.hw_caps}')
 
             # Find and print partitions for this disk
             disk_parts = [(name, part) for name, part in partitions.items()

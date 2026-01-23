@@ -631,10 +631,10 @@ class MainScreen(DiskWipeScreen):
         is_usb = getattr(partition, 'is_usb', False)
         # Show FwCAPS if device has actual capabilities
         if partition.hw_caps:
-            key_str = '   FwCAPS: ' + ','.join(list(partition.hw_caps.keys()))
+            key_str = '   FwCAPS: ' + partition.hw_caps
         # Show FwERRS only for non-USB devices (USB without caps = normal, don't show error)
         elif partition.hw_nopes and not is_usb:
-            key_str = '   FwERRS: ' + ','.join(list(partition.hw_nopes.keys()))
+            key_str = '   FwERRS: ' + partition.hw_nopes
         # Only show "..." for wipeable devices (not Mnt, Blk, Busy) that aren't USB
         elif hw_state in (ProbeState.PENDING, ProbeState.PROBING):
             if partition.state not in ('Mnt', 'iMnt', 'Blk', 'iBlk', 'Busy') and not is_usb:
@@ -1064,7 +1064,7 @@ class MainScreen(DiskWipeScreen):
                     # Build choices: Zero, Rand, and any firmware wipe types
                     choices = ['Zero', 'Rand']
                     if part.hw_caps:
-                        choices.extend(list(part.hw_caps.keys()))
+                        choices.extend([m.strip() for m in part.hw_caps.split(',')])
                     app.confirmation.start(action_type='wipe',
                                identity=part.name, mode='choices', choices=choices)
                     app.win.passthrough_mode = True

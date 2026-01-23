@@ -50,9 +50,9 @@ class DeviceWorker(threading.Thread):
             'model_state': ProbeState.PENDING,
             'marker_state': ProbeState.PENDING,
 
-            # Cached values
-            'hw_caps': {},
-            'hw_nopes': {},
+            # Cached values (hw_caps/hw_nopes are immutable strings once set, safe for lock-free reads)
+            'hw_caps': '',
+            'hw_nopes': '',
             'serial': '',
             'model': '',
             'vendor': '',
@@ -131,12 +131,12 @@ class DeviceWorker(threading.Thread):
         """Get hardware capabilities if ready.
 
         Returns:
-            tuple: (hw_caps, hw_nopes, state, is_usb) where state is ProbeState
+            tuple: (hw_caps, hw_nopes, state, is_usb) where hw_caps/hw_nopes are strings
         """
         with self._lock:
             return (
-                self._state['hw_caps'].copy(),
-                self._state['hw_nopes'].copy(),
+                self._state['hw_caps'],
+                self._state['hw_nopes'],
                 self._state['hw_caps_state'],
                 self._state['is_usb']
             )
@@ -174,6 +174,7 @@ class DeviceWorker(threading.Thread):
                     self._state['hw_caps_state'] = ProbeState.READY
                 return
 
+            # Store results as strings (immutable, no locking needed for reads)
             with self._lock:
                 self._state['hw_caps'] = result.modes
                 self._state['hw_nopes'] = result.issues
