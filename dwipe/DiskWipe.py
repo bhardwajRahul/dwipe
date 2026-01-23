@@ -622,7 +622,7 @@ class MainScreen(DiskWipeScreen):
         self.persist_port_serial = set()
 
 
-    def _port_serial_line(self, partition):
+    def _port_serial_line(self, partition, has_children=True):
         wids = self.app.wids
         wid = wids.state if wids else 5
         sep, key_str = '  ', ''
@@ -639,7 +639,9 @@ class MainScreen(DiskWipeScreen):
         elif hw_state in (ProbeState.PENDING, ProbeState.PROBING):
             if partition.state not in ('Mnt', 'iMnt', 'Blk', 'iBlk', 'Busy') and not is_usb:
                 key_str = '   FwCAPS: ...'
-        return f'{"":>{wid}}{sep}│   └────── {port:<12} {serial}{key_str}'
+        # Use corner └ if no children below, or vertical │ if there are children to connect to
+        connector = '│' if has_children else ' '
+        return f'{"":>{wid}}{sep}{connector}   └────── {port:<12} {serial}{key_str}'
 
     def do_job_maintenance(self):
         """ Check all the jobs in progress and advance their state
@@ -742,6 +744,7 @@ class MainScreen(DiskWipeScreen):
                         partition.job = None
                         partition.marker_checked = False  # Reset to "dont-know" - will re-read on next scan
                         partition.marker = ''  # Clear stale marker string to avoid showing old data during re-read
+                        partition.monitor_marker = False  # Stop monitoring verify job
                     else:
                         # Wipe job completed (with or without auto-verify)
                         # Check if stopped during verify phase (after successful write)
@@ -829,6 +832,7 @@ class MainScreen(DiskWipeScreen):
                         partition.job = None
                         partition.marker_checked = False  # Reset to "dont-know" - will re-read on next scan
                         partition.marker = ''  # Clear stale marker string to avoid showing old data during re-read
+                        partition.monitor_marker = True  # Start monitoring the new marker
             if partition.job:
                 elapsed, pct, rate, until, more_state = partition.job.get_status()
 
@@ -940,7 +944,9 @@ class MainScreen(DiskWipeScreen):
                     doit = True
                     self.persist_port_serial.add(partition.name)
                 if doit:
-                    line = self._port_serial_line(partition)
+                    # Check if this disk has any visible child partitions
+                    has_children = partition.name in parent_last_child
+                    line = self._port_serial_line(partition, has_children)
                     app.win.add_body(line, attr=attr, context=Context(genre='DECOR'))
 
             # Show inline confirmation prompt if this is the partition being confirmed

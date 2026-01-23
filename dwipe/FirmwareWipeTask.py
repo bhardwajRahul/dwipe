@@ -539,7 +539,10 @@ class StandardPrecheckTask(WipeTask):
 class FirmwarePreVerifyTask(WipeTask):
     """Write test blocks before firmware wipe for later verification
 
-    Writes 3 x 4KB blocks of pseudo-random data at:
+    First performs a 256KB zero wipe from offset 0 using direct I/O to ensure
+    partition tables and firmware headers are cleared before test blocks are written.
+
+    Then writes 3 x 4KB blocks of pseudo-random data at:
     - Front: 16KB after marker area
     - Middle: total_size // 2
     - End: total_size - 4096
@@ -549,6 +552,7 @@ class FirmwarePreVerifyTask(WipeTask):
 
     BLOCK_SIZE = 4096
     NUM_BLOCKS = 3
+    ZERO_WIPE_SIZE = 256 * 1024  # 256KB to clear partition tables and firmware headers
 
     def __init__(self, device_path, total_size, opts):
         super().__init__(device_path, total_size, opts)
@@ -556,15 +560,20 @@ class FirmwarePreVerifyTask(WipeTask):
         self.original_blocks = []  # Stores 3 x 4KB test blocks
         self.test_locations = []   # Stores 3 offsets
         self.elapsed_secs = 0      # Capture elapsed time when task completes
+        self.zero_wipe_bytes = 0   # Track bytes written during zero wipe
 
     def get_display_name(self):
         """Get display name for pre-verify task"""
         return "Pre-verify"
 
     def run_task(self):
-        """Write 3 test blocks at front/middle/end and save for later verification"""
+        """First zero wipe 256KB from offset 0, then write 3 test blocks"""
         try:
-            # Calculate locations (skip marker area at front)
+            # Phase 1: Zero wipe 256KB from offset 0 using direct I/O
+            # This clears partition tables and firmware headers
+            self._zero_wipe_partition_area()
+
+            # Phase 2: Calculate locations for test blocks (skip marker area at front)
             self.test_locations = [
                 WipeTask.MARKER_SIZE + 16384,    # Front: 16KB after marker
                 self.total_size // 2,             # Middle
@@ -577,7 +586,7 @@ class FirmwarePreVerifyTask(WipeTask):
                 block = bytes([random.randint(0, 255) for _ in range(self.BLOCK_SIZE)])
                 self.original_blocks.append(block)
 
-            # Write blocks to device
+            # Phase 3: Write blocks to device
             with open(self.device_path, 'r+b') as device:
                 for i, offset in enumerate(self.test_locations):
                     if self.do_abort:
@@ -587,7 +596,8 @@ class FirmwarePreVerifyTask(WipeTask):
                     device.write(self.original_blocks[i])
                     device.flush()
                     self.blocks_written += 1
-                    self.total_written = self.blocks_written * self.BLOCK_SIZE
+                    # Total written includes both zero wipe and test blocks
+                    self.total_written = self.zero_wipe_bytes + (self.blocks_written * self.BLOCK_SIZE)
 
                 os.fsync(device.fileno())
 
@@ -597,6 +607,60 @@ class FirmwarePreVerifyTask(WipeTask):
             # Capture elapsed time when task completes (not when logged later)
             self.elapsed_secs = int(time.monotonic() - self.start_mono)
             self.done = True
+
+    def _zero_wipe_partition_area(self):
+        """Zero wipe 256KB from offset 0 using direct I/O to clear partition tables
+
+        Uses the same O_DIRECT mechanism as logical wipes to ensure partition
+        tables and firmware headers are cleared before test blocks are written.
+        """
+        try:
+            # Open device with O_DIRECT for unbuffered I/O
+            fd = os.open(self.device_path, os.O_WRONLY | os.O_DIRECT)
+
+            try:
+                # Seek to start of device
+                os.lseek(fd, 0, os.SEEK_SET)
+
+                bytes_to_write = self.ZERO_WIPE_SIZE
+                bytes_written_total = 0
+
+                while bytes_written_total < bytes_to_write and not self.do_abort:
+                    # Calculate chunk size (must be block-aligned for O_DIRECT)
+                    remaining = bytes_to_write - bytes_written_total
+                    chunk_size = min(WipeTask.WRITE_SIZE, remaining)
+                    # Round down to block boundary
+                    chunk_size = (chunk_size // WipeTask.BLOCK_SIZE) * WipeTask.BLOCK_SIZE
+                    if chunk_size == 0:
+                        break
+
+                    # Get zero buffer from WipeTask
+                    chunk = WipeTask.zero_buffer[:chunk_size]
+
+                    try:
+                        # Write with O_DIRECT (bypasses page cache)
+                        bytes_written = os.write(fd, chunk)
+                    except Exception as e:
+                        self.exception = f"Zero wipe failed: {str(e)}"
+                        self.do_abort = True
+                        bytes_written = 0
+
+                    bytes_written_total += bytes_written
+                    self.zero_wipe_bytes = bytes_written_total
+                    self.total_written = bytes_written_total
+
+                    # Check for incomplete writes
+                    if bytes_written < chunk_size:
+                        break
+
+            finally:
+                # Close device file descriptor
+                if fd is not None:
+                    os.close(fd)
+
+        except Exception as e:
+            self.exception = f"Zero wipe partition area failed: {str(e)}"
+            self.do_abort = True
 
     def get_summary_dict(self):
         """Generate summary dictionary for structured logging"""

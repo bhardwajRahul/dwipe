@@ -28,6 +28,7 @@ from .DeviceWorker import DeviceWorkerManager, ProbeState
 class DeviceInfo:
     """Class to dig out the info we want from the system."""
     disk_majors = set()  # major devices that are disks
+    _discovery_cycle = 0  # Counter to prove discovery is running
 
     @staticmethod
     def clean_partition_label(label):
@@ -89,6 +90,9 @@ class DeviceInfo:
                                size_bytes=size_bytes,  # /sys/block/{name}/...
                                marker='',      #  persistent status
                                marker_checked=False,  # True if we've read the marker once
+                               monitor_marker=False,  # True if we should keep rechecking marker
+                               last_marker_probe_time=0,  # Timestamp of last marker probe
+                               marker_probe_seq=0,  # Sequence number for marker probes (for debugging)
                                mounts=[],        # /proc/mounts
                                minors=[],
                                job=None,         # if zap running
@@ -414,6 +418,9 @@ class DeviceInfo:
         # Build dark device set from previous state
         dark_devices = self._build_dark_device_set(prev_nss)
 
+        # Increment discovery cycle counter (proves code is running)
+        DeviceInfo._discovery_cycle += 1
+
         # Phase 1: Parse /proc for basic device list and mounts
         proc_devices = self._parse_proc_partitions()
         if not proc_devices:
@@ -491,24 +498,73 @@ class DeviceInfo:
                 has_job = is_dark  # Already checked above
                 has_filesystem = entry.fstype or entry.label
 
+                # Check if this disk has child partitions in current scan
+                current_has_children = any(parent_name == name for parent_name in parent_map.values())
+
                 # Inherit marker_checked from previous scan
                 prev_had_filesystem = (prev_nss and name in prev_nss and
                                        (prev_nss[name].fstype or prev_nss[name].label))
                 filesystem_changed = prev_had_filesystem != bool(has_filesystem)
 
-                # Inherit previous marker state if filesystem hasn't changed
-                if prev_nss and name in prev_nss and not filesystem_changed:
+                # Check if partition table has changed by comparing child partition count
+                partition_table_changed = False
+                if prev_nss and name in prev_nss:
+                    prev_had_children = bool(prev_nss[name].minors)
+                    partition_table_changed = prev_had_children != current_has_children
+
+                # Check if device has actual partitions even before we build minors list
+                # This is a quick check to see if we should suppress the marker
+                has_child_partitions = any(parent_name == name for parent_name in parent_map.values())
+
+                # Inherit previous marker state if nothing has changed
+                # Only invalidate marker if actual partitions exist (not blkid noise)
+                # blkid can detect garbage data inconsistently after wipes
+                inherit_success = False
+                inheritance_fail_reason = ''  # Track why inheritance failed for debug output
+                if not prev_nss:
+                    # No previous state to inherit from
+                    inheritance_fail_reason = 'no-prev'
+                elif name not in prev_nss:
+                    # Device didn't exist in previous discovery
+                    inheritance_fail_reason = 'new-dev'
+                elif partition_table_changed:
+                    # Partition table changed - need to re-check
+                    inheritance_fail_reason = f'part-changed'
+                elif has_child_partitions:
+                    # Device has partitions - suppress marker
+                    inheritance_fail_reason = 'has-children'
+                else:
+                    # All conditions passed - inherit marker state
+                    # NOTE: We DON'T check filesystem_changed because blkid can detect garbage
+                    # data inconsistently. Marker is only invalidated for actual partitions.
+                    inherit_success = True
                     entry.marker_checked = prev_nss[name].marker_checked
+                    entry.monitor_marker = prev_nss[name].monitor_marker  # Keep monitoring if we were
+                    entry.last_marker_probe_time = prev_nss[name].last_marker_probe_time  # Preserve probe time
+                    entry.marker_probe_seq = prev_nss[name].marker_probe_seq  # Preserve sequence number
                     # Also inherit marker string if we're not about to re-read
                     entry.marker = getattr(prev_nss[name], 'marker', '')
 
+                if partition_table_changed or has_child_partitions:
+                    # If partitions exist, mark as checked to prevent re-reading
+                    # Otherwise, force re-read by setting marker_checked = False
+                    if has_child_partitions:
+                        entry.marker_checked = True  # Don't try to re-read
+                        entry.monitor_marker = False  # Stop monitoring (partitions now present)
+                    else:
+                        entry.marker_checked = False  # Re-read on next scan
+                        # Keep monitor_marker as-is (might be in transition)
+                    entry.marker = ''  # Clear marker display
+
                 # Read marker synchronously on startup for clean devices
+                # SKIP if device has actual partitions (partitions take precedence over marker)
                 if (not entry.mounts and not has_filesystem and
-                        not has_job and not entry.marker_checked):
+                        not has_job and not entry.marker_checked and not has_child_partitions):
                     try:
                         marker = WipeJob.read_marker_buffer(name)
                         entry.marker_checked = True
                         if marker:
+                            # Marker found - will set monitor_marker below
                             now = int(round(time.time()))
                             if (marker.size_bytes == entry.size_bytes
                                     and marker.unixtime < now):
@@ -525,11 +581,93 @@ class DeviceInfo:
                                 abort_reason = getattr(marker, 'abort_reason', None)
                                 if abort_reason:
                                     error_suffix = f' Err[{abort_reason}]'
+                                # Initial marker display
                                 entry.marker = f'{verify_prefix}{state} {pct}% {marker.mode} {dt.strftime("%Y/%m/%d %H:%M")}{error_suffix}'
                                 entry.state = state
                                 entry.dflt = state
+                                # Found a marker - start monitoring it for changes
+                                entry.monitor_marker = True
+                                entry.last_marker_probe_time = time.time()
+                                entry.marker_probe_seq = 0  # Reset sequence on initial discovery
+                            else:
+                                # Marker found but invalid (failed validation)
+                                # Stop monitoring if we were
+                                entry.monitor_marker = False
+                        else:
+                            # Marker not found (read returned None)
+                            # If we were monitoring, stop now (marker has disappeared)
+                            entry.monitor_marker = False
                     except Exception:
                         entry.marker_checked = True
+                        # On exception, stop monitoring to avoid repeated failures
+                        entry.monitor_marker = False
+
+            # Request periodic marker re-probe for devices we're monitoring
+            # (only if clean and no partitions, skip dark devices with jobs)
+            # Use has_child_partitions instead of entry.minors because minors are populated later in Phase 4
+            # IMPORTANT: Don't block on has_filesystem! After formatting (GPT/MBR), blkid might detect
+            # the partition table as a "filesystem", but we need monitoring to run to clear the marker!
+            can_monitor = (not is_dark and not has_child_partitions and entry.monitor_marker and
+                    entry.type == 'disk' and not entry.mounts)
+
+            if can_monitor:
+                current_time = time.time()
+                time_since_last = current_time - entry.last_marker_probe_time
+                # Recheck every 5 seconds if monitoring
+                if time_since_last >= 5:
+                    # Increment sequence number before attempting probe (for debugging)
+                    entry.marker_probe_seq += 1
+
+                    # Request non-blocking marker probe from worker thread
+                    if self.worker_manager:
+                        self.worker_manager.request_marker(name)
+                        # Get the result from worker
+                        marker, marker_checked, probe_state = self.worker_manager.get_marker(name)
+
+                        # Debug: Check if we got a stale cached marker despite validation rejection
+                        debug_info = WipeJob._last_marker_debug.get(name, {})
+                        val_result = debug_info.get("validation_result", "")
+
+                        # If validation just rejected the marker but we got a marker object,
+                        # it's a stale cache - force clear it
+                        if val_result == 'REJECTED-first15kb-not-zero' and marker is not None:
+                            marker = None  # Force clear the stale marker
+
+                        # If probe completed (marker_checked=True), update the marker display regardless of state
+                        if marker_checked:
+                            entry.marker_checked = True
+                            if marker:
+                                # Marker still valid - update it
+                                now = int(round(time.time()))
+                                if (marker.size_bytes == entry.size_bytes
+                                        and marker.unixtime < now):
+                                    pct = min(100, int(round((marker.scrubbed_bytes / marker.size_bytes) * 100)))
+                                    state = 'W' if pct >= 100 else 's'
+                                    dt = datetime.datetime.fromtimestamp(marker.unixtime)
+                                    verify_prefix = ''
+                                    verify_status = getattr(marker, 'verify_status', None)
+                                    if verify_status == 'pass':
+                                        verify_prefix = '✓ '
+                                    elif verify_status == 'fail':
+                                        verify_prefix = '✗ '
+                                    error_suffix = ''
+                                    abort_reason = getattr(marker, 'abort_reason', None)
+                                    if abort_reason:
+                                        error_suffix = f' Err[{abort_reason}]'
+                                    # Append sequence number for debugging marker rechecks
+                                    entry.marker = f'{verify_prefix}{state} {pct}% {marker.mode} {dt.strftime("%Y/%m/%d %H:%M")}{error_suffix} [#{entry.marker_probe_seq}]'
+                                    entry.state = state
+                                    entry.dflt = state
+                            else:
+                                # Marker gone - stop monitoring
+                                entry.marker = ''
+                                entry.monitor_marker = False
+                                entry.state = 'noMkr'
+                    else:
+                        # Worker manager not available - show this in marker for debugging
+                        entry.marker = f'{entry.marker} [#{entry.marker_probe_seq}-no-worker]'
+
+                    entry.last_marker_probe_time = current_time
 
             entries[name] = entry
 
@@ -541,6 +679,18 @@ class DeviceInfo:
                 # Propagate mount state to parent
                 if entries[name].mounts:
                     entries[parent_name].state = 'iMnt'
+
+        # Phase 4b: Clear marker display and state for disks with actual partitions
+        # If a disk has partitions, the partitions take precedence over the wipe marker
+        for name, entry in entries.items():
+            if entry.minors:  # Disk has child partitions
+                entry.marker = ''  # Don't show marker when partitions exist
+                # Also clear the state if it was set to a wipe state ('W' or 's')
+                # Reset to default state '-' (unmarked)
+                if entry.state in ('W', 's'):
+                    entry.state = '-'
+                if entry.dflt in ('W', 's'):
+                    entry.dflt = '-'
 
         # Phase 5: Handle superfloppy case and clean disk rows
         final_entries = {}
@@ -766,8 +916,9 @@ class DeviceInfo:
             if ns.mounts:
                 # Disk has mounts - show them
                 emit += f'{sep}{",".join(ns.mounts)}'
-            elif ns.marker and ns.marker.strip():
-                # Disk has wipe status - show it
+            elif ns.marker and ns.marker.strip() and not ns.minors:
+                # Disk has wipe status - show it ONLY if no child partitions
+                # (partitions take precedence over marker)
                 emit += f'{sep}{ns.marker}'
             else:
                 # No status - show heavy line divider (start 1 char left to fill gap)
