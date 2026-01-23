@@ -205,8 +205,19 @@ class Utils:
         result_str = summary['result']
         size_str = device['size']
         time_str = summary['total_elapsed']
-        # Get rate from first step (wipe step)
-        rate_str = summary['steps'][0]['rate'] if summary['steps'] else 'N/A'
+        # Get rate from wipe step (skip precheck/verify steps for firmware wipes)
+        rate_str = 'N/A'
+        for step in summary['steps']:
+            step_name = step.get('step', '').lower()
+            # Look for actual wipe steps: firmware wipes start with "firmware",
+            # software wipes have "writing" in the step name
+            # Skip precheck, pre-verify, post-verify steps
+            if step_name.startswith('firmware') or 'writing' in step_name:
+                rate_str = step.get('rate', 'N/A')
+                break
+        # Fallback to first step if no wipe step found
+        if rate_str == 'N/A' and summary['steps']:
+            rate_str = summary['steps'][0].get('rate', 'N/A')
 
         # Build base message
         operation = plan['operation'].capitalize()

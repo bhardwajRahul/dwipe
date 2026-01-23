@@ -18,6 +18,7 @@ from .Utils import Utils
 from .WipeTask import WipeTask
 from .WriteTask import WriteTask, WriteZeroTask, WriteRandTask
 from .VerifyTask import VerifyTask, VerifyZeroTask, VerifyRandTask
+from .FirmwareWipeTask import FirmwareWipeTask
 
 
 class WipeJob:
@@ -274,15 +275,15 @@ class WipeJob:
 
                 # Check for task errors (AFTER proxying state)
                 if task.exception:
-                    self.exception = task.exception
-                    # For write tasks, failure means wipe didn't succeed
-                    if isinstance(task, WriteTask):
+                    # For write tasks and firmware wipe tasks, failure is critical - set exception and break
+                    if isinstance(task, (WriteTask, FirmwareWipeTask)):
+                        self.exception = task.exception
                         # Sync abort state before breaking
                         if task.do_abort:
                             self.do_abort = True
                         break
-                    # For verify tasks, continue but record the exception
-                    # (wipe succeeded but verification failed)
+                    # For other tasks (precheck, pre-verify, post-verify), continue without setting job exception
+                    # (these are support tasks - only the actual wipe matters for job success/failure)
 
                 # Check if task was aborted (sync abort state)
                 if task.do_abort and not self.do_abort:

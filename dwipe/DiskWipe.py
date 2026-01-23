@@ -126,7 +126,8 @@ class DiskWipe:
                     device_path=f'/dev/{part.name}',
                     total_size=part.size_bytes,
                     opts=self.opts,
-                    selected_wipe_type=wipe_type
+                    selected_wipe_type=wipe_type,
+                    command_method=command_args
                 )
 
                 pre_verify = FirmwarePreVerifyTask(

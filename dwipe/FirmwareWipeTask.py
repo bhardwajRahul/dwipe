@@ -56,6 +56,7 @@ class FirmwareWipeTask(WipeTask):
         self.finish_mono = None
         self.actual_command = None  # Store actual command that was executed
         self.return_code = None     # Store process return code
+        self.stderr_output = None   # Store stderr output on failure
         self.elapsed_secs = 0       # Capture elapsed time when task completes
 
         # Estimated duration for progress reporting
@@ -169,6 +170,7 @@ class FirmwareWipeTask(WipeTask):
                 if completion_status is False:
                     # Failed
                     stderr = self.process.stderr.read() if self.process.stderr else ""
+                    self.stderr_output = stderr  # Store for logging
                     self.exception = f"Firmware wipe failed: {stderr}"
 
                     # Capture return code on failure too
@@ -237,7 +239,7 @@ class FirmwareWipeTask(WipeTask):
         summary = {
             "step": f"firmware {self.wipe_name} {self.device_path}",
             "elapsed": Utils.ago_str(self.elapsed_secs),
-            "rate": "Firmware",
+            "rate": self.wipe_name,  # Use actual wipe mode (Enhanced, Crypto, etc.)
             "bytes_written": self.total_written,
             "bytes_total": self.total_size,
             "result": "completed" if self.total_written == self.total_size else "partial"
@@ -250,6 +252,10 @@ class FirmwareWipeTask(WipeTask):
         # Include return code if process completed
         if self.return_code is not None:
             summary["return_code"] = self.return_code
+
+        # Include stderr output if the command failed
+        if self.stderr_output:
+            summary["stderr"] = self.stderr_output.strip()
 
         return summary
 
@@ -462,9 +468,10 @@ class StandardPrecheckTask(WipeTask):
     Applies to both NVMe and SATA firmware wipes.
     """
 
-    def __init__(self, device_path, total_size, opts, selected_wipe_type):
+    def __init__(self, device_path, total_size, opts, selected_wipe_type, command_method=None):
         super().__init__(device_path, total_size, opts)
         self.selected_wipe_type = selected_wipe_type
+        self.command_method = command_method  # The actual method name for get_wipe_verdict()
         self.capabilities_found = {}
         self.method_available = False
         self.elapsed_secs = 0
@@ -480,8 +487,9 @@ class StandardPrecheckTask(WipeTask):
             if self.device_path.startswith('/dev/nvme'):
                 # NVMe device
                 tool = NvmeTool(self.device_path)
-                # Check if selected method is available
-                verdict = tool.get_wipe_verdict(method=self.selected_wipe_type)
+                # Check if selected method is available (use command_method if provided, else selected_wipe_type)
+                method_to_check = self.command_method if self.command_method else self.selected_wipe_type
+                verdict = tool.get_wipe_verdict(method=method_to_check)
                 if verdict == "OK":
                     self.capabilities_found[self.selected_wipe_type] = "available"
                     self.method_available = True
@@ -512,7 +520,7 @@ class StandardPrecheckTask(WipeTask):
 
     def get_summary_dict(self):
         """Generate summary dictionary for structured logging"""
-        return {
+        summary = {
             "step": f"precheck firmware capabilities {self.device_path}",
             "elapsed": Utils.ago_str(self.elapsed_secs),
             "rate": "Precheck",
@@ -520,6 +528,12 @@ class StandardPrecheckTask(WipeTask):
             "selected_method": self.selected_wipe_type,
             "result": "passed" if self.method_available else "failed"
         }
+
+        # Include error message if precheck failed
+        if self.exception:
+            summary["error"] = self.exception
+
+        return summary
 
 
 class FirmwarePreVerifyTask(WipeTask):
