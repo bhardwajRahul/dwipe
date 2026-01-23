@@ -94,8 +94,9 @@ class DiskWipe:
                     self.win.passthrough_mode = False
                     return
 
-                # Get command args from hw_caps
-                command_args = part.hw_caps[wipe_type]
+                # Get command args for this wipe type
+                from .DrivePreChecker import DrivePreChecker
+                command_args = DrivePreChecker.get_wipe_command_args(wipe_type)
 
                 # Import firmware task classes
                 from .FirmwareWipeTask import (NvmeWipeTask, SataWipeTask,
@@ -553,6 +554,7 @@ class DiskWipe:
 
 
         check_devices_mono = time.monotonic()
+        cached_worker_state = {}  # Track marker/hw_caps state to detect updates
 
         try:
             while True:
@@ -575,8 +577,24 @@ class DiskWipe:
                 devices_changed = device_monitor.get_and_clear()
                 time_since_refresh = time.monotonic() - check_devices_mono
 
-                if devices_changed or time_since_refresh > 3.0:
-                    # Refresh if: device changes detected OR periodic refresh (3s default)
+                # Build current worker state for comparison
+                current_worker_state = {}
+                if self.worker_manager:
+                    for device_name, part in self.partitions.items():
+                        current_worker_state[device_name] = {
+                            'marker': part.marker,
+                            'hw_caps_state': part.hw_caps_state
+                        }
+                    # Check if worker has any updates (markers or hw_caps changes)
+                    worker_has_updates = (
+                        self.worker_manager.has_updates(cached_worker_state)
+                    )
+                else:
+                    worker_has_updates = False
+
+                if (devices_changed or worker_has_updates or
+                    time_since_refresh > 3.0):
+                    # Refresh if: device changes, worker updates, OR periodic (3s default)
                     info = DeviceInfo(opts=self.opts, persistent_state=self.persistent_state,
                                      worker_manager=self.worker_manager)
                     self.partitions = info.assemble_partitions(self.partitions)
@@ -587,6 +605,8 @@ class DiskWipe:
                     # Probe hw_caps for devices that need it (only once per refresh, not every draw)
                     self.get_hw_caps_when_needed()
                     check_devices_mono = time.monotonic()
+                    # Update cached state after refresh
+                    cached_worker_state = current_worker_state.copy()
 
                 # Save any persistent state changes
                 self.persistent_state.save_updated_opts(self.opts)

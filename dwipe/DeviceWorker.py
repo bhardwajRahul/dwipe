@@ -5,10 +5,10 @@ Each device gets its own worker thread that handles potentially-blocking
 operations (sysfs reads, hdparm, nvme commands) without freezing the UI.
 """
 import os
+import time
 import threading
 import queue
 from enum import Enum
-from types import SimpleNamespace
 
 from .DrivePreChecker import DrivePreChecker
 
@@ -48,16 +48,22 @@ class DeviceWorker(threading.Thread):
             'hw_caps_state': ProbeState.PENDING,
             'serial_state': ProbeState.PENDING,
             'model_state': ProbeState.PENDING,
-            'marker_state': ProbeState.PENDING,
 
-            # Cached values (hw_caps/hw_nopes are immutable strings once set, safe for lock-free reads)
-            'hw_caps': '',
-            'hw_nopes': '',
+            # Cached values
+            'hw_caps': '',  # String with wipe mode names: "Crypto, Block, Ovwr" (for display, thread-safe)
+            'hw_nopes': '',  # String with issue names: "Frozen, Locked" (for display, thread-safe)
             'serial': '',
             'model': '',
             'vendor': '',
-            'marker': None,
-            'marker_checked': False,
+
+            # Marker handling (formatted string returned to UI)
+            'marker_formatted': '',  # Empty string = no marker (or not wanted)
+            'want_marker': False,  # Main thread sets this; worker reads it
+
+            # Marker polling metadata (worker only)
+            'last_marker_check_time': 0,
+            'marker_found_time': 0,  # When marker was first found (0 = not found)
+            'marker_search_start_time': 0,  # When we started looking for marker
 
             # Metadata
             'last_error': None,
@@ -71,11 +77,11 @@ class DeviceWorker(threading.Thread):
         self._is_hd = device_name.startswith('hd')
 
     def run(self):
-        """Main worker loop - processes work queue."""
+        """Main worker loop - processes work queue and continuous marker polling."""
         while self._running:
             try:
-                # Wait for work with timeout (allows clean shutdown)
-                task = self._work_queue.get(timeout=0.5)
+                # Wait for work with short timeout (allows responsive polling and clean shutdown)
+                task = self._work_queue.get(timeout=0.2)
                 if task == 'stop':
                     break
                 elif task == 'hw_caps':
@@ -84,13 +90,16 @@ class DeviceWorker(threading.Thread):
                     self._probe_serial()
                 elif task == 'model':
                     self._probe_model()
-                elif task == 'marker':
-                    self._probe_marker()
                 elif task == 'refresh_all':
                     self._probe_serial()
                     self._probe_model()
+                elif task == 'check_marker':
+                    # Immediate marker check (used after wipes for quick feedback)
+                    self._probe_marker_once()
             except queue.Empty:
-                pass  # Normal timeout, check if still running
+                # No task - check if we should probe marker based on polling strategy
+                self._check_marker_polling()
+
             except Exception as e:
                 with self._lock:
                     self._state['last_error'] = str(e)
@@ -107,16 +116,38 @@ class DeviceWorker(threading.Thread):
                 self._state['hw_caps_state'] = ProbeState.PROBING
                 self._work_queue.put('hw_caps')
 
-    def request_marker(self):
-        """Request marker buffer read (non-blocking)."""
+    def set_want_marker(self, want):
+        """Set whether we want to monitor for a marker (non-blocking).
+
+        Args:
+            want: Boolean - True to enable polling, False to clear and stop
+        """
         with self._lock:
-            if self._state['marker_state'] == ProbeState.PENDING:
-                self._state['marker_state'] = ProbeState.PROBING
-                self._work_queue.put('marker')
+            prev_want = self._state['want_marker']
+            self._state['want_marker'] = want
+
+            # If enabling monitoring, always reset search time (fresh start after wipe)
+            if want:
+                now = time.time()
+                self._state['marker_search_start_time'] = now
+                self._state['marker_found_time'] = 0
+            # If disabling monitoring, clear everything
+            elif prev_want:
+                self._state['marker_formatted'] = ''
+                self._state['marker_search_start_time'] = 0
+                self._state['marker_found_time'] = 0
 
     def request_refresh(self):
         """Request refresh of dynamic data (non-blocking)."""
         self._work_queue.put('refresh_all')
+
+    def request_marker_check(self):
+        """Request immediate marker check (non-blocking).
+
+        Used to get quick feedback after wipes complete without waiting
+        for the polling interval.
+        """
+        self._work_queue.put('check_marker')
 
     def get_state(self):
         """Get current cached state (thread-safe, non-blocking).
@@ -141,18 +172,14 @@ class DeviceWorker(threading.Thread):
                 self._state['is_usb']
             )
 
-    def get_marker(self):
-        """Get marker buffer if ready.
+    def get_marker_formatted(self):
+        """Get formatted marker string (ready to display).
 
         Returns:
-            tuple: (marker, marker_checked, state) where state is ProbeState
+            str: Formatted marker string, or empty string if no marker
         """
         with self._lock:
-            return (
-                self._state['marker'],
-                self._state['marker_checked'],
-                self._state['marker_state']
-            )
+            return self._state['marker_formatted']
 
     def _probe_hw_caps(self):
         """Probe hardware wipe capabilities (runs in worker thread)."""
@@ -176,8 +203,8 @@ class DeviceWorker(threading.Thread):
 
             # Store results as strings (immutable, no locking needed for reads)
             with self._lock:
-                self._state['hw_caps'] = result.modes
-                self._state['hw_nopes'] = result.issues
+                self._state['hw_caps'] = ', '.join(result.modes.keys()) if result.modes else ''
+                self._state['hw_nopes'] = ', '.join(result.issues.keys()) if result.issues else ''
                 self._state['hw_caps_state'] = ProbeState.READY
 
         except Exception as e:
@@ -224,32 +251,100 @@ class DeviceWorker(threading.Thread):
                 self._state['model_state'] = ProbeState.FAILED
                 self._state['last_error'] = f"model: {e}"
 
-    def _probe_marker(self):
-        """Probe marker buffer (runs in worker thread).
+    def _check_marker_polling(self):
+        """Check if we should probe marker based on adaptive polling strategy.
 
-        This reads the first 16KB from the device to check for wipe markers.
-        WARNING: This can block indefinitely if device is in firmware wipe.
-        That's why it runs in the worker thread, not main thread.
+        Polling rates:
+        - 1s for first 12s when marker wanted but not found (initial search)
+        - 3s when marker has been found (keep it fresh)
+        - 30s when not found and initial search expired (wait for next wipe)
+        - Never poll when want_marker is False
         """
         with self._lock:
-            self._state['marker_state'] = ProbeState.PROBING
+            if not self._state['want_marker']:
+                return  # Not monitoring
 
+            now = time.time()
+            last_check = self._state['last_marker_check_time']
+            search_start = self._state['marker_search_start_time']
+            found_time = self._state['marker_found_time']
+
+            # Determine polling interval based on state
+            if found_time > 0:
+                # Marker was found - refresh every 3s
+                interval = 3.0
+            elif now - search_start < 12.0:
+                # Still in initial search window (first 12s) - check every 1s
+                interval = 1.0
+            else:
+                # Initial search expired, no marker found - wait 30s before next check
+                interval = 30.0
+
+        # Check if enough time has passed
+        if now - last_check >= interval:
+            self._probe_marker_once()
+
+    def _probe_marker_once(self):
+        """Probe marker once and format the result as a string."""
         try:
             # Import here to avoid circular dependency
             from .WipeJob import WipeJob
+            import datetime
 
             marker = WipeJob.read_marker_buffer(self.device_name)
 
             with self._lock:
-                self._state['marker'] = marker
-                self._state['marker_checked'] = True
-                self._state['marker_state'] = ProbeState.READY
+                now = time.time()
+                self._state['last_marker_check_time'] = now
+
+                if marker:
+                    # Marker found - format it
+                    self._state['marker_found_time'] = now
+                    formatted = self._format_marker(marker)
+                    self._state['marker_formatted'] = formatted
+                else:
+                    # No marker found
+                    self._state['marker_found_time'] = 0
+                    self._state['marker_formatted'] = ''
 
         except Exception as e:
             with self._lock:
-                self._state['marker_state'] = ProbeState.FAILED
-                self._state['marker_checked'] = True  # Mark as checked even on failure
                 self._state['last_error'] = f"marker: {e}"
+
+    def _format_marker(self, marker):
+        """Format marker object as a display string.
+
+        Returns:
+            str: Formatted marker like "✓ W 100% Zero 2026/01/23 14:30"
+        """
+        import datetime
+
+        try:
+            now = int(round(time.time()))
+            if marker.size_bytes == 0 or marker.unixtime >= now:
+                return ''  # Invalid marker
+
+            pct = min(100, int(round((marker.scrubbed_bytes / marker.size_bytes) * 100)))
+            state = 'W' if pct >= 100 else 's'
+            dt = datetime.datetime.fromtimestamp(marker.unixtime)
+
+            # Build prefix with verify status
+            verify_prefix = ''
+            verify_status = getattr(marker, 'verify_status', None)
+            if verify_status == 'pass':
+                verify_prefix = '✓ '
+            elif verify_status == 'fail':
+                verify_prefix = '✗ '
+
+            # Build suffix with error info
+            error_suffix = ''
+            abort_reason = getattr(marker, 'abort_reason', None)
+            if abort_reason:
+                error_suffix = f' Err[{abort_reason}]'
+
+            return f'{verify_prefix}{state} {pct}% {marker.mode} {dt.strftime("%Y/%m/%d %H:%M")}{error_suffix}'
+        except Exception:
+            return ''
 
     def _read_sysfs_attr(self, attr_path):
         """Read a sysfs attribute for this device.
@@ -332,36 +427,52 @@ class DeviceWorkerManager:
             if worker:
                 worker.request_hw_caps()
 
-    def request_marker(self, device_name):
-        """Request marker buffer read for a device."""
+    def set_want_marker(self, device_name, want):
+        """Set whether we want to monitor for a marker on a device.
+
+        Args:
+            device_name: Device to monitor
+            want: Boolean - True to enable polling, False to disable
+        """
         with self._lock:
             worker = self._workers.get(device_name)
             if worker:
-                worker.request_marker()
+                worker.set_want_marker(want)
+
+    def request_marker_check(self, device_name):
+        """Request immediate marker check for a device (non-blocking).
+
+        Used to get quick feedback after wipes complete without waiting
+        for the polling interval.
+        """
+        with self._lock:
+            worker = self._workers.get(device_name)
+            if worker:
+                worker.request_marker_check()
+
+    def get_marker_formatted(self, device_name):
+        """Get formatted marker string for a device (ready to display).
+
+        Returns:
+            str: Formatted marker string, or empty string if no marker
+        """
+        with self._lock:
+            worker = self._workers.get(device_name)
+            if worker:
+                return worker.get_marker_formatted()
+        return ''
 
     def get_hw_caps(self, device_name):
         """Get hardware capabilities for a device.
 
         Returns:
-            tuple: (hw_caps, hw_nopes, state, is_usb) or ({}, {}, ProbeState.PENDING, False) if no worker
+            tuple: (hw_caps, hw_nopes, state, is_usb) where hw_caps/hw_nopes are strings
         """
         with self._lock:
             worker = self._workers.get(device_name)
             if worker:
                 return worker.get_hw_caps()
-        return ({}, {}, ProbeState.PENDING, False)
-
-    def get_marker(self, device_name):
-        """Get marker buffer for a device.
-
-        Returns:
-            tuple: (marker, marker_checked, state) or (None, False, ProbeState.PENDING) if no worker
-        """
-        with self._lock:
-            worker = self._workers.get(device_name)
-            if worker:
-                return worker.get_marker()
-        return (None, False, ProbeState.PENDING)
+        return ('', '', ProbeState.PENDING, False)
 
     def get_state(self, device_name):
         """Get full cached state for a device."""
@@ -380,6 +491,28 @@ class DeviceWorkerManager:
             for worker in self._workers.values():
                 worker.join(timeout=2.0)
             self._workers.clear()
+
+    def has_updates(self, cached_state):
+        """Check if any markers or hw_caps have changed since cached_state.
+
+        Args:
+            cached_state: dict mapping device_name -> {'marker': str, 'hw_caps_state': ProbeState}
+
+        Returns:
+            bool: True if any markers or hw_caps differ from cached_state
+        """
+        with self._lock:
+            for device_name, worker in self._workers.items():
+                cached = cached_state.get(device_name, {})
+                current_state = worker.get_state()
+                # Check if marker changed
+                if current_state.get('marker_formatted') != cached.get('marker'):
+                    return True
+                # Check if hw_caps changed (from PENDING to READY)
+                cached_hw_state = cached.get('hw_caps_state', ProbeState.PENDING)
+                if current_state.get('hw_caps_state') != cached_hw_state:
+                    return True
+        return False
 
     @staticmethod
     def _is_whole_disk(name):

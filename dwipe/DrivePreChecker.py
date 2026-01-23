@@ -6,13 +6,47 @@ from .SataTool import SataTool
 
 @dataclass
 class PreCheckResult:
-    # Comma-separated strings of capabilities and issues
-    issues: str = ""  # e.g. "Frozen, Locked"
-    modes: str = ""   # e.g. "Crypto, Block, Ovwr"
+    # Dict of capabilities and issues
+    issues: dict = None  # e.g. {"Frozen": reason, "Locked": reason}
+    modes: dict = None   # e.g. {"Crypto": ..., "Block": ..., "Ovwr": ...}
+
+    def __post_init__(self):
+        if self.issues is None:
+            self.issues = {}
+        if self.modes is None:
+            self.modes = {}
 
 class DrivePreChecker:
     def __init__(self, timeout: int = 10):
         self.timeout = timeout
+
+    @staticmethod
+    def get_wipe_command_args(wipe_type: str) -> str:
+        """Get command arguments for a given wipe type name.
+
+        Maps wipe mode names to their corresponding firmware command arguments.
+        This is a static mapping independent of device capabilities.
+
+        Args:
+            wipe_type: Wipe mode name (e.g., 'Crypto', 'Block', 'Enhanced', 'Erase')
+
+        Returns:
+            str: Command argument string (e.g., 'sanitize_crypto', 'enhanced')
+                 Empty string if wipe_type is unknown
+        """
+        wipe_args_map = {
+            # NVMe sanitize operations
+            'Crypto': 'sanitize_crypto',
+            'Block': 'sanitize_block',
+            'Ovwr': 'sanitize_overwrite',
+            # NVMe format operations
+            'FCrypto': 'format_crypto',
+            'FErase': 'format_erase',
+            # SATA/ATA security erase operations
+            'Enhanced': 'enhanced',
+            'Erase': 'normal',
+        }
+        return wipe_args_map.get(wipe_type, '')
 
     def check_nvme_drive(self, device: str) -> PreCheckResult:
         result = PreCheckResult()
@@ -23,34 +57,34 @@ class DrivePreChecker:
             )
 
             if id_ctrl.returncode != 0:
-                result.issues = "Unresponsive"
+                result.issues['Unresponsive'] = "NVMe controller did not respond"
                 return result
 
             data = json.loads(id_ctrl.stdout)
 
             # 1. Sanitize Support
-            modes = []
             sanicap = data.get('sanicap', 0)
             if sanicap > 0:
-                if sanicap & 0x04: modes.append('Crypto')
-                if sanicap & 0x02: modes.append('Block')
-                if sanicap & 0x01: modes.append('Ovwr')
+                if sanicap & 0x04:
+                    result.modes['Crypto'] = 'sanitize_crypto'
+                if sanicap & 0x02:
+                    result.modes['Block'] = 'sanitize_block'
+                if sanicap & 0x01:
+                    result.modes['Ovwr'] = 'sanitize_overwrite'
 
             # 2. Format Support
             oncs = data.get('oncs', 0)
             if oncs & 0x04:  # Format NVM command supported
                 fna = data.get('fna', 0)
                 if fna & 0x04:
-                    modes.append('FCrypto')
-                modes.append('FErase')
+                    result.modes['FCrypto'] = 'format_crypto'
+                result.modes['FErase'] = 'format_erase'
 
-            if modes:
-                result.modes = ', '.join(modes)
-            else:
-                result.issues = "Unsupported"
+            if not result.modes:
+                result.issues['Unsupported'] = "Drive lacks Sanitize or Format NVM capabilities"
 
         except Exception as e:
-            result.issues = f"Error: {str(e)}"
+            result.issues['Error'] = f"NVMe Probe Exception: {str(e)}"
 
         return result
 
@@ -61,18 +95,16 @@ class DrivePreChecker:
             verdict = tool.get_wipe_verdict()
             if verdict == 'OK':
                 # Populate Modes only if no fatal issues
-                modes = []
                 secures = tool.secures
                 if secures.enhanced_erase_supported:
-                    modes.append('Enhanced')
-                modes.append('Erase')
-                result.modes = ', '.join(modes)
+                    result.modes['Enhanced'] = 'enhanced'
+                result.modes['Erase'] = 'normal'
             elif verdict == 'DumbDevice':
                 pass  # No security feature - don't report as error (e.g., USB thumb drive)
             else:
-                result.issues = verdict
+                result.issues[verdict] = verdict
 
         except Exception as e:
-            result.issues = f"Error: {str(e)}"
+            result.issues['Error'] = f"ATA Probe Exception: {str(e)}"
 
         return result
