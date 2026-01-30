@@ -314,3 +314,57 @@ class Utils:
             Utils.fix_file_ownership(log_path)
         except Exception:
             pass  # Don't fail if logging fails
+
+    @staticmethod
+    def parse_nvme_sanitize_capabilities(id_ctrl_data: dict) -> dict:
+        """Parse NVMe sanitize capabilities from id-ctrl JSON data.
+
+        Extracts the sanicap field and interprets the capability bits according
+        to the NVMe specification:
+        - Bit 0: Crypto Erase
+        - Bit 1: Block Erase
+        - Bit 2: Overwrite
+
+        Args:
+            id_ctrl_data: Dictionary from nvme id-ctrl command (with -o json)
+
+        Returns:
+            dict: Maps capability names to method names, e.g.,
+                  {'Crypto': 'sanitize_crypto', 'Block': 'sanitize_block'}
+        """
+        modes = {}
+        sanicap = id_ctrl_data.get('sanicap', 0)
+
+        if sanicap > 0:
+            if sanicap & 0x01:
+                modes['Crypto'] = 'sanitize_crypto'
+            if sanicap & 0x02:
+                modes['Block'] = 'sanitize_block'
+            if sanicap & 0x04:
+                modes['Ovwr'] = 'sanitize_overwrite'
+
+        return modes
+
+    @staticmethod
+    def parse_nvme_sanitize_flags(id_ctrl_data: dict) -> tuple:
+        """Parse NVMe sanitize capabilities into individual boolean flags.
+
+        Interprets sanicap bits according to NVMe specification:
+        - Bit 0: Crypto Erase
+        - Bit 1: Block Erase
+        - Bit 2: Overwrite
+
+        Args:
+            id_ctrl_data: Dictionary from nvme id-ctrl command (with -o json)
+
+        Returns:
+            tuple: (has_sanitize, crypto_erase_supported, block_erase_supported,
+                    overwrite_supported)
+        """
+        sanicap = id_ctrl_data.get('sanicap', 0)
+        has_sanitize = sanicap > 0
+        crypto_erase_supported = bool(sanicap & 0x01)
+        block_erase_supported = bool(sanicap & 0x02)
+        overwrite_supported = bool(sanicap & 0x04)
+
+        return has_sanitize, crypto_erase_supported, block_erase_supported, overwrite_supported

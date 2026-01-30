@@ -97,46 +97,66 @@ class FirmwareWipeTask(WipeTask):
 
         Firmware wipes erase the entire disk including any existing markers.
         We need to write a new marker indicating the wipe is complete.
+        Retries on I/O errors as drives may need time to stabilize after sanitize.
         """
-        try:
-            # Force OS to re-read partition table (now empty)
-            subprocess.run(['blockdev', '--rereadpt', self.device_path],
-                          capture_output=True, timeout=5, check=False)
-            time.sleep(1)  # Let kernel settle
+        max_retries = 20
+        retry_delay = 1.0  # seconds
 
-            # Prepare marker data
-            data = {
-                "unixtime": int(time.time()),
-                "scrubbed_bytes": self.total_size,
-                "size_bytes": self.total_size,
-                "passes": 1,
-                "mode": self.wipe_name,  # e.g., 'Crypto', 'Enhanced'
-            }
-            json_data = json.dumps(data).encode('utf-8')
+        for attempt in range(max_retries):
+            try:
+                # Force OS to re-read partition table (now empty)
+                subprocess.run(['blockdev', '--rereadpt', self.device_path],
+                              capture_output=True, timeout=5, check=False)
+                time.sleep(0.5)  # Let kernel settle
 
-            # Build marker buffer (16KB)
-            buffer = bytearray(WipeTask.MARKER_SIZE)
-            buffer[:WipeTask.STATE_OFFSET] = b'\x00' * WipeTask.STATE_OFFSET
-            buffer[WipeTask.STATE_OFFSET:WipeTask.STATE_OFFSET + len(json_data)] = json_data
-            remaining = WipeTask.MARKER_SIZE - (WipeTask.STATE_OFFSET + len(json_data))
-            buffer[WipeTask.STATE_OFFSET + len(json_data):] = b'\x00' * remaining
+                # Prepare marker data
+                data = {
+                    "unixtime": int(time.time()),
+                    "scrubbed_bytes": self.total_size,
+                    "size_bytes": self.total_size,
+                    "passes": 1,
+                    "mode": self.wipe_name,  # e.g., 'Crypto', 'Enhanced'
+                }
+                json_data = json.dumps(data).encode('utf-8')
 
-            # Write marker to beginning of device
-            with open(self.device_path, 'wb') as f:
-                f.write(buffer)
-                f.flush()
-                os.fsync(f.fileno())
+                # Build marker buffer (16KB)
+                buffer = bytearray(WipeTask.MARKER_SIZE)
+                buffer[:WipeTask.STATE_OFFSET] = b'\x00' * WipeTask.STATE_OFFSET
+                buffer[WipeTask.STATE_OFFSET:WipeTask.STATE_OFFSET + len(json_data)] = json_data
+                remaining = WipeTask.MARKER_SIZE - (WipeTask.STATE_OFFSET + len(json_data))
+                buffer[WipeTask.STATE_OFFSET + len(json_data):] = b'\x00' * remaining
 
-        except Exception as e:
-            # Don't fail the whole job if marker write fails
-            self.exception = f"Marker write warning: {e}"
+                # Write marker to beginning of device
+                with open(self.device_path, 'wb') as f:
+                    f.write(buffer)
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                # Success
+                return
+
+            except OSError as e:
+                # I/O errors (errno 5 = EIO) may be transient after sanitize
+                if e.errno == 5 and attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                # For non-I/O errors or final attempt, give up
+                self.exception = f"Marker write warning: {e}"
+                return
+
+            except Exception as e:
+                # Don't fail the whole job if marker write fails
+                self.exception = f"Marker write warning: {e}"
+                return
 
     def run_task(self):
         """Execute firmware wipe operation (blocking, runs in thread)"""
         try:
             # Build command
             cmd = self._build_command()
-            self.actual_command = cmd  # Store command for logging
+            # Only set actual_command if cmd is non-empty (subclass may have already set it)
+            if cmd:
+                self.actual_command = cmd
 
             # Start subprocess (non-blocking) - skip if process already started (e.g., NVMe)
             if cmd:
@@ -245,9 +265,11 @@ class FirmwareWipeTask(WipeTask):
             "result": "completed" if self.total_written == self.total_size else "partial"
         }
 
-        # Include actual command if available
+        # Include actual command (always show for debugging)
         if self.actual_command:
             summary["command"] = ' '.join(self.actual_command) if isinstance(self.actual_command, list) else str(self.actual_command)
+        else:
+            summary["command"] = "N/A"
 
         # Include return code if process completed
         if self.return_code is not None:
@@ -313,6 +335,10 @@ class NvmeWipeTask(FirmwareWipeTask):
         self.tool.start_wipe(method=self.wipe_method)
         self.process = self.tool.job.process
         self.more_state = 'nvmeIP'
+
+        # Capture the command for logging in summary
+        if self.tool.last_command:
+            self.actual_command = self.tool.last_command
 
         # Return empty list since process is already started
         return []
@@ -742,6 +768,10 @@ class FirmwarePostVerifyTask(WipeTask):
     def run_task(self):
         """Read test blocks and verify they differ from originals by 95%+"""
         try:
+            # Brief delay to allow NVMe drives to finalize wipe operation
+            # Some firmware implementations need a moment before reads are reliable
+            time.sleep(0.5)
+
             # Find pre-verify task in job's task list
             pre_verify_task = None
             for task in self.job.tasks:
@@ -790,9 +820,9 @@ class FirmwarePostVerifyTask(WipeTask):
             verify_status = "pass" if self.verification_passed else "fail"
             self._update_marker_verify_status(verify_status)
 
-        except Exception:
+        except Exception as e:
             if not self.exception:
-                self.exception = traceback.format_exc()
+                self.exception = str(e) if str(e) else traceback.format_exc()
         finally:
             # Capture elapsed time when task completes (not when logged later)
             self.elapsed_secs = int(time.monotonic() - self.start_mono)
@@ -800,10 +830,16 @@ class FirmwarePostVerifyTask(WipeTask):
 
     def get_summary_dict(self):
         """Generate summary dictionary for structured logging"""
-        return {
+        summary = {
             "step": "post-verify test blocks",
             "elapsed": Utils.ago_str(self.elapsed_secs),
             "rate": "Test",
             "diff_pct": self.diff_percentages,
             "result": "pass" if self.verification_passed else "fail"
         }
+
+        # Include error message if verification failed
+        if self.exception:
+            summary["error"] = self.exception.strip()
+
+        return summary

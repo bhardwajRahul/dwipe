@@ -207,13 +207,30 @@ The top line shows available actions. Some are context-sensitive (only available
 
 `dwipe` supports several wipe modes.
 
+**Software Wipes:**
 - **Zero** - Fills the device with zeros (multi-pass alternates random/zero patterns, ending on zeros)
 - **Rand** - Fills the device with random data (multi-pass alternates zero/random patterns, ending on random)
-- **Firmware wipes** - TBD
+
+**Firmware Wipes (requires `--firmware-wipes` flag):**
+- **NVMe Sanitize Operations** - Direct hardware erase at the drive controller level:
+  - **Crypto** - Cryptographic erase (erase keys, invalidate all user data)
+  - **Block** - Block erase (reset all blocks to default state)
+  - **Overwrite** - Overwrite erase (fill with pattern, if supported by drive)
+  - Much faster than software wipes (seconds to minutes vs. hours for large drives)
+  - No progress reporting during operation (drive works independently)
+- **NVMe Format** - Secure format operations:
+  - **FCrypto** - Format with cryptographic erase
+  - **FErase** - Format with user data erase
+- **SATA ATA Security Erase** - Via `hdparm`:
+  - **Enhanced** - Enhanced erase (overwrites all sectors)
+  - **Erase** - Normal erase (quick, drive-dependent)
 
 The `+V` suffix indicates automatic verification after wipe completion. Without `+V`, you can still manually verify by pressing **v** on a wiped device.
 
-> **Note:** Multi-pass sofware (Zero and Rand) wipes (2 or 4 passes) alternate between zero and random patterns to ensure different bit patterns physically overwrite the disk, ending on your selected mode.
+> **Note:**
+> - Multi-pass software (Zero and Rand) wipes (2 or 4 passes) alternate between zero and random patterns to ensure different bit patterns physically overwrite the disk, ending on your selected mode.
+> - Firmware wipes show only supported methods for each drive based on capabilities detection. The FwCAPS display shows available methods.
+> - Firmware wipes include test block verification to ensure drive properly processed the erase command.
 
 ### Resuming Stopped Wipes
 

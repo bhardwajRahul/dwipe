@@ -5,6 +5,7 @@ import io
 import re
 import time
 from types import SimpleNamespace
+from .Utils import Utils
 
 
 class NvmeTool:
@@ -25,6 +26,7 @@ class NvmeTool:
         self.job.process = None
         self.job.wipe_started_mono = None
         self.job.est_secs = 60 # NVMe is usually much faster than SATA
+        self.last_command = None  # Store the last command executed
         
     def run_nvme_cmd(self, args, json_out=True):
         """Helper to run nvme-cli commands."""
@@ -94,12 +96,11 @@ class NvmeTool:
 
         if data:
             # Sanitize Capabilities (sanicap)
-            # Bit 0: Overwrite, Bit 1: Block Erase, Bit 2: Crypto Erase
-            sanicap = data.get('sanicap', 0)
-            caps.has_sanitize = sanicap > 0
-            caps.overwrite_supported = bool(sanicap & 0x01)
-            caps.block_erase_supported = bool(sanicap & 0x02)
-            caps.crypto_erase_supported = bool(sanicap & 0x04)
+            has_san, crypt, block, ovwr = Utils.parse_nvme_sanitize_flags(data)
+            caps.has_sanitize = has_san
+            caps.crypto_erase_supported = crypt
+            caps.block_erase_supported = block
+            caps.overwrite_supported = ovwr
 
             # Optional NVM Command Support (oncs)
             # Bit 2: Format NVM command is supported
@@ -151,14 +152,14 @@ class NvmeTool:
 
     def start_wipe(self, method='format_crypto'):
         ctrl_path = re.sub(r'n\d+$', '', self.device_path)
-        
+
         # 1. Determine the Best Command
         # If the drive supports Sanitize, it's MUCH more 'general' than Format
         if method.startswith('sanitize'):
-            mode_map = {'sanitize_block': 'start-block-erase', 
-                        'sanitize_crypto': 'start-crypto-erase', 
-                        'sanitize_overwrite': 'overwrite'}
-            cmd = ['nvme', 'sanitize', '-a', mode_map[method], ctrl_path]
+            mode_map = {'sanitize_block': '2',
+                        'sanitize_crypto': '4',
+                        'sanitize_overwrite': '3'}
+            cmd = ['nvme', 'sanitize', '-a', mode_map[method], self.device_path]
         else:
             # For 'Format', we send the BARE MINIMUM. 
             # No --lbaf, no --ms, no --pi. 
@@ -170,6 +171,9 @@ class NvmeTool:
                 f'--ses={ses_type}',
                 '--force'
             ]
+
+        # Store command for logging in task summary
+        self.last_command = cmd
 
         try:
             # We run synchronously for the format command because it's fast

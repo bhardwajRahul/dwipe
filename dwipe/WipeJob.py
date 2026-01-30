@@ -773,7 +773,7 @@ class WipeJob:
 
             # Build top-level summary
             summary = {
-                "result": "stopped" if self.do_abort else "completed",
+                "result": "stopped" if self.do_abort else ("failed" if self.exception else "completed"),
                 "total_elapsed": Utils.ago_str(int(total_elapsed)),
                 "total_errors": total_errors,
                 "pct_complete": round(pct_complete, 1),
@@ -860,7 +860,7 @@ class WipeJob:
 
         # Build top-level summary
         summary = {
-            "result": "stopped" if self.do_abort else "completed",
+            "result": "stopped" if self.do_abort else ("failed" if self.exception else "completed"),
             "total_elapsed": Utils.ago_str(int(total_elapsed)),
             "total_errors": self.total_errors,
             "pct_complete": round(pct_complete, 1),

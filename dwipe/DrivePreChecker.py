@@ -3,6 +3,7 @@ import subprocess
 import json
 from dataclasses import dataclass
 from .SataTool import SataTool
+from .Utils import Utils
 
 @dataclass
 class PreCheckResult:
@@ -63,14 +64,7 @@ class DrivePreChecker:
             data = json.loads(id_ctrl.stdout)
 
             # 1. Sanitize Support
-            sanicap = data.get('sanicap', 0)
-            if sanicap > 0:
-                if sanicap & 0x04:
-                    result.modes['Crypto'] = 'sanitize_crypto'
-                if sanicap & 0x02:
-                    result.modes['Block'] = 'sanitize_block'
-                if sanicap & 0x01:
-                    result.modes['Ovwr'] = 'sanitize_overwrite'
+            result.modes.update(Utils.parse_nvme_sanitize_capabilities(data))
 
             # 2. Format Support
             oncs = data.get('oncs', 0)
