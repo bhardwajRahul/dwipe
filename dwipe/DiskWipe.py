@@ -1137,6 +1137,19 @@ class MainScreen(DiskWipeScreen):
                 except Exception:
                     pass
 
+        # Reset hw_caps stickiness for all devices so they'll be re-probed
+        # This allows detecting hardware state changes after sleep/wake cycles
+        if self.app.worker_manager:
+            for partition in self.app.partitions.values():
+                # Queue worker to re-probe this device's capabilities
+                if partition.parent: # only need to do whole disks
+                    continue
+                self.app.worker_manager.request_hw_caps(partition.name)
+                # Clear cached values so UI refreshes with new probing state
+                partition.hw_caps = ''
+                partition.hw_nopes = ''
+                partition.hw_caps_state = ProbeState.PENDING
+
     def delete_device_ACTION(self):
         """ DEL key -- Cause the OS to drop a sata device so it
             can be replaced sooner """

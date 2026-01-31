@@ -121,6 +121,8 @@ class DeviceInfo:
         hw_caps, hw_nopes, state, is_usb = self.worker_manager.get_hw_caps(ns.name)
 
         # 5. Update namespace with worker state
+        # import time
+        # ns.hw_caps = hw_caps + ', ' + str((int(round(time.monotonic())) % 200))
         ns.hw_caps = hw_caps
         ns.hw_nopes = hw_nopes
         ns.hw_caps_state = state
