@@ -405,12 +405,20 @@ class SataWipeTask(FirmwareWipeTask):
     def __init__(self, device_path, total_size, opts, command_args, wipe_name):
         self.tool = SataTool(device_path)
         self.use_enhanced = 'enhanced' in command_args
+        self.sanitize_method = None  # e.g., 'sanitize_crypto', 'sanitize_block', 'sanitize_overwrite'
+        if command_args.startswith('sanitize_'):
+            self.sanitize_method = command_args
         self.state_mono = 0
         self.commands_executed = []  # Store pre-erase commands for logging
         super().__init__(device_path, total_size, opts, command_args, wipe_name)
 
     def _estimate_duration(self):
-        """Estimate SATA erase duration from drive's reported time"""
+        """Estimate SATA erase/sanitize duration from drive's reported time"""
+        # For sanitize operations, use default estimate
+        if self.sanitize_method:
+            return 120  # Default 2 minutes for SATA Sanitize
+
+        # For ATA Security Erase, use drive's reported time
         self.tool.refresh_secures()
         if self.tool.secures and self.tool.secures.erase_est_secs:
             idx = -1 if self.use_enhanced else 0
@@ -420,11 +428,21 @@ class SataWipeTask(FirmwareWipeTask):
     def _build_command(self):
         """Build hdparm erase command (sets password first as required for SATA)
 
-        Uses SataTool.start_wipe() to execute pre-erase commands and get the final erase command.
+        For ATA Security Erase: Uses SataTool.start_wipe() to execute pre-erase commands
+        For SATA Sanitize: Directly executes the sanitize command without password setup
 
         Returns:
             list: ['hdparm', '--user-master', 'u', '--security-erase', 'NULL', '/dev/sda']
         """
+        # Handle SATA Sanitize methods
+        if self.sanitize_method:
+            # Sanitize doesn't require password setup
+            self.tool.start_sanitize_wipe(method=self.sanitize_method)
+            self.more_state = 'hdparmIP'
+            # Return empty list since process is already started by tool
+            return []
+
+        # Handle ATA Security Erase methods
         # Call start_wipe which handles password setting and pre-erase setup
         result = self.tool.start_wipe(use_enhanced=self.use_enhanced, password='NULL', db=False)
 

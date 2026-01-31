@@ -149,6 +149,8 @@ class SataTool:
         return SimpleNamespace(supported=False, enabled=False,
                 frozen=False, locked=False, expired=False,
                 enhanced_erase_supported=False, erase_est_secs=[4*60*60],
+                sanitize_supported=False, sanitize_crypto_supported=False,
+                sanitize_block_supported=False, sanitize_overwrite_supported=False,
                 has_security_feature=False)  # True if hdparm found a Security block
 
     def _parse_output_to_secures(self, output):
@@ -173,6 +175,15 @@ class SataTool:
         minutes = re.findall(r"(\d+)min", sec_block)
         if minutes:
             secures.erase_est_secs = [60*int(m) for m in minutes]
+
+        # Look for Sanitize feature block
+        sanitize_match = re.search(r"(?i)Sanitize Feature Set:.*?(?=\n\w|\Z)", output, re.DOTALL)
+        if sanitize_match:
+            sanitize_block = sanitize_match.group(0)
+            secures.sanitize_supported = True
+            secures.sanitize_crypto_supported = "crypto" in sanitize_block.lower()
+            secures.sanitize_block_supported = "block" in sanitize_block.lower()
+            secures.sanitize_overwrite_supported = "overwrite" in sanitize_block.lower()
 
         return secures
 
@@ -226,6 +237,41 @@ class SataTool:
         self.job.wipe_started_mono = time.monotonic()
         idx = 0 if use_enhanced else -1
         self.job.est_secs = self.secures.erase_est_secs[idx]
+        return self.job.process
+
+    def start_sanitize_wipe(self, method='crypto'):
+        """Execute SATA Sanitize command (Crypto, Block, or Overwrite).
+
+        Args:
+            method: 'crypto', 'block', or 'overwrite'
+
+        Returns:
+            Popen object for the sanitize command
+        """
+        # Map method names to hdparm sanitize flags
+        sanitize_map = {
+            'sanitize_crypto': '--sanitize-crypto-scramble',
+            'sanitize_block': '--sanitize-block-erase',
+            'sanitize_overwrite': '--sanitize-overwrite'
+        }
+
+        # Convert method to full method name if needed
+        if not method.startswith('sanitize_'):
+            method = f'sanitize_{method}'
+
+        sanitize_flag = sanitize_map.get(method)
+        if not sanitize_flag:
+            raise ValueError(f"Unknown sanitize method: {method}")
+
+        cmd = ['hdparm', '--user-master', 'u', sanitize_flag, self.device_path]
+
+        # Store command for logging (similar to NvmeTool)
+        self.last_command = cmd
+
+        # Execute asynchronously
+        self.job.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.job.wipe_started_mono = time.monotonic()
+        self.job.est_secs = 120  # Estimate for sanitize operations
         return self.job.process
 
 

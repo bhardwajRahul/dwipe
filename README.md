@@ -224,6 +224,10 @@ The top line shows available actions. Some are context-sensitive (only available
 - **SATA ATA Security Erase** - Via `hdparm`:
   - **Enhanced** - Enhanced erase (overwrites all sectors)
   - **Erase** - Normal erase (quick, drive-dependent)
+- **SATA Sanitize** - Newer standard for SATA drives (if supported):
+  - **SCrypto** - Cryptographic erase (erase encryption keys)
+  - **SBlock** - Block erase (reset blocks to factory state)
+  - **SOverwrite** - Overwrite erase (fill sectors with pattern)
 
 The `+V` suffix indicates automatic verification after wipe completion. Without `+V`, you can still manually verify by pressing **v** on a wiped device.
 

@@ -90,9 +90,20 @@ class DrivePreChecker:
             if verdict == 'OK':
                 # Populate Modes only if no fatal issues
                 secures = tool.secures
+
+                # ATA Security Erase modes
                 if secures.enhanced_erase_supported:
                     result.modes['Enhanced'] = 'enhanced'
                 result.modes['Erase'] = 'normal'
+
+                # SATA Sanitize modes (if supported)
+                if secures.sanitize_supported:
+                    if secures.sanitize_crypto_supported:
+                        result.modes['SCrypto'] = 'sanitize_crypto'
+                    if secures.sanitize_block_supported:
+                        result.modes['SBlock'] = 'sanitize_block'
+                    if secures.sanitize_overwrite_supported:
+                        result.modes['SOverwrite'] = 'sanitize_overwrite'
             elif verdict == 'DumbDevice':
                 pass  # No security feature - don't report as error (e.g., USB thumb drive)
             else:
