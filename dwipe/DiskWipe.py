@@ -1408,10 +1408,21 @@ class HistoryScreen(DiskWipeScreen):
             timestamp = ctx.timestamp
             # Toggle between collapsed and expanded
             current = self.expands.get(timestamp, False)
-            if current:
-                del self.expands[timestamp]  # Collapse
+            if current: # Collapsing
+                del self.expands[timestamp]
+                # Search backwards to find first context with matching timestamp
+                # This should be the header line of this entry
+                test_pos = win.pick_pos - 1
+                while test_pos >= 0:
+                    test_ctx = win.body.contexts[test_pos]
+                    if test_ctx and hasattr(test_ctx, 'timestamp') and test_ctx.timestamp == timestamp:
+                        win.pick_pos = test_pos
+                        test_pos -= 1
+                    else:
+                        return
             else:
-                self.expands[timestamp] = True  # Expand
+                # Expanding - just toggle, cursor stays where it is
+                self.expands[timestamp] = True
 
     def filter_ACTION(self):
         """'/' key - Start incremental search"""
