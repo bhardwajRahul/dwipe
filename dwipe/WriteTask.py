@@ -54,7 +54,7 @@ class WriteTask(WipeTask):
         self.marker_update_interval = 30  # Update every 30 seconds
 
         # Performance monitoring
-        self.slowdown_stop = getattr(opts, 'slowdown_stop', 16)
+        self.slowdown_stop = getattr(opts, 'slowdown_stop', 64)
         self.stall_timeout = getattr(opts, 'stall_timeout', 60)
         self.max_slowdown_ratio = 0
         self.max_stall_secs = 0

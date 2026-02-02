@@ -40,9 +40,26 @@ class DiskWipe:
     """Main application controller and UI manager"""
     singleton = None
 
-    def __init__(self, opts=None):
+    def __init__(self, opts=None, persistent_state=None):
         DiskWipe.singleton = self
         self.opts = opts if opts else SimpleNamespace(debug=0)
+        # Use provided persistent_state or create a new one
+        self.persistent_state = persistent_state if persistent_state else PersistentState()
+        # Set defaults for command-line options (only if not provided)
+        if not hasattr(self.opts, 'wipe_mode'):
+            self.opts.wipe_mode = '+V'
+        if not hasattr(self.opts, 'passes'):
+            self.opts.passes = 1
+        if not hasattr(self.opts, 'verify_pct'):
+            self.opts.verify_pct = 1
+        if not hasattr(self.opts, 'port_serial'):
+            self.opts.port_serial = 'Auto'
+        if not hasattr(self.opts, 'slowdown_stop'):
+            self.opts.slowdown_stop = 64
+        if not hasattr(self.opts, 'stall_timeout'):
+            self.opts.stall_timeout = 60
+        if not hasattr(self.opts, 'dense'):
+            self.opts.dense = False
         self.mounts_lines = None
         self.partitions = {}  # a dict of namespaces keyed by name
         self.wids = None
@@ -70,9 +87,6 @@ class DiskWipe:
             on_accept=self._on_filter_accept,
             on_cancel=self._on_filter_cancel
         )
-
-        # Initialize persistent state
-        self.persistent_state = PersistentState()
 
     def _start_wipe(self):
         """Start the wipe job after confirmation"""
@@ -325,15 +339,7 @@ class DiskWipe:
         line += ' [S]top' if self.job_cnt > 0 else ''
         line = f'{line:<20} '
         line += self.filter_bar.get_display_string(prefix=' /') or ' /'
-        # Show mode spinner with key
-        line += f' [m]ode={self.opts.wipe_mode}'
-        # Show passes spinner with key
-        line += f' [P]ass={self.opts.passes}'
-        # Show verification percentage spinner with key
-        line += f' [V]pct={self.opts.verify_pct}%'
-        line += f' [p]ort={self.opts.port_serial}'
-        # line += ' !:scan [h]ist [t]heme ?:help [q]uit'
-        line += ' [h]ist [t]heme ?:help [q]uit'
+        line += ' [r]escan [h]ist [t]heme ?:help [q]uit'
         return line[1:]
 
     def get_actions(self, part):
@@ -510,12 +516,6 @@ class DiskWipe:
         spin = self.spin = OptionSpinner(stack=self.stack)
         spin.default_obj = self.opts
         spin.add_key('dense', 'D - dense/spaced view', vals=[False, True])
-        spin.add_key('port_serial', 'p - disk port info', vals=['Auto', 'On', 'Off'])
-        spin.add_key('slowdown_stop', 'W - stop if disk slows Nx', vals=[64, 256, 0, 4, 16])
-        spin.add_key('stall_timeout', 'T - stall timeout (sec)', vals=[60, 120, 300, 600, 0,])
-        spin.add_key('verify_pct', 'V - verification %', vals=[2, 5, 10, 20, 40, 70, 100])
-        spin.add_key('passes', 'P - wipe pass count', vals=[1, 2, 4])
-        spin.add_key('wipe_mode', 'm - wipe mode', vals=['-V', '+V'])
         spin.add_key('hist_time_format', 'a - time format',
                      vals=['ago+time', 'ago', 'time'], scope=LOG_ST)
 
@@ -530,7 +530,8 @@ class DiskWipe:
         spin.add_key('block', 'b - block/unblock disk', genre='action')
         spin.add_key('delete_device', 'DEL - remove disk from system',
                          genre='action', keys=(cs.KEY_DC))
-        spin.add_key('scan_all_devices', '! - rescan all devices', genre='action')
+        spin.add_key('scan_all_devices', 'r - rescan devices and recheck capabilities',
+                     genre='action', scope=MAIN_ST)
         spin.add_key('stop_all', 'S - stop ALL wipes', genre='action')
         spin.add_key('help', '? - show help screen', genre='action')
         spin.add_key('history', 'h - show wipe history', genre='action')
@@ -541,7 +542,8 @@ class DiskWipe:
         spin.add_key('expand', 'e - expand history entry', genre='action', scope=LOG_ST)
         spin.add_key('show_keys', 'K - show keys (demo mode)', genre='action')
         self.opts.theme = ''
-        self.persistent_state.restore_updated_opts(self.opts)
+        # Note: don't call restore_updated_opts() here - persistent_state was already used
+        # as defaults in main.py argparse, so opts already has the right values
         Theme.set(self.opts.theme)
         self.win.set_handled_keys(self.spin.keys)
 
@@ -1125,6 +1127,9 @@ class MainScreen(DiskWipeScreen):
     def scan_all_devices_ACTION(self):
         """ Trigger a re-scan of all devices to make the appear
         quicker in the list"""
+        # Show temporary feedback
+        self.app.win.flash('Scanning devices and rechecking firmware capabilities...', duration=0.75)
+
         base_path = '/sys/class/scsi_host'
         if not os.path.exists(base_path):
             return
@@ -1234,6 +1239,20 @@ class HelpScreen(DiskWipeScreen):
         if spinner:
             spinner.show_help_nav_keys(app.win)
             spinner.show_help_body(app.win)
+
+        # Add CLI Options section
+        app.win.add_body('Command Line Arguments:', attr=cs.A_UNDERLINE)
+        opts, wid = app.opts, 8
+        cli_options = [
+            f'--mode: . . . .  {opts.mode:<{wid}} Wipe mode',
+            f'--passes: . . .  {opts.passes:<{wid}} Passes for software wipes',
+            f'--verify-pct: .  {opts.verify_pct:<{wid}} Verification %',
+            f'--port-serial:   {opts.port_serial:<{wid}} Show port/serial/FwCAPS',
+            f'--slowdown-stop: {opts.slowdown_stop:<{wid}} Stop if disk slows',
+            f'--stall-timeout: {opts.stall_timeout:<{wid}} Stall timeout in sec',
+        ]
+        for opt in cli_options:
+            app.win.add_body(opt, attr=cs.A_DIM)
 
 
 

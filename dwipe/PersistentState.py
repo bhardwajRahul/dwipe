@@ -24,14 +24,13 @@ class PersistentState:
         self.config_path = Path(config_path)
         self.state = {
             'theme': 'default',
-            'wipe_mode': '+V',  # '+V' (verify) or '-V' (no verify)
-            'passes': 1,  # 1, 2, or 4 wipe pass
-            'confirmation': 'YES',  # 'Y', 'y', 'YES', 'yes', 'device'
-            'verify_pct': 2,  # 0, 2, 5, 10, 25, 50, 100
+            'wipe_mode': '+V',  # '-V' (no verify) or '+V' (verify after wipe) [default: +V]
+            'passes': 1,  # 1, 2, or 4 wipe passes [default: 1]
+            'verify_pct': 1,  # Verification percentage: 1, 3, 10, 30, 100 [default: 1]
             'dense': False,  # True = compact view, False = blank lines between disks
-            'slowdown_stop': 16,
-            'stall_timeout': 60,
-            'port_serial': False,
+            'slowdown_stop': 64,  # Stop if disk slows (0=disabled, else ms interval) [default: 64]
+            'stall_timeout': 60,  # Stall timeout in seconds (0=disabled) [default: 60]
+            'port_serial': 'Auto',  # Show port/serial info: Auto, On, Off [default: Auto]
             'devices': {}  # device_id -> {blocked, last_seen, last_name, size_bytes}
         }
         self.dirty = False
