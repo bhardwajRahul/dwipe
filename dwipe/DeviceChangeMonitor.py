@@ -30,7 +30,7 @@ except (OSError, TypeError):
     _HAVE_LIBC = False
 
 
-class LsblkMonitor:
+class DeviceChangeMonitor:
     """Background monitor that detects block device changes via inotify or polling.
 
     This class monitors for device hot-plug events without using lsblk (which

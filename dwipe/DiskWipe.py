@@ -26,7 +26,7 @@ from .DeviceWorker import ProbeState
 from .Utils import Utils
 from .PersistentState import PersistentState
 from .StructuredLogger import StructuredLogger
-from .LsblkMonitor import LsblkMonitor
+from .DeviceChangeMonitor import DeviceChangeMonitor
 
 # Screen constants
 MAIN_ST = 0
@@ -490,7 +490,7 @@ class DiskWipe:
             pick_attr=cs.A_REVERSE,  # Use reverse video for pick highlighting
             ctrl_c_terminates=False,
         )
-        device_monitor = LsblkMonitor(check_interval=1.0)
+        device_monitor = DeviceChangeMonitor(check_interval=1.0)
         device_monitor.start()
         print("Discovering devices...")
         # Create persistent worker manager for hw_caps probing

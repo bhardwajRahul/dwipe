@@ -2,6 +2,7 @@
 """ Ini file for dwipe"""
 import configparser
 import os
+from .Utils import Utils
 
 class Tunables:
     """Manages dwipe configuration and provides hardware-tuning defaults."""
@@ -11,9 +12,10 @@ class Tunables:
     def __init__(self):
         assert not Tunables.singleton
 
-        self.path = os.path.expanduser('~/.config/tunables.ini')
+        config_dir = Utils.get_config_dir()
+        self.path = config_dir / 'tunables.ini'
         self.config = configparser.ConfigParser()
-        
+
         # Load existing or create default
         if not os.path.exists(self.path):
             self._create_default()
@@ -35,10 +37,13 @@ class Tunables:
             'reappearance_timeout': '120',
             'poll_interval': '5.0'
         }
-        
+
         with open(self.path, 'w', encoding='utf-8') as f:
             f.write("# dwipe Configuration - Tune these for 'grumpy' hardware\n")
             self.config.write(f)
+
+        # Fix ownership when running with sudo
+        Utils.fix_file_ownership(self.path)
 
     @property
     def post_password_delay(self):
