@@ -176,14 +176,17 @@ class SataTool:
         if minutes:
             secures.erase_est_secs = [60*int(m) for m in minutes]
 
-        # Look for Sanitize feature block
-        sanitize_match = re.search(r"(?i)Sanitize Feature Set:.*?(?=\n\w|\Z)", output, re.DOTALL)
-        if sanitize_match:
-            sanitize_block = sanitize_match.group(0)
+        # Look for SANITIZE capabilities in Commands/features section
+        # hdparm -I shows these as separate lines like:
+        #    *    SANITIZE feature set
+        #    *    CRYPTO_SCRAMBLE_EXT command
+        #    *    BLOCK_ERASE_EXT command
+        #    *    OVERWRITE_EXT command
+        if re.search(r'\*\s+SANITIZE feature set', output):
             secures.sanitize_supported = True
-            secures.sanitize_crypto_supported = "crypto" in sanitize_block.lower()
-            secures.sanitize_block_supported = "block" in sanitize_block.lower()
-            secures.sanitize_overwrite_supported = "overwrite" in sanitize_block.lower()
+            secures.sanitize_crypto_supported = bool(re.search(r'\*\s+CRYPTO_SCRAMBLE_EXT', output))
+            secures.sanitize_block_supported = bool(re.search(r'\*\s+BLOCK_ERASE_EXT', output))
+            secures.sanitize_overwrite_supported = bool(re.search(r'\*\s+OVERWRITE_EXT', output))
 
         return secures
 
@@ -263,7 +266,13 @@ class SataTool:
         if not sanitize_flag:
             raise ValueError(f"Unknown sanitize method: {method}")
 
-        cmd = ['hdparm', '--user-master', 'u', sanitize_flag, self.device_path]
+        cmd = ['hdparm', '--yes-i-know-what-i-am-doing', sanitize_flag]
+
+        # Overwrite requires a pattern (use zeros)
+        if method == 'sanitize_overwrite':
+            cmd.append('hex:00000000')
+
+        cmd.append(self.device_path)
 
         # Store command for logging (similar to NvmeTool)
         self.last_command = cmd

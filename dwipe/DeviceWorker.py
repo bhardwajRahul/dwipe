@@ -202,8 +202,13 @@ class DeviceWorker(threading.Thread):
                 return
 
             # Store results as strings (immutable, no locking needed for reads)
+            # Sort modes by rank (worst to best) with '*' on the recommended (last) one
             with self._lock:
-                self._state['hw_caps'] = ', '.join(result.modes.keys()) if result.modes else ''
+                if result.modes:
+                    sorted_modes = DrivePreChecker.sort_modes_by_rank(result.modes.keys())
+                    self._state['hw_caps'] = ', '.join(sorted_modes)
+                else:
+                    self._state['hw_caps'] = ''
                 self._state['hw_nopes'] = ', '.join(result.issues.keys()) if result.issues else ''
                 self._state['hw_caps_state'] = ProbeState.READY
 

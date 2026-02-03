@@ -18,6 +18,44 @@ class PreCheckResult:
             self.modes = {}
 
 class DrivePreChecker:
+    # Firmware wipe rankings: lower number = better (1 = most desirable)
+    # NVMe and SATA modes have separate namespaces but similar ranking logic
+    WIPE_RANKS = {
+        # NVMe modes (rank 1-5)
+        'Crypto': 1,    # Sanitize Cryptographic Erase - fastest, instant key invalidation
+        'Block': 2,     # Sanitize Block Erase - fast, deallocates blocks
+        'FCrypto': 3,   # Format with Crypto Erase - fast, namespace reformat
+        'FErase': 4,    # Format with User Data Erase - less thorough than crypto
+        'Ovwr': 5,      # Sanitize Overwrite - slow, pattern write
+        # SATA modes (rank 1-5)
+        'SCrypto': 1,   # Sanitize Cryptographic Erase - fastest
+        'Enhanced': 2,  # ATA Security Erase Enhanced - most compatible firmware wipe
+        'SBlock': 3,    # Sanitize Block Erase - fast
+        'Erase': 4,     # ATA Security Erase Normal - slow but widely supported
+        'SOverwrite': 5,  # Sanitize Overwrite - slow
+        # Software wipes (fallback when firmware unavailable, or only option for partitions)
+        'Rand': 6,      # Software Random Write - better than zeros for verification
+        'Zero': 7,      # Software Zero Write - simplest fallback
+    }
+
+    @staticmethod
+    def sort_modes_by_rank(modes, add_star=True):
+        """Sort wipe modes from worst to best rank (highest rank number first).
+
+        Args:
+            modes: iterable of mode names (e.g., ['Crypto', 'Block', 'Ovwr'])
+            add_star: if True, append '*' to the last (best) mode
+
+        Returns:
+            list of mode names sorted worst to best, optionally with '*' on last
+        """
+        ranks = DrivePreChecker.WIPE_RANKS
+        # Sort by rank descending (worst first), unknown modes get rank 99
+        sorted_modes = sorted(modes, key=lambda m: ranks.get(m, 99), reverse=True)
+        if add_star and sorted_modes:
+            sorted_modes[-1] = sorted_modes[-1] + '*'
+        return sorted_modes
+
     def __init__(self, timeout: int = 10):
         self.timeout = timeout
 
@@ -43,6 +81,10 @@ class DrivePreChecker:
             # NVMe format operations
             'FCrypto': 'format_crypto',
             'FErase': 'format_erase',
+            # SATA sanitize operations
+            'SCrypto': 'sanitize_crypto',
+            'SBlock': 'sanitize_block',
+            'SOverwrite': 'sanitize_overwrite',
             # SATA/ATA security erase operations
             'Enhanced': 'enhanced',
             'Erase': 'normal',

@@ -437,9 +437,11 @@ class SataWipeTask(FirmwareWipeTask):
         # Handle SATA Sanitize methods
         if self.sanitize_method:
             # Sanitize doesn't require password setup
-            self.tool.start_sanitize_wipe(method=self.sanitize_method)
+            process = self.tool.start_sanitize_wipe(method=self.sanitize_method)
+            self.process = process  # Store process reference for monitoring
+            self.actual_command = self.tool.last_command
             self.more_state = 'hdparmIP'
-            # Return empty list since process is already started by tool
+            # Return empty list since process is already started
             return []
 
         # Handle ATA Security Erase methods

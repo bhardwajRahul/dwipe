@@ -194,38 +194,47 @@ The top line shows available actions. Some are context-sensitive (only available
 
 ### Wipe Types
 
-`dwipe` supports several wipe modes.
+`dwipe` supports firmware wipes (hardware-accelerated) and software wipes. Firmware wipes require the `--firmware-wipes` or `-F` flag. Tables below list wipe methods from most desirable (Rank 1) to least.
 
-**Software Wipes:**
-- **Zero** - Fills the device with zeros (multi-pass alternates random/zero patterns, ending on zeros)
-- **Rand** - Fills the device with random data (multi-pass alternates zero/random patterns, ending on random)
+#### NVMe Drives
 
-**Firmware Wipes (requires `--firmware-wipes` flag):**
-- **NVMe Sanitize Operations** - Direct hardware erase at the drive controller level:
-  - **Crypto** - Cryptographic erase (erase keys, invalidate all user data)
-  - **Block** - Block erase (reset all blocks to default state)
-  - **Overwrite** - Overwrite erase (fill with pattern, if supported by drive)
-  - Much faster than software wipes (seconds to minutes vs. hours for large drives)
-  - No progress reporting during operation (drive works independently)
-- **NVMe Format** - Secure format operations:
-  - **FCrypto** - Format with cryptographic erase
-  - **FErase** - Format with user data erase
-- **SATA ATA Security Erase** - Via `hdparm`:
-  - **Enhanced** - Enhanced erase (overwrites all sectors)
-  - **Erase** - Normal erase (quick, drive-dependent)
-- **SATA Sanitize** - Newer standard for SATA drives (if supported):
-  - **SCrypto** - Cryptographic erase (erase encryption keys)
-  - **SBlock** - Block erase (reset blocks to factory state)
-  - **SOverwrite** - Overwrite erase (fill sectors with pattern)
+| Rank | Abbrev | Official Name | Remarks |
+|------|--------|---------------|---------|
+| 1 | Crypto | Sanitize Cryptographic Erase | Fastest; erases encryption keys; instant data invalidation |
+| 2 | Block | Sanitize Block Erase | Fast; resets all blocks to deallocated state |
+| 3 | FCrypto | Format with Crypto Erase | Fast; reformats namespace with key erasure |
+| 4 | FErase | Format with User Data Erase | Fast; reformats with simple data erase; less thorough than crypto |
+| 5 | Ovwr | Sanitize Overwrite | Slow; writes pattern to all blocks; most thorough but rarely needed |
+| 6 | Rand | Software Random Write | Fallback; writes random data via software; hours for large drives |
+| 7 | Zero | Software Zero Write | Fallback; writes zeros via software; verifiable but slower |
 
-The `+V` suffix indicates automatic verification after wipe completion. Without `+V`, you can still manually verify by pressing **v** on a wiped device.
+#### SATA Drives
 
-> **Note:**
-> - Multi-pass software (Zero and Rand) wipes (2 or 4 passes) alternate between zero and random patterns to ensure different bit patterns physically overwrite the disk, ending on your selected mode.
-> - Firmware wipes show only supported methods for each drive based on capabilities detection. The FwCAPS display shows available methods.
-> - Firmware wipes include test block verification to ensure drive properly processed the erase command.
+| Rank | Abbrev | Official Name | Remarks |
+|------|--------|---------------|---------|
+| 1 | SCrypto | Sanitize Cryptographic Erase | Fastest; erases encryption keys; requires SANITIZE feature |
+| 2 | Enhanced | ATA Security Erase Enhanced | Fast; vendor-specific deep erase; most compatible firmware wipe |
+| 3 | SBlock | Sanitize Block Erase | Fast; resets blocks to factory state; requires SANITIZE feature |
+| 4 | Erase | ATA Security Erase Normal | Slow (hours); writes zeros to all sectors; widely supported |
+| 5 | SOverwrite | Sanitize Overwrite | Slow; overwrites with pattern; requires SANITIZE feature |
+| 6 | Rand | Software Random Write | Fallback; writes random data via software; hours for large drives |
+| 7 | Zero | Software Zero Write | Fallback; writes zeros via software; verifiable but slower |
 
-### Resuming Stopped Wipes
+#### Partitions and USB/Thumb Drives
+
+| Rank | Abbrev | Official Name | Remarks |
+|------|--------|---------------|---------|
+| 1 | Rand | Software Random Write | Preferred; unpredictable pattern; statistical verification |
+| 2 | Zero | Software Zero Write | Simpler; fast verification (fails on first non-zero byte) |
+
+> **Notes:**
+> - Firmware wipes show only methods supported by each drive (see FwCAPS column).
+> - Firmware wipes include automatic spotcheck verification.
+> - The `+V` suffix enables automatic verification after software wipes. Without `+V`, press **v** to verify manually.
+> - Multi-pass software wipes (2 or 4) alternate zero/random patterns, ending on your selected mode.
+> - USB drives and partitions lack firmware erase—only software wipes available.
+
+### Resuming Stopped SOFTWARE Wipes
 
 Stopped wipes (state **s**) can be resumed by pressing **w** on the device. Choose the same type of wipe or it will start over at 0% complete.
 

@@ -1084,9 +1084,14 @@ class MainScreen(DiskWipeScreen):
                 if app.test_state(part, to='0%'):
                     self.clear_hotswap_marker(part)
                     # Build choices: Zero, Rand, and any firmware wipe types
+                    # Sort all by rank (worst to best) with '*' on recommended (last) one
+                    from .DrivePreChecker import DrivePreChecker
                     choices = ['Zero', 'Rand']
                     if part.hw_caps:
-                        choices.extend([m.strip() for m in part.hw_caps.split(',')])
+                        # Strip '*' from hw_caps modes (already has it from display string)
+                        fw_modes = [m.strip().rstrip('*') for m in part.hw_caps.split(',')]
+                        choices.extend(fw_modes)
+                    choices = DrivePreChecker.sort_modes_by_rank(choices)
                     app.confirmation.start(action_type='wipe',
                                identity=part.name, mode='choices', choices=choices)
                     app.win.passthrough_mode = True
