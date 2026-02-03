@@ -368,3 +368,127 @@ class Utils:
         overwrite_supported = bool(sanicap & 0x04)
 
         return has_sanitize, crypto_erase_supported, block_erase_supported, overwrite_supported
+
+
+class ClipboardHelper:
+    """Helper for copying text to clipboard across different Linux environments.
+
+    Supports:
+    - OSC 52 escape sequence (works over SSH if terminal supports it)
+    - Wayland (wl-copy)
+    - X11 (xclip, xsel)
+    - Terminal fallback (print to screen when clipboard unavailable)
+
+    Detection priority:
+    1. If SSH session detected -> use OSC 52 (terminal clipboard escape sequence)
+    2. If WAYLAND_DISPLAY set -> try wl-copy
+    3. If DISPLAY set -> try xclip, then xsel
+    4. Fallback -> terminal mode (manual copy)
+    """
+    import subprocess
+    import shutil
+
+    # Singleton instance for caching probe results
+    _instance = None
+    _probed = False
+    _clipboard_cmd = None  # e.g., ['wl-copy'] or ['xclip', '-selection', 'clipboard']
+    _use_osc52 = False     # Use OSC 52 terminal escape sequence
+    _is_ssh = False
+    _method_name = None  # Human-readable method name
+
+    @classmethod
+    def _probe(cls):
+        """Probe available clipboard methods (called once, results cached)."""
+        if cls._probed:
+            return
+
+        cls._probed = True
+        import shutil
+
+        # Check for SSH session - use OSC 52 escape sequence
+        cls._is_ssh = bool(os.environ.get('SSH_CLIENT') or os.environ.get('SSH_TTY')
+                          or os.environ.get('SSH_CONNECTION'))
+
+        if cls._is_ssh:
+            # OSC 52 works through terminal emulators that support it
+            # (iTerm2, kitty, alacritty, Windows Terminal, tmux with set-clipboard)
+            cls._use_osc52 = True
+            cls._method_name = 'OSC 52 (terminal escape sequence)'
+            return
+
+        # Check Wayland first
+        if os.environ.get('WAYLAND_DISPLAY'):
+            if shutil.which('wl-copy'):
+                cls._clipboard_cmd = ['wl-copy']
+                cls._method_name = 'wl-copy (Wayland)'
+                return
+
+        # Check X11
+        if os.environ.get('DISPLAY'):
+            if shutil.which('xclip'):
+                cls._clipboard_cmd = ['xclip', '-selection', 'clipboard']
+                cls._method_name = 'xclip (X11)'
+                return
+            if shutil.which('xsel'):
+                cls._clipboard_cmd = ['xsel', '--clipboard', '--input']
+                cls._method_name = 'xsel (X11)'
+                return
+
+        cls._method_name = 'terminal (no clipboard tool found)'
+
+    @classmethod
+    def get_method_name(cls):
+        """Return human-readable description of clipboard method."""
+        cls._probe()
+        return cls._method_name
+
+    @classmethod
+    def has_clipboard(cls):
+        """Return True if a clipboard method is available (tool or OSC 52)."""
+        cls._probe()
+        return cls._clipboard_cmd is not None or cls._use_osc52
+
+    @classmethod
+    def copy(cls, text):
+        """Copy text to clipboard.
+
+        Args:
+            text: String to copy
+
+        Returns:
+            tuple: (success: bool, error_message: str or None)
+        """
+        cls._probe()
+        import subprocess
+        import base64
+
+        # Try OSC 52 escape sequence (works over SSH with supporting terminals)
+        if cls._use_osc52:
+            try:
+                encoded = base64.b64encode(text.encode('utf-8')).decode('ascii')
+                # OSC 52: \033]52;c;<base64>\a
+                # 'c' = clipboard selection
+                osc52 = f'\033]52;c;{encoded}\a'
+                sys.stdout.write(osc52)
+                sys.stdout.flush()
+                return True, None
+            except Exception as e:
+                return False, f"OSC 52 failed: {e}"
+
+        if not cls._clipboard_cmd:
+            return False, "No clipboard available"
+
+        try:
+            proc = subprocess.run(
+                cls._clipboard_cmd,
+                input=text.encode('utf-8'),
+                capture_output=True,
+                timeout=5
+            )
+            if proc.returncode == 0:
+                return True, None
+            return False, proc.stderr.decode('utf-8', errors='replace').strip()
+        except subprocess.TimeoutExpired:
+            return False, "Clipboard command timed out"
+        except Exception as e:
+            return False, str(e)

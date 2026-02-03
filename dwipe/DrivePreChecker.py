@@ -56,6 +56,34 @@ class DrivePreChecker:
             sorted_modes[-1] = sorted_modes[-1] + '*'
         return sorted_modes
 
+    @staticmethod
+    def get_fw_caps_summary(modes):
+        """Get a compact summary of firmware wipe capabilities.
+
+        Args:
+            modes: iterable of mode names (e.g., ['Crypto', 'Block', 'Ovwr'])
+
+        Returns:
+            str: Summary like '⚡Crypto', '⚡Erase', or '⚡Overwrite' based on best available,
+                 or empty string if no firmware modes available
+        """
+        if not modes:
+            return ''
+
+        ranks = DrivePreChecker.WIPE_RANKS
+        # Find the best (lowest rank) mode
+        best_mode = min(modes, key=lambda m: ranks.get(m, 99))
+        best_rank = ranks.get(best_mode, 99)
+
+        # Categorize: Crypto (rank 1 or name contains Crypto), Erase (2-4), Overwrite (5)
+        if best_rank == 1 or 'Crypto' in best_mode:
+            return '⚡Crypto'
+        elif best_rank <= 4:
+            return '⚡Erase'
+        elif best_rank == 5:
+            return '⚡Overwrite'
+        return ''
+
     def __init__(self, timeout: int = 10):
         self.timeout = timeout
 

@@ -540,6 +540,7 @@ class DiskWipe:
         spin.add_key('spin_theme', 't - theme', genre='action', scope=THEME_ST)
         spin.add_key('header_mode', '_ - header style', vals=['Underline', 'Reverse', 'Off'])
         spin.add_key('expand', 'e - expand history entry', genre='action', scope=LOG_ST)
+        spin.add_key('copy', 'c - copy entry to clipboard', genre='action', scope=LOG_ST)
         spin.add_key('show_keys', 'K - show keys (demo mode)', genre='action')
         self.opts.theme = ''
         # Note: don't call restore_updated_opts() here - persistent_state was already used
@@ -646,24 +647,50 @@ class MainScreen(DiskWipeScreen):
 
     def _port_serial_line(self, partition, has_children=True):
         wids = self.app.wids
-        wid = wids.state if wids else 5
-        sep, key_str = '  ', ''
+        sep = '  '
         port, serial = partition.port, partition.serial
         hw_state = getattr(partition, 'hw_caps_state', ProbeState.PENDING)
         is_usb = getattr(partition, 'is_usb', False)
-        # Show FwCAPS if device has actual capabilities
+
+        # Get column widths (with defaults if wids not yet initialized)
+        wid_state = wids.state if wids else 5
+        wid_name = wids.name if wids else 10
+        wid_human = wids.human if wids else 8
+        wid_fstype = wids.fstype if wids else 6
+        wid_label = wids.label if wids else 12
+
+        # Determine firmware capability summary
+        fw_summary = ''
         if partition.hw_caps:
-            key_str = '   FwCAPS: ' + partition.hw_caps
-        # Show FwERRS only for non-USB devices (USB without caps = normal, don't show error)
+            # Show compact summary (⚡Crypto, ⚡Erase, ⚡Overwrite)
+            fw_summary = getattr(partition, 'hw_caps_summary', '')
         elif partition.hw_nopes and not is_usb:
-            key_str = '   FwERRS: ' + partition.hw_nopes
-        # Only show "..." for wipeable devices (not Mnt, Blk, Busy) that aren't USB
+            # Show issue with ✗ prefix (e.g., "✗Frozen") - use first issue if multiple
+            first_issue = partition.hw_nopes.split(',')[0].strip()
+            fw_summary = f'✗{first_issue}'
         elif hw_state in (ProbeState.PENDING, ProbeState.PROBING):
+            # Show ... while probing (only for wipeable non-USB devices)
             if partition.state not in ('Mnt', 'iMnt', 'Blk', 'iBlk', 'Busy') and not is_usb:
-                key_str = '   FwCAPS: ...'
+                fw_summary = '...'
+
         # Use corner └ if no children below, or vertical │ if there are children to connect to
         connector = '│' if has_children else ' '
-        return f'{"":>{wid}}{sep}{connector}   └────── {port:<12} {serial}{key_str}'
+
+        # Build base line: state padding + connector + port/serial
+        base = f'{"":>{wid_state}}{sep}{connector}   └────── {port:<12} {serial}'
+
+        # Position fw_summary under mount/status column
+        # Mount/status starts after: state + sep + name + sep + human + sep + fstype + sep + label + sep
+        mount_col = wid_state + 2 + wid_name + 2 + wid_human + 2 + wid_fstype + 2 + wid_label + 2
+        if fw_summary:
+            # Pad to mount/status column position, then add summary
+            padding = mount_col - len(base)
+            if padding > 0:
+                base += ' ' * padding + fw_summary
+            else:
+                base += '  ' + fw_summary  # At least 2 spaces if line is long
+
+        return base
 
     def do_job_maintenance(self):
         """ Check all the jobs in progress and advance their state
@@ -1369,7 +1396,7 @@ class HistoryScreen(DiskWipeScreen):
 
         # Header
         # header_line = f'ESC:back [e]xpand [/]search {len(self.filtered_entries)}/{len(self.entries)} ({level_summary}) '
-        header_line = f'ESC:back [e]xpand [/]search {len(self.filtered_entries)}/{len(self.entries)} '
+        header_line = f'ESC:back [e]xpand [c]opy [/]search {len(self.filtered_entries)}/{len(self.entries)} '
         if search_display:
             header_line += f'/ {search_display}'
         else:
@@ -1466,3 +1493,68 @@ class HistoryScreen(DiskWipeScreen):
         app = self.app
         self.search_bar.start(self.prev_filter)
         app.win.passthrough_mode = True
+
+    def copy_ACTION(self):
+        """'c' key - Copy current entry to clipboard or print to terminal"""
+        from .Utils import ClipboardHelper
+        app = self.app
+        win = app.win
+        ctx = win.get_picked_context()
+
+        if not ctx or not hasattr(ctx, 'timestamp'):
+            return
+
+        # Find the entry by timestamp
+        timestamp = ctx.timestamp
+        entry = None
+        for e in self.entries:
+            if e.timestamp == timestamp:
+                entry = e
+                break
+
+        if not entry:
+            return
+
+        # Format entry as JSON
+        entry_text = json.dumps(entry.to_dict(), indent=2)
+
+        # Try clipboard first
+        if ClipboardHelper.has_clipboard():
+            success, error = ClipboardHelper.copy(entry_text)
+            if success:
+                # Show brief success indicator - use the header context temporarily
+                # The message will be visible until next refresh
+                win.add_header(f'Copied to clipboard ({ClipboardHelper.get_method_name()})')
+            else:
+                win.add_header(f'Clipboard error: {error}')
+        else:
+            # Terminal fallback: exit curses, print, wait for input
+            self._copy_terminal_fallback(entry_text)
+
+    def _copy_terminal_fallback(self, text):
+        """Print entry to terminal when clipboard unavailable (e.g., SSH sessions)."""
+        from .Utils import ClipboardHelper
+        app = self.app
+
+        # Exit curses to use the terminal
+        ConsoleWindow.stop_curses()
+        os.system('clear; stty sane')
+
+        # Print with border
+        print('=' * 60)
+        print('LOG ENTRY (copy manually from terminal):')
+        print('=' * 60)
+        print(text)
+        print('=' * 60)
+        print(f'\nClipboard: {ClipboardHelper.get_method_name()}')
+        print('\nPress ENTER to return to dwipe...')
+
+        # Wait for user input
+        try:
+            input()
+        except EOFError:
+            pass
+
+        # Restore curses
+        ConsoleWindow.start_curses()
+        app.win.pick_pos = app.win.pick_pos  # Force position refresh

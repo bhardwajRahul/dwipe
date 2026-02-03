@@ -50,7 +50,8 @@ class DeviceWorker(threading.Thread):
             'model_state': ProbeState.PENDING,
 
             # Cached values
-            'hw_caps': '',  # String with wipe mode names: "Crypto, Block, Ovwr" (for display, thread-safe)
+            'hw_caps': '',  # String with wipe mode names: "Ovwr, Block, Crypto*" (for choices, thread-safe)
+            'hw_caps_summary': '',  # Summary like "⚡Crypto" (for display, thread-safe)
             'hw_nopes': '',  # String with issue names: "Frozen, Locked" (for display, thread-safe)
             'serial': '',
             'model': '',
@@ -162,11 +163,13 @@ class DeviceWorker(threading.Thread):
         """Get hardware capabilities if ready.
 
         Returns:
-            tuple: (hw_caps, hw_nopes, state, is_usb) where hw_caps/hw_nopes are strings
+            tuple: (hw_caps, hw_caps_summary, hw_nopes, state, is_usb)
+                   hw_caps: full sorted list for choices, hw_caps_summary: compact display
         """
         with self._lock:
             return (
                 self._state['hw_caps'],
+                self._state['hw_caps_summary'],
                 self._state['hw_nopes'],
                 self._state['hw_caps_state'],
                 self._state['is_usb']
@@ -207,8 +210,10 @@ class DeviceWorker(threading.Thread):
                 if result.modes:
                     sorted_modes = DrivePreChecker.sort_modes_by_rank(result.modes.keys())
                     self._state['hw_caps'] = ', '.join(sorted_modes)
+                    self._state['hw_caps_summary'] = DrivePreChecker.get_fw_caps_summary(result.modes.keys())
                 else:
                     self._state['hw_caps'] = ''
+                    self._state['hw_caps_summary'] = ''
                 self._state['hw_nopes'] = ', '.join(result.issues.keys()) if result.issues else ''
                 self._state['hw_caps_state'] = ProbeState.READY
 
@@ -471,13 +476,13 @@ class DeviceWorkerManager:
         """Get hardware capabilities for a device.
 
         Returns:
-            tuple: (hw_caps, hw_nopes, state, is_usb) where hw_caps/hw_nopes are strings
+            tuple: (hw_caps, hw_caps_summary, hw_nopes, state, is_usb)
         """
         with self._lock:
             worker = self._workers.get(device_name)
             if worker:
                 return worker.get_hw_caps()
-        return ('', '', ProbeState.PENDING, False)
+        return ('', '', '', ProbeState.PENDING, False)
 
     def get_state(self, device_name):
         """Get full cached state for a device."""

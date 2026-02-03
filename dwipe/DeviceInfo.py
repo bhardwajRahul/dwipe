@@ -93,7 +93,8 @@ class DeviceInfo:
                                uuid='',        # filesystem UUID or PARTUUID
                                serial='',      # disk serial number (for whole disks)
                                port='',        # port (for whole disks)
-                               hw_caps='',      # hw_wipe capabilities string: "Crypto, Block"
+                               hw_caps='',      # hw_wipe capabilities string: "Ovwr, Block, Crypto*"
+                               hw_caps_summary='',  # compact display: "⚡Crypto"
                                hw_nopes='',   # hw_wipe issues string: "Frozen, Locked"
                                hw_caps_state=ProbeState.PENDING,  # probe state for hw_caps
                                is_usb=False,   # True if device is on USB bus
@@ -118,12 +119,11 @@ class DeviceInfo:
         self.worker_manager.request_hw_caps(ns.name)
 
         # 4. Get current state from worker
-        hw_caps, hw_nopes, state, is_usb = self.worker_manager.get_hw_caps(ns.name)
+        hw_caps, hw_caps_summary, hw_nopes, state, is_usb = self.worker_manager.get_hw_caps(ns.name)
 
         # 5. Update namespace with worker state
-        # import time
-        # ns.hw_caps = hw_caps + ', ' + str((int(round(time.monotonic())) % 200))
         ns.hw_caps = hw_caps
+        ns.hw_caps_summary = hw_caps_summary
         ns.hw_nopes = hw_nopes
         ns.hw_caps_state = state
         ns.is_usb = is_usb
@@ -467,6 +467,7 @@ class DeviceInfo:
                 entry.serial = prev.serial
                 entry.marker = prev.marker
                 entry.hw_caps = getattr(prev, 'hw_caps', '')
+                entry.hw_caps_summary = getattr(prev, 'hw_caps_summary', '')
                 entry.hw_nopes = getattr(prev, 'hw_nopes', '')
                 entry.hw_caps_state = getattr(prev, 'hw_caps_state', ProbeState.PENDING)
                 entry.model = getattr(prev, 'model', '')
@@ -868,6 +869,7 @@ class DeviceInfo:
                 prev_hw_state = getattr(prev_ns, 'hw_caps_state', ProbeState.PENDING)
                 if prev_hw_state == ProbeState.READY:
                     new_ns.hw_caps = getattr(prev_ns, 'hw_caps', '')
+                    new_ns.hw_caps_summary = getattr(prev_ns, 'hw_caps_summary', '')
                     new_ns.hw_nopes = getattr(prev_ns, 'hw_nopes', '')
                     new_ns.hw_caps_state = ProbeState.READY
 

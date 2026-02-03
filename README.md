@@ -38,11 +38,16 @@
 
 ## Requirements
 - **Linux operating system** (uses `/dev/`, `/sys/`, `/proc/` interfaces)
-- **Python 3.8 or higher**
+- **Python 3.10 or higher**
 - **Root/sudo privileges** (automatically requested when you run the tool)
 - **lsblk utility** (usually pre-installed on most Linux distributions)
 - **nvme-cli** - For NVMe operations (Sanitize/Format detection)
 - **hdparm** - For SATA operations (ATA Security Erase detection)
+
+**Optional (for clipboard copy in history screen):**
+- **xclip** or **xsel** - For X11 clipboard (`apt install xclip` or `xsel`)
+- **wl-clipboard** - For Wayland clipboard (`apt install wl-clipboard`)
+- SSH sessions use OSC 52 terminal escape (no extra packages needed)
 
 ## Installation
 
@@ -191,6 +196,27 @@ The top line shows available actions. Some are context-sensitive (only available
 | **ESC** | clear filter | Clear the filter and jump to top of list |
 | **ESC** | back | Return to previous screen if on nested screen |
 | **a** | time format | Cycle wipe history time display format (ago+time, ago, time) |
+
+### History Screen
+
+Press **h** to view the wipe history log. The history screen shows all wipe and verify operations with timestamps, device info, and results.
+
+**History screen actions:**
+- **e** - Expand/collapse entry to show full JSON details
+- **c** - Copy current entry to clipboard (see below)
+- **/** - Search/filter entries (prefix with `/` for deep JSON search)
+- **a** - Cycle time format (ago+time, ago, time)
+- **ESC** - Return to main screen
+
+**Clipboard copy methods** (detected automatically):
+| Environment | Method | Notes |
+|-------------|--------|-------|
+| SSH session | OSC 52 | Terminal escape sequence; requires terminal support (iTerm2, kitty, alacritty, Windows Terminal, tmux with `set-clipboard on`) |
+| Wayland | wl-copy | Requires `wl-clipboard` package |
+| X11 | xclip/xsel | Requires `xclip` or `xsel` package |
+| Fallback | Terminal | Exits to shell, prints entry for manual copy |
+
+> **Note:** If OSC 52 doesn't work with your terminal, the text still appears on screen for manual selection. For tmux, enable clipboard with `set -g set-clipboard on` in your `.tmux.conf`.
 
 ### Wipe Types
 
