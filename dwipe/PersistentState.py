@@ -56,12 +56,24 @@ class PersistentState:
                 setattr(opts, key, self.state[key])
 
     def load(self):
-        """Load state from disk"""
+        """Load state from disk, handling schema upgrades/downgrades"""
         if self.config_path.exists():
             try:
+                # Remember valid keys from default state
+                valid_keys = set(self.state.keys())
+
                 with open(self.config_path, 'r', encoding='utf-8') as f:
                     loaded = json.load(f)
-                    self.state.update(loaded)
+
+                    # Only load keys that exist in current schema
+                    for key in valid_keys:
+                        if key in loaded:
+                            self.state[key] = loaded[key]
+
+                    # Check for obsolete keys that need removal
+                    obsolete_keys = set(loaded.keys()) - valid_keys
+                    if obsolete_keys:
+                        self.dirty = True  # Trigger save to clean up
 
                     # Migrate old wipe_mode values to new format
                     old_wipe_mode = self.state.get('wipe_mode', '+V')
