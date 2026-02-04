@@ -97,7 +97,8 @@ class DiskWipe:
                 delattr(part, 'verify_failed_msg')
 
             # Get the wipe type from user's choice
-            wipe_type = self.confirmation.input_buffer.strip()
+            # ConsoleWindow already canonicalizes case, just strip the '*' recommendation marker
+            wipe_type = self.confirmation.input_buffer.strip().rstrip('*')
 
             # Check if it's a firmware wipe
             if wipe_type not in ('Zero', 'Rand'):
@@ -355,7 +356,8 @@ class DiskWipe:
                 actions['s'] = 'stop'
             elif self.test_state(part, to='0%'):
                 actions['w'] = 'wipe'
-                if part.parent is None:
+                # DEL only for whole disks that are SATA or NVMe
+                if part.parent is None and part.name[:2] in ('sd', 'hd', 'nv'):
                     actions['DEL'] = 'DEL'
             # Can verify:
             # 1. Anything with wipe markers (states 's' or 'W') - EXCEPT firmware wipes
@@ -528,7 +530,7 @@ class DiskWipe:
         spin.add_key('verify', 'v - verify device', genre='action')
         spin.add_key('stop', 's - stop wipe', genre='action')
         spin.add_key('block', 'b - block/unblock disk', genre='action')
-        spin.add_key('delete_device', 'DEL - remove disk from system',
+        spin.add_key('delete_device', 'DEL - remove/unbind disk from system',
                          genre='action', keys=(cs.KEY_DC))
         spin.add_key('scan_all_devices', 'r - rescan devices and recheck capabilities',
                      genre='action', scope=MAIN_ST)
@@ -542,9 +544,8 @@ class DiskWipe:
         spin.add_key('expand', 'e - expand history entry', genre='action', scope=LOG_ST)
         spin.add_key('copy', 'c - copy entry to clipboard', genre='action', scope=LOG_ST)
         spin.add_key('show_keys', 'K - show keys (demo mode)', genre='action')
-        self.opts.theme = ''
-        # Note: don't call restore_updated_opts() here - persistent_state was already used
-        # as defaults in main.py argparse, so opts already has the right values
+        # Load theme from persistent state
+        self.opts.theme = self.persistent_state.state.get('theme', '')
         Theme.set(self.opts.theme)
         self.win.set_handled_keys(self.spin.keys)
 
@@ -1162,17 +1163,20 @@ class MainScreen(DiskWipeScreen):
         # Show temporary feedback
         self.app.win.flash('Scanning devices and rechecking firmware capabilities...', duration=0.75)
 
+        # SCSI host rescan (for SATA devices)
         base_path = '/sys/class/scsi_host'
-        if not os.path.exists(base_path):
-            return
-        for host in os.listdir(base_path):
-            scan_file = os.path.join(base_path, host, 'scan')
-            if os.path.exists(scan_file):
-                try:
-                    with open(scan_file, 'w', encoding='utf-8') as f:
-                        f.write("- - -")
-                except Exception:
-                    pass
+        if os.path.exists(base_path):
+            for host in os.listdir(base_path):
+                scan_file = os.path.join(base_path, host, 'scan')
+                if os.path.exists(scan_file):
+                    try:
+                        with open(scan_file, 'w', encoding='utf-8') as f:
+                            f.write("- - -")
+                    except Exception:
+                        pass
+
+        # Rebind any unbound NVMe devices
+        self._rebind_nvme_devices()
 
         # Reset hw_caps stickiness for all devices so they'll be re-probed
         # This allows detecting hardware state changes after sleep/wake cycles
@@ -1188,22 +1192,84 @@ class MainScreen(DiskWipeScreen):
                 partition.hw_caps_state = ProbeState.PENDING
 
     def delete_device_ACTION(self):
-        """ DEL key -- Cause the OS to drop a sata device so it
-            can be replaced sooner """
+        """ DEL key -- Cause the OS to drop a SATA device or unbind an NVMe device
+            so it can be replaced sooner """
         app = self.app
         ctx = app.win.get_picked_context()
         if ctx and hasattr(ctx, 'partition'):
             part = ctx.partition
             if not part or part.parent or not app.test_state(part, to='0%'):
                 return
-            path = f"/sys/block/{part.name}/device/delete"
-            if os.path.exists(path):
-                try:
-                    with open(path, 'w', encoding='utf-8') as f:
-                        f.write("1")
-                    return True
-                except Exception:
-                    pass
+            # NVMe unbind - write PCI address to driver unbind file
+            if part.name.startswith('nvme'):
+                pci_addr = self._get_nvme_pci_address(part.name)
+                if pci_addr:
+                    unbind_path = "/sys/bus/pci/drivers/nvme/unbind"
+                    if os.path.exists(unbind_path):
+                        try:
+                            with open(unbind_path, 'w', encoding='utf-8') as f:
+                                f.write(pci_addr)
+                            return True
+                        except Exception:
+                            pass
+            # SATA/IDE delete - write 1 to device delete file
+            else:
+                path = f"/sys/block/{part.name}/device/delete"
+                if os.path.exists(path):
+                    try:
+                        with open(path, 'w', encoding='utf-8') as f:
+                            f.write("1")
+                        return True
+                    except Exception:
+                        pass
+
+    def _get_nvme_pci_address(self, device_name):
+        """Get the full PCI address for an NVMe device (e.g., '0000:01:00.0')
+
+        The sysfs path may contain multiple PCI addresses (bridges), so we need
+        the last one before /nvme/ which is the actual NVMe controller.
+        """
+        try:
+            sysfs_path = f'/sys/class/block/{device_name}'
+            if os.path.exists(sysfs_path):
+                real_path = os.path.realpath(sysfs_path)
+                # Find all PCI addresses and take the last one (the NVMe controller)
+                pci_matches = re.findall(r'(0000:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f])', real_path, re.I)
+                if pci_matches:
+                    return pci_matches[-1]
+        except Exception:
+            pass
+        return None
+
+    def _rebind_nvme_devices(self):
+        """Find and rebind any unbound NVMe devices.
+
+        Scans PCI devices for NVMe controllers (class 0x010802) that have no
+        driver bound, and attempts to bind them to the nvme driver.
+        """
+        pci_devices = '/sys/bus/pci/devices'
+        nvme_bind = '/sys/bus/pci/drivers/nvme/bind'
+        if not os.path.exists(pci_devices) or not os.path.exists(nvme_bind):
+            return
+
+        for pci_addr in os.listdir(pci_devices):
+            device_path = os.path.join(pci_devices, pci_addr)
+            # Check if this is an NVMe controller (class 0x010802)
+            class_file = os.path.join(device_path, 'class')
+            try:
+                with open(class_file, 'r', encoding='utf-8') as f:
+                    device_class = f.read().strip()
+                if device_class != '0x010802':
+                    continue
+                # Check if driver is already bound
+                driver_link = os.path.join(device_path, 'driver')
+                if os.path.exists(driver_link):
+                    continue
+                # Try to bind to nvme driver
+                with open(nvme_bind, 'w', encoding='utf-8') as f:
+                    f.write(pci_addr)
+            except Exception:
+                pass
 
     def stop_ACTION(self):
         """Handle 's' key - stop current wipe (but not firmware wipes)"""
