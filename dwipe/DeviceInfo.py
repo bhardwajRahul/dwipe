@@ -112,11 +112,7 @@ class DeviceInfo:
         if ns.hw_caps_state == ProbeState.READY:
             return ns.hw_caps, ns.hw_nopes
 
-        # 2. Skip probing non-wipeable devices (mounted/blocked)
-        if ns.state in ('Mnt', 'iMnt', 'Blk', 'iBlk', 'Busy'):
-            return ns.hw_caps, ns.hw_nopes
-
-        # 3. Skip probing if device has active job (would block on SATA wipe)
+        # 2. Skip probing if device has active job (would block on SATA wipe)
         if ns.job:
             return ns.hw_caps, ns.hw_nopes
 
@@ -829,15 +825,17 @@ class DeviceInfo:
             hw_state = getattr(ns, 'hw_caps_state', ProbeState.PENDING)
             is_usb = getattr(ns, 'is_usb', False)
 
+            # Non-wipeable devices always show '---' regardless of capabilities
             fw_label = ''
-            if hw_caps:
+            if ns.state in ('Mnt', 'iMnt', 'Blk', 'iBlk', 'Busy'):
+                fw_label = '---'
+            elif hw_caps:
                 fw_label = hw_summary
             elif hw_nopes and not is_usb:
                 first_issue = hw_nopes.split(',')[0].strip()
                 fw_label = f'✗{first_issue}'
-            elif hw_state in (ProbeState.PENDING, ProbeState.PROBING):
-                if ns.state not in ('Mnt', 'iMnt', 'Blk', 'iBlk', 'Busy') and not is_usb:
-                    fw_label = '...'
+            elif hw_state in (ProbeState.PENDING, ProbeState.PROBING) and not is_usb:
+                fw_label = '...'
 
             if not fw_label:
                 fw_label = '---'
@@ -1056,8 +1054,9 @@ class DeviceInfo:
         self.clear_inferred_states(nss)
 
         # Re-apply Mnt state for devices with mounts (cleared above, needed for set_all_states)
+        # But Blk trumps Mnt - blocked devices stay blocked even if mounted
         for ns in nss.values():
-            if ns.mounts:
+            if ns.mounts and ns.state != 'Blk':
                 ns.state = 'Mnt'
 
         self.set_all_states(nss)  # set inferred states (propagates Mnt/Busy to parents)

@@ -443,9 +443,6 @@ class DiskWipe:
             # Device must not be actively wiping (to avoid blocking)
             if ns.job:
                 continue
-            # Don't probe mounted/blocked devices
-            if ns.state in ('Mnt', 'iMnt', 'Blk', 'iBlk'):
-                continue
             # Re-probe after wipe: worker state is still READY, need force
             if not (ns.hw_caps or ns.hw_nopes):
                 ns.hw_caps_state = ProbeState.PENDING
