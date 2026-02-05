@@ -446,11 +446,10 @@ class DiskWipe:
             # Don't probe mounted/blocked devices
             if ns.state in ('Mnt', 'iMnt', 'Blk', 'iBlk'):
                 continue
-            # Reset state to PENDING to force a re-probe if needed
-            # (state stays READY even after wipe clears results)
+            # Re-probe after wipe: worker state is still READY, need force
             if not (ns.hw_caps or ns.hw_nopes):
                 ns.hw_caps_state = ProbeState.PENDING
-            # Probe any device that might be ready (s, W, -, ^, or wipeable state)
+                self.worker_manager.request_hw_caps(ns.name, force=True)
             self.dev_info.get_hw_capabilities(ns)
 
     def _poll_hw_caps_updates(self):
@@ -506,6 +505,7 @@ class DiskWipe:
         self.partitions = info.assemble_partitions(self.partitions)
         # Start probing hw_caps immediately instead of waiting for first 3s refresh
         self.dev_info = info
+        self.worker_manager = worker_manager
         self.get_hw_caps_when_needed()
         if self.opts.dump_lsblk:
             DeviceInfo.dump(self.partitions, title="after assemble_partitions")
@@ -551,8 +551,6 @@ class DiskWipe:
 
         # Background device change monitor started above
 
-        # self.dev_info already set during startup probe above
-        self.worker_manager = worker_manager
         pick_range = info.get_pick_range()
         self.win.set_pick_range(pick_range[0], pick_range[1])
 
@@ -577,9 +575,20 @@ class DiskWipe:
                 # This lets us show results quickly even though commands take 1-3 seconds
                 self._poll_hw_caps_updates()
 
+                # Detect suspend/resume: loop runs every ~0.25s, so a large
+                # gap in monotonic time means the system was likely suspended
+                now_mono = time.monotonic()
+                loop_gap = now_mono - check_devices_mono
+                if loop_gap > 5.0 and hasattr(self, '_last_loop_mono'):
+                    suspend_gap = now_mono - self._last_loop_mono
+                    if suspend_gap > 5.0:
+                        self.win.flash(f'Suspend detected ({suspend_gap:.0f}s gap), rescanning...', duration=1.5)
+                        self.screens[MAIN_ST].scan_all_devices_ACTION()
+                self._last_loop_mono = now_mono
+
                 # Check for device changes from background monitor
                 devices_changed = device_monitor.get_and_clear()
-                time_since_refresh = time.monotonic() - check_devices_mono
+                time_since_refresh = now_mono - check_devices_mono
 
                 # Build current worker state for comparison
                 current_worker_state = {}
@@ -1188,7 +1197,7 @@ class MainScreen(DiskWipeScreen):
                 # Queue worker to re-probe this device's capabilities
                 if partition.parent: # only need to do whole disks
                     continue
-                self.app.worker_manager.request_hw_caps(partition.name)
+                self.app.worker_manager.request_hw_caps(partition.name, force=True)
                 # Clear cached values so UI refreshes with new probing state
                 partition.hw_caps = ''
                 partition.hw_nopes = ''

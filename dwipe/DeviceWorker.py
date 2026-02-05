@@ -111,11 +111,17 @@ class DeviceWorker(threading.Thread):
         self._running = False
         self._work_queue.put('stop')
 
-    def request_hw_caps(self):
-        """Request hardware capabilities probe (non-blocking)."""
+    def request_hw_caps(self, force=False):
+        """Request hardware capabilities probe (non-blocking).
+        Args:
+            force: If True, reset cached state and re-probe even if already done.
+        """
         with self._lock:
-            if self._state['hw_caps_state'] == ProbeState.PENDING:
+            if force or self._state['hw_caps_state'] == ProbeState.PENDING:
                 self._state['hw_caps_state'] = ProbeState.PROBING
+                self._state['hw_caps'] = ''
+                self._state['hw_caps_summary'] = ''
+                self._state['hw_nopes'] = ''
                 self._work_queue.put('hw_caps')
 
     def set_want_marker(self, want):
@@ -460,12 +466,12 @@ class DeviceWorkerManager:
                 worker.start()
                 self._workers[name] = worker
 
-    def request_hw_caps(self, device_name):
+    def request_hw_caps(self, device_name, force=False):
         """Request hardware capabilities probe for a device."""
         with self._lock:
             worker = self._workers.get(device_name)
             if worker:
-                worker.request_hw_caps()
+                worker.request_hw_caps(force=force)
 
     def set_want_marker(self, device_name, want):
         """Set whether we want to monitor for a marker on a device.

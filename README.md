@@ -65,7 +65,7 @@
 1. **Drives and the OS often lie about drive type.** Outwit them both:
     * For spinning HDDs, **always** use `Rand` or `Zero` (interruptible, shows progress).
     * For SSDs, **always** use firmware wipes if available (faster, reaches hidden blocks).
-1. **If a drive is 'Frozen'**, press `DEL` to detach it and, when gone, press `r` to rescan; it should come back unfrozen.
+1. **If a drive is 'Frozen'**, suspend your system briefly and resume; `dwipe` auto-detects the resume and rescans. Or press `r` to rescan manually. The drive should come back unfrozen.
 1. **If a drive is 'Locked'**, you must unlock it manually (see "Unlock Locked Device" section below). If `dwipe` locked it, the password is `NULL`; otherwise use the password that locked it.
 1. **Hot-swap workflow for SATA drives**: `DEL` to detach, physically swap drives, then `r` to rescan (if needed).
 
@@ -461,11 +461,10 @@ Press **ESC** from the main screen to clear the filter and return to showing all
 Firmware wipes (SATA/NVMe secure erase operations) have different characteristics than software wipes:
 
 **Frozen Drives:**
-- Firmware wipes sometimes report the drive as "Frozen" if the device is present (mounted or in use) when capabilities are detected
+- SATA drives are typically frozen by the BIOS/UEFI during POST as a security measure
 - This is a drive-level security feature, not a `dwipe` limitation
-- **Solution**: Unmount the device, wait briefly (often just a few seconds of idle time is enough), then use **r** to rescan capabilities
-- The freeze state is usually temporary and clears after the device is no longer actively in use
-- If the drive remains frozen, try hot-swapping (remove and reinsert) or power-cycling the device
+- **Solution**: Suspend your system briefly and resume; `dwipe` auto-detects the resume and rescans (or press **r** manually). The suspend/resume power-cycles the SATA link which clears the freeze.
+- If the drive remains frozen after suspend/resume, try a full power-off (10+ minutes to drain drive capacitors) followed by boot and rescan
 
 **Device Quirks and Compatibility:**
 - Storage devices have various firmware implementations and hardware quirks that affect secure erase operations

@@ -112,7 +112,11 @@ class DeviceInfo:
         if ns.hw_caps_state == ProbeState.READY:
             return ns.hw_caps, ns.hw_nopes
 
-        # 2. Skip probing if device has active job (would block on SATA wipe)
+        # 2. Skip probing non-wipeable devices (mounted/blocked)
+        if ns.state in ('Mnt', 'iMnt', 'Blk', 'iBlk', 'Busy'):
+            return ns.hw_caps, ns.hw_nopes
+
+        # 3. Skip probing if device has active job (would block on SATA wipe)
         if ns.job:
             return ns.hw_caps, ns.hw_nopes
 
