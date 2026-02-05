@@ -51,7 +51,7 @@ class DeviceWorker(threading.Thread):
 
             # Cached values
             'hw_caps': '',  # String with wipe mode names: "Ovwr, Block, Crypto*" (for choices, thread-safe)
-            'hw_caps_summary': '',  # Summary like "⚡Crypto" (for display, thread-safe)
+            'hw_caps_summary': '',  # Summary like "ϟCrypto" (for display, thread-safe)
             'hw_nopes': '',  # String with issue names: "Frozen, Locked" (for display, thread-safe)
             'serial': '',
             'model': '',
@@ -70,6 +70,7 @@ class DeviceWorker(threading.Thread):
             'last_error': None,
             'probe_count': 0,
             'is_usb': False,  # True if device is on USB bus
+            'is_rotational': False,  # True if HDD (spinning disk)
         }
 
         # Device type detection
@@ -163,7 +164,7 @@ class DeviceWorker(threading.Thread):
         """Get hardware capabilities if ready.
 
         Returns:
-            tuple: (hw_caps, hw_caps_summary, hw_nopes, state, is_usb)
+            tuple: (hw_caps, hw_caps_summary, hw_nopes, state, is_usb, is_rotational)
                    hw_caps: full sorted list for choices, hw_caps_summary: compact display
         """
         with self._lock:
@@ -172,7 +173,8 @@ class DeviceWorker(threading.Thread):
                 self._state['hw_caps_summary'],
                 self._state['hw_nopes'],
                 self._state['hw_caps_state'],
-                self._state['is_usb']
+                self._state['is_usb'],
+                self._state['is_rotational']
             )
 
     def get_marker_formatted(self):
@@ -191,6 +193,8 @@ class DeviceWorker(threading.Thread):
             self._state['probe_count'] += 1
             # Detect USB (SATA-over-USB bridges can still support ATA passthrough)
             self._state['is_usb'] = self._is_usb_device()
+            # Detect HDD vs SSD for ranking preferences
+            self._state['is_rotational'] = self._is_rotational_device()
 
         try:
             dev_path = f"/dev/{self.device_name}"
@@ -207,8 +211,15 @@ class DeviceWorker(threading.Thread):
             # Store results as strings (immutable, no locking needed for reads)
             # Sort modes by rank (worst to best) with '*' on the recommended (last) one
             with self._lock:
+                is_rotational = self._state['is_rotational']
                 if result.modes:
-                    sorted_modes = DrivePreChecker.sort_modes_by_rank(result.modes.keys())
+                    # Use HDD rankings ONLY if rotational AND no crypto-capable firmware
+                    # Note: 'Enhanced' is available on HDDs too (slow overwrite, not crypto)
+                    # Only SCrypto/Crypto/FCrypto definitively indicate SSD with crypto
+                    has_crypto_fw = any(m in result.modes for m in ('SCrypto', 'Crypto', 'FCrypto'))
+                    use_hdd_ranking = is_rotational and not has_crypto_fw
+                    sorted_modes = DrivePreChecker.sort_modes_by_rank(
+                        result.modes.keys(), add_star=not use_hdd_ranking, is_rotational=use_hdd_ranking)
                     self._state['hw_caps'] = ', '.join(sorted_modes)
                     self._state['hw_caps_summary'] = DrivePreChecker.get_fw_caps_summary(result.modes.keys())
                 else:
@@ -365,7 +376,8 @@ class DeviceWorker(threading.Thread):
         path = f"/sys/class/block/{self.device_name}/{attr_path}"
         try:
             with open(path, 'r') as f:
-                return f.read().strip()
+                # Sanitize: some USB bridges return strings with embedded nulls
+                return f.read().strip().replace('\x00', '')
         except (FileNotFoundError, IOError, OSError):
             return ''
 
@@ -379,7 +391,8 @@ class DeviceWorker(threading.Thread):
             with open(path, 'rb') as f:
                 data = f.read()
                 if len(data) > 4:
-                    return data[4:].decode('ascii', errors='ignore').strip()
+                    # Sanitize: remove nulls that some USB bridges include
+                    return data[4:].decode('ascii', errors='ignore').strip().replace('\x00', '')
         except (FileNotFoundError, IOError, OSError):
             pass
         return ''
@@ -391,6 +404,23 @@ class DeviceWorker(threading.Thread):
             real_path = os.path.realpath(sysfs_path).lower()
             return '/usb' in real_path
         except (OSError, IOError):
+            return False
+
+    def _is_rotational_device(self):
+        """Check if device is rotational (HDD) vs solid-state (SSD).
+
+        Reads /sys/block/<device>/queue/rotational:
+        - 1 = HDD (spinning disk)
+        - 0 = SSD (solid-state)
+
+        Returns:
+            bool: True if HDD (rotational), False if SSD or unknown
+        """
+        try:
+            path = f'/sys/block/{self.device_name}/queue/rotational'
+            with open(path, 'r', encoding='utf-8') as f:
+                return f.read().strip() == '1'
+        except (FileNotFoundError, PermissionError, OSError):
             return False
 
 
@@ -476,13 +506,13 @@ class DeviceWorkerManager:
         """Get hardware capabilities for a device.
 
         Returns:
-            tuple: (hw_caps, hw_caps_summary, hw_nopes, state, is_usb)
+            tuple: (hw_caps, hw_caps_summary, hw_nopes, state, is_usb, is_rotational)
         """
         with self._lock:
             worker = self._workers.get(device_name)
             if worker:
                 return worker.get_hw_caps()
-        return ('', '', '', ProbeState.PENDING, False)
+        return ('', '', '', ProbeState.PENDING, False, False)
 
     def get_state(self, device_name):
         """Get full cached state for a device."""

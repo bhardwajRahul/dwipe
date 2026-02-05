@@ -55,12 +55,20 @@
 * **Verify installation:** `dwipe --help`
 * **Uninstall:** `pipx uninstall dwipe`
 
-## Quick Start
+## Quick Start (please READ THIS, at least)
 1. Install `dwipe`
-2. Run `dwipe` from a terminal (`sudo` will be requested automatically)
-3. Observe the context-sensitive help on the first line
-4. Navigate with arrow keys or vi-like keys (j/k)
-5. Press **?** for full help screen
+1. Run `dwipe` from a terminal (`sudo` will be requested automatically)
+1. Observe the context-sensitive help on the first line
+1. Navigate with arrow keys or vi-like keys (j/k)
+1. Press **?** for full help screen
+1. **When you press `w` to wipe a drive,** you must type the abbreviation (e.g., `Rand`, `Zero`, `Crypto`); wipes are presented from least to most recommended, and the last one is marked with `*`. Normally, pick the last choice, but ...
+1. **Drives and the OS often lie about drive type.** Outwit them both:
+    * For spinning HDDs, **always** use `Rand` or `Zero` (interruptible, shows progress).
+    * For SSDs, **always** use firmware wipes if available (faster, reaches hidden blocks).
+1. **If a drive is 'Frozen'**, press `DEL` to detach it and, when gone, press `r` to rescan; it should come back unfrozen.
+1. **If a drive is 'Locked'**, you must unlock it manually (see "Unlock Locked Device" section below). If `dwipe` locked it, the password is `NULL`; otherwise use the password that locked it.
+1. **Hot-swap workflow for SATA drives**: `DEL` to detach, physically swap drives, then `r` to rescan (if needed).
+
 
 ## Features
 
@@ -230,21 +238,32 @@ Press **h** to view the wipe history log. The history screen shows all wipe and 
 | 2 | Block | Sanitize Block Erase | Fast; resets all blocks to deallocated state |
 | 3 | FCrypto | Format with Crypto Erase | Fast; reformats namespace with key erasure |
 | 4 | FErase | Format with User Data Erase | Fast; reformats with simple data erase; less thorough than crypto |
-| 5 | Ovwr | Sanitize Overwrite | Slow; writes pattern to all blocks; most thorough but rarely needed |
+| 5 | Ovwr | Sanitize Overwrite | Minutes; writes pattern to all blocks; most thorough but rarely needed |
 | 6 | Rand | Software Random Write | Fallback; writes random data via software; hours for large drives |
 | 7 | Zero | Software Zero Write | Fallback; writes zeros via software; verifiable but slower |
 
-#### SATA Drives
+#### SATA SSDs (with crypto/sanitize features)
 
 | Rank | Abbrev | Official Name | Remarks |
 |------|--------|---------------|---------|
 | 1 | SCrypto | Sanitize Cryptographic Erase | Fastest; erases encryption keys; requires SANITIZE feature |
-| 2 | Enhanced | ATA Security Erase Enhanced | Fast; vendor-specific deep erase; most compatible firmware wipe |
+| 2 | Enhanced | ATA Security Erase Enhanced | Fast; vendor-specific deep erase with crypto key destruction |
 | 3 | SBlock | Sanitize Block Erase | Fast; resets blocks to factory state; requires SANITIZE feature |
-| 4 | Erase | ATA Security Erase Normal | Slow (hours); writes zeros to all sectors; widely supported |
-| 5 | SOverwrite | Sanitize Overwrite | Slow; overwrites with pattern; requires SANITIZE feature |
-| 6 | Rand | Software Random Write | Fallback; writes random data via software; hours for large drives |
-| 7 | Zero | Software Zero Write | Fallback; writes zeros via software; verifiable but slower |
+| 4 | Erase | ATA Security Erase Normal | Minutes; writes zeros to all sectors; widely supported |
+| 5 | SOverwrite | Sanitize Overwrite | Minutes; overwrites with pattern; requires SANITIZE feature |
+| 6 | Rand | Software Random Write | Fallback; can't reach wear-leveled or remapped blocks |
+| 7 | Zero | Software Zero Write | Fallback; can't reach wear-leveled or remapped blocks |
+
+#### SATA HDDs (spinning drives)
+
+| Rank | Abbrev | Official Name | Remarks |
+|------|--------|---------------|---------|
+| 1 | Rand | Software Random Write | Preferred; interruptible, resumable, shows progress |
+| 2 | Zero | Software Zero Write | Preferred; interruptible, resumable, fast verification |
+| 3 | Enhanced | ATA Security Erase Enhanced | Slow (hours); not interruptible; no progress; same result as software |
+| 4 | Erase | ATA Security Erase Normal | Slow (hours); not interruptible; no progress; same result as software |
+
+> **Note:** HDDs don't have wear leveling or hidden blocks, so software wipes are equally thorough as firmware wipes but offer better control (progress, pause/resume, interruptibility).
 
 #### Partitions and USB/Thumb Drives
 

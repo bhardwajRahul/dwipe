@@ -649,47 +649,18 @@ class MainScreen(DiskWipeScreen):
     def _port_serial_line(self, partition, has_children=True):
         wids = self.app.wids
         sep = '  '
-        port, serial = partition.port, partition.serial
-        hw_state = getattr(partition, 'hw_caps_state', ProbeState.PENDING)
-        is_usb = getattr(partition, 'is_usb', False)
+        # Sanitize port/serial - some USB bridges return strings with embedded nulls
+        port = partition.port.replace('\x00', '') if partition.port else ''
+        serial = partition.serial.replace('\x00', '') if partition.serial else ''
 
         # Get column widths (with defaults if wids not yet initialized)
         wid_state = wids.state if wids else 5
-        wid_name = wids.name if wids else 10
-        wid_human = wids.human if wids else 8
-        wid_fstype = wids.fstype if wids else 6
-        wid_label = wids.label if wids else 12
-
-        # Determine firmware capability summary
-        fw_summary = ''
-        if partition.hw_caps:
-            # Show compact summary (⚡Crypto, ⚡Erase, ⚡Overwrite)
-            fw_summary = getattr(partition, 'hw_caps_summary', '')
-        elif partition.hw_nopes and not is_usb:
-            # Show issue with ✗ prefix (e.g., "✗Frozen") - use first issue if multiple
-            first_issue = partition.hw_nopes.split(',')[0].strip()
-            fw_summary = f'✗{first_issue}'
-        elif hw_state in (ProbeState.PENDING, ProbeState.PROBING):
-            # Show ... while probing (only for wipeable non-USB devices)
-            if partition.state not in ('Mnt', 'iMnt', 'Blk', 'iBlk', 'Busy') and not is_usb:
-                fw_summary = '...'
 
         # Use corner └ if no children below, or vertical │ if there are children to connect to
         connector = '│' if has_children else ' '
 
         # Build base line: state padding + connector + port/serial
         base = f'{"":>{wid_state}}{sep}{connector}   └────── {port:<12} {serial}'
-
-        # Position fw_summary under mount/status column
-        # Mount/status starts after: state + sep + name + sep + human + sep + fstype + sep + label + sep
-        mount_col = wid_state + 2 + wid_name + 2 + wid_human + 2 + wid_fstype + 2 + wid_label + 2
-        if fw_summary:
-            # Pad to mount/status column position, then add summary
-            padding = mount_col - len(base)
-            if padding > 0:
-                base += ' ' * padding + fw_summary
-            else:
-                base += '  ' + fw_summary  # At least 2 spaces if line is long
 
         return base
 
@@ -952,6 +923,19 @@ class MainScreen(DiskWipeScreen):
             # Add partitions for this disk, sorted alphabetically
             parts = sorted([p for p in app.partitions.values() if p.parent == disk.name],
                            key=lambda p: p.name)
+            # If disk is directly blocked, hide children and aggregate their mounts
+            if disk.state == 'Blk':
+                # Collect all mounts from children, sort with "/" first (by name/length)
+                all_mounts = []
+                for part in parts:
+                    all_mounts.extend(part.mounts)
+                # Sort: "/" first, then by name (implicitly by length since "/" is shortest)
+                all_mounts.sort(key=lambda m: (m != '/', m))
+                disk.aggregated_mounts = all_mounts
+                # Skip adding children to visible list
+                continue
+            else:
+                disk.aggregated_mounts = None
             for part in parts:
                 if wanted(part.name) or part.job:
                     visible_partitions.append(part)
@@ -985,7 +969,16 @@ class MainScreen(DiskWipeScreen):
             # Create context with partition reference
             ctx = Context(genre='disk' if partition.parent is None else 'partition',
                          partition=partition)
-            app.win.add_body(partition.line, attr=attr, context=ctx)
+            # For disks, underline just the alphanumeric part of fw capability text
+            fw_ul = getattr(partition, '_fw_underline', None)
+            if fw_ul:
+                ul_start, ul_end = fw_ul
+                app.win.add_body(partition.line[:ul_start], attr=attr, context=ctx)
+                ul_attr = (attr or cs.A_NORMAL) | cs.A_UNDERLINE
+                app.win.add_body(partition.line[ul_start:ul_end], attr=ul_attr, resume=True)
+                app.win.add_body(partition.line[ul_end:], attr=attr, resume=True)
+            else:
+                app.win.add_body(partition.line, attr=attr, context=ctx)
             if partition.parent is None and app.opts.port_serial != 'Off':
                 doit = bool(app.opts.port_serial == 'On')
                 if not doit:
@@ -997,7 +990,8 @@ class MainScreen(DiskWipeScreen):
                     # Check if this disk has any visible child partitions
                     has_children = partition.name in parent_last_child
                     line = self._port_serial_line(partition, has_children)
-                    app.win.add_body(line, attr=attr, context=Context(genre='DECOR'))
+                    port_attr = (attr or cs.A_NORMAL) & ~cs.A_BOLD
+                    app.win.add_body(line, attr=port_attr, context=Context(genre='DECOR'))
 
             # Show inline confirmation prompt if this is the partition being confirmed
             if app.confirmation.active and app.confirmation.identity == partition.name:
@@ -1115,11 +1109,20 @@ class MainScreen(DiskWipeScreen):
                     # Sort all by rank (worst to best) with '*' on recommended (last) one
                     from .DrivePreChecker import DrivePreChecker
                     choices = ['Zero', 'Rand']
+                    fw_modes = []
                     if part.hw_caps:
                         # Strip '*' from hw_caps modes (already has it from display string)
                         fw_modes = [m.strip().rstrip('*') for m in part.hw_caps.split(',')]
                         choices.extend(fw_modes)
-                    choices = DrivePreChecker.sort_modes_by_rank(choices)
+                    # Use HDD rankings (prefer software wipes) ONLY if:
+                    # 1. Device reports as rotational, AND
+                    # 2. Device has no crypto-capable firmware wipes
+                    # Note: 'Enhanced' is available on HDDs too (slow overwrite, not crypto)
+                    # Only SCrypto/Crypto/FCrypto definitively indicate SSD with crypto
+                    is_rotational = getattr(part, 'is_rotational', False)
+                    has_crypto_fw = any(m in fw_modes for m in ('SCrypto', 'Crypto', 'FCrypto'))
+                    use_hdd_ranking = is_rotational and not has_crypto_fw
+                    choices = DrivePreChecker.sort_modes_by_rank(choices, is_rotational=use_hdd_ranking)
                     app.confirmation.start(action_type='wipe',
                                identity=part.name, mode='choices', choices=choices)
                     app.win.passthrough_mode = True
@@ -1304,7 +1307,7 @@ class MainScreen(DiskWipeScreen):
         if ctx and hasattr(ctx, 'partition'):
             part = ctx.partition
             self.clear_hotswap_marker(part)
-            app.set_state(part, 'Unbl' if part.state in ('Blk', 'iBlk') else 'Blk')
+            app.set_state(part, 'Unbl' if part.state == 'Blk' else 'Blk')
 
     def help_ACTION(self):
         """Handle '?' key - push help screen"""

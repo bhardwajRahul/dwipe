@@ -94,10 +94,11 @@ class DeviceInfo:
                                serial='',      # disk serial number (for whole disks)
                                port='',        # port (for whole disks)
                                hw_caps='',      # hw_wipe capabilities string: "Ovwr, Block, Crypto*"
-                               hw_caps_summary='',  # compact display: "⚡Crypto"
+                               hw_caps_summary='',  # compact display: "ϟCrypto"
                                hw_nopes='',   # hw_wipe issues string: "Frozen, Locked"
                                hw_caps_state=ProbeState.PENDING,  # probe state for hw_caps
                                is_usb=False,   # True if device is on USB bus
+                               is_rotational=False,  # True if HDD (spinning disk)
                                )
 
     def get_hw_capabilities(self, ns):
@@ -119,7 +120,7 @@ class DeviceInfo:
         self.worker_manager.request_hw_caps(ns.name)
 
         # 4. Get current state from worker
-        hw_caps, hw_caps_summary, hw_nopes, state, is_usb = self.worker_manager.get_hw_caps(ns.name)
+        hw_caps, hw_caps_summary, hw_nopes, state, is_usb, is_rotational = self.worker_manager.get_hw_caps(ns.name)
 
         # 5. Update namespace with worker state
         ns.hw_caps = hw_caps
@@ -127,6 +128,7 @@ class DeviceInfo:
         ns.hw_nopes = hw_nopes
         ns.hw_caps_state = state
         ns.is_usb = is_usb
+        ns.is_rotational = is_rotational
 
         return ns.hw_caps, ns.hw_nopes
 
@@ -188,13 +190,40 @@ class DeviceInfo:
                 rv = ''
                 fullpath = f'/sys/class/block/{device_name}/device/{suffix}'
                 with open(fullpath, 'r', encoding='utf-8') as f:  # Read information
-                    rv = f.read().strip()
+                    # Sanitize: some USB bridges return strings with embedded nulls
+                    rv = f.read().strip().replace('\x00', '')
             except (FileNotFoundError, Exception):
                 pass
             return rv
 
         rv = f'{get_str(device_name, "model")}'
         return rv.strip()
+
+    @staticmethod
+    def _is_rotational_device(device_name):
+        """Check if device is rotational (HDD) vs solid-state (SSD).
+
+        Reads /sys/block/<device>/queue/rotational:
+        - 1 = HDD (spinning disk)
+        - 0 = SSD (solid-state)
+
+        Returns:
+            bool: True if HDD (rotational), False if SSD or unknown
+        """
+        try:
+            # For partitions, get the parent disk name
+            parent = device_name.rstrip('0123456789')
+            if parent.endswith('p') and parent[:-1].rstrip('0123456789'):
+                # NVMe style: nvme0n1p1 -> nvme0n1
+                parent = parent[:-1]
+            if not parent:
+                parent = device_name
+
+            path = f'/sys/block/{parent}/queue/rotational'
+            with open(path, 'r', encoding='utf-8') as f:
+                return f.read().strip() == '1'
+        except (FileNotFoundError, PermissionError, OSError):
+            return False
 
     # ========================================================================
     # Non-blocking device discovery helpers (replacement for lsblk)
@@ -311,7 +340,8 @@ class DeviceInfo:
         # Try NVMe-style path first (plain text)
         try:
             with open(f'/sys/class/block/{name}/device/serial', 'r', encoding='utf-8') as f:
-                return f.read().strip()
+                # Sanitize: some USB bridges return strings with embedded nulls
+                return f.read().strip().replace('\x00', '')
         except (FileNotFoundError, Exception):
             pass
 
@@ -322,7 +352,8 @@ class DeviceInfo:
                 if len(data) > 4:
                     # VPD format: 00 80 00 LL [serial...] where LL is length
                     length = data[3] if len(data) > 3 else 0
-                    serial = data[4:4+length].decode('ascii', errors='ignore').strip()
+                    # Sanitize: remove nulls that some USB bridges include
+                    serial = data[4:4+length].decode('ascii', errors='ignore').strip().replace('\x00', '')
                     return serial
         except (FileNotFoundError, Exception):
             pass
@@ -472,6 +503,7 @@ class DeviceInfo:
                 entry.hw_caps_state = getattr(prev, 'hw_caps_state', ProbeState.PENDING)
                 entry.model = getattr(prev, 'model', '')
                 entry.port = getattr(prev, 'port', '')
+                entry.is_rotational = getattr(prev, 'is_rotational', False)
             else:
                 # Non-dark device: probe for metadata
                 if entry.type == 'disk':
@@ -479,6 +511,7 @@ class DeviceInfo:
                     entry.serial = self._get_serial_from_sysfs(name)
                     entry.model = self._get_device_vendor_model(name)
                     entry.port = self._get_port_from_sysfs(name)
+                    entry.is_rotational = self._is_rotational_device(name)
 
                 # Get fstype/label/uuid via blkid (skip only if dark device)
                 if not is_dark:
@@ -619,7 +652,7 @@ class DeviceInfo:
             return False
         if to == 'Blk' and not state_in(ns.state, list(ready_states) + ['Mnt', 'iMnt', 'iBlk']):
             return False
-        if to == 'Unbl' and ns.state not in ('Blk', 'iBlk'):
+        if to == 'Unbl' and ns.state != 'Blk':
             return False
 
         if to and fnmatch(to, '*%'):
@@ -776,8 +809,8 @@ class DeviceInfo:
             # Last partition of disk: rounded corner
             prefix = '└ '
         else:
-            # Regular partition: vertical line
-            prefix = '│ '
+            # Non-last partition: tee junction
+            prefix = '├ '
 
         name_str = prefix + ns.name
 
@@ -785,9 +818,60 @@ class DeviceInfo:
         emit += f'{sep}{Utils.human(ns.size_bytes):>{wids.human}}'
         emit += sep + print_str_or_dash(ns.fstype, wids.fstype)
         if ns.parent is None:
-            # Physical disk - always show thick line in LABEL field (disks don't have labels)
-            emit += sep + '━' * wids.label
-            if ns.mounts:
+            # Physical disk - show firmware capability/status centered in LABEL field
+            hw_caps = getattr(ns, 'hw_caps', '')
+            hw_nopes = getattr(ns, 'hw_nopes', '')
+            hw_summary = getattr(ns, 'hw_caps_summary', '')
+            hw_state = getattr(ns, 'hw_caps_state', ProbeState.PENDING)
+            is_usb = getattr(ns, 'is_usb', False)
+
+            fw_label = ''
+            if hw_caps:
+                fw_label = hw_summary
+            elif hw_nopes and not is_usb:
+                first_issue = hw_nopes.split(',')[0].strip()
+                fw_label = f'✗{first_issue}'
+            elif hw_state in (ProbeState.PENDING, ProbeState.PROBING):
+                if ns.state not in ('Mnt', 'iMnt', 'Blk', 'iBlk', 'Busy') and not is_usb:
+                    fw_label = '...'
+
+            if not fw_label:
+                fw_label = '---'
+
+            # Split fw_label into symbol prefix and alphanumeric text for underline rendering
+            fw_symbol = ''
+            fw_text = fw_label
+            if fw_label not in ('---', '...'):
+                for i, ch in enumerate(fw_label):
+                    if ch.isascii() and ch.isalnum():
+                        fw_symbol = fw_label[:i]
+                        fw_text = fw_label[i:]
+                        break
+
+            # Record positions so caller can underline just the alphanumeric text
+            label_start = len(emit) + len(sep)
+            centered = f'{fw_label:^{wids.label}}'
+            emit += sep + centered
+
+            if fw_symbol:
+                left_pad = (wids.label - len(fw_label)) // 2
+                ul_start = label_start + left_pad + len(fw_symbol)
+                ul_end = ul_start + len(fw_text)
+                ns._fw_underline = (ul_start, ul_end)
+            else:
+                ns._fw_underline = None
+
+            # Check for aggregated mounts (from hidden children when disk is blocked)
+            agg_mounts = getattr(ns, 'aggregated_mounts', None)
+            if agg_mounts:
+                # Show first mount + count of others (e.g., "/ + 5 more")
+                first_mount = agg_mounts[0]
+                remaining = len(agg_mounts) - 1
+                if remaining > 0:
+                    emit += f'{sep}{first_mount} + {remaining} more'
+                else:
+                    emit += f'{sep}{first_mount}'
+            elif ns.mounts:
                 # Disk has mounts - show them
                 emit += f'{sep}{",".join(ns.mounts)}'
             elif ns.marker and ns.marker.strip() and not ns.minors:
@@ -795,8 +879,8 @@ class DeviceInfo:
                 # (partitions take precedence over marker)
                 emit += f'{sep}{ns.marker}'
             else:
-                # No status - show heavy line divider (start 1 char left to fill gap)
-                emit += '━' + '━' * 30
+                # No wipe status
+                emit += f'{sep}     ---'
         else:
             # Partition: show label and mount/status info
             emit += sep + print_str_or_dash(ns.label, wids.label)
@@ -837,6 +921,13 @@ class DeviceInfo:
         # Override with red/danger color if verify failed
         if hasattr(ns, 'verify_failed_msg') and ns.verify_failed_msg:
             attr = curses.color_pair(Theme.DANGER) | curses.A_BOLD
+
+        # Make disk lines bold
+        if ns.parent is None:
+            if attr is None:
+                attr = curses.A_BOLD
+            else:
+                attr |= curses.A_BOLD
 
         return emit, attr
 
