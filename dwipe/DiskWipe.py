@@ -15,16 +15,18 @@ import threading
 import json
 import curses as cs
 from types import SimpleNamespace
+from datetime import datetime
 from console_window import (ConsoleWindow, ConsoleWindowOpts, OptionSpinner,
             IncrementalSearchBar, InlineConfirmation, Theme,
             Screen, ScreenStack, Context)
 
 from .WipeJob import WipeJob
 from .DeviceInfo import DeviceInfo
+from .DeviceWorker import ProbeState
 from .Utils import Utils
 from .PersistentState import PersistentState
 from .StructuredLogger import StructuredLogger
-from .LsblkMonitor import LsblkMonitor
+from .DeviceChangeMonitor import DeviceChangeMonitor
 
 # Screen constants
 MAIN_ST = 0
@@ -38,9 +40,26 @@ class DiskWipe:
     """Main application controller and UI manager"""
     singleton = None
 
-    def __init__(self, opts=None):
+    def __init__(self, opts=None, persistent_state=None):
         DiskWipe.singleton = self
         self.opts = opts if opts else SimpleNamespace(debug=0)
+        # Use provided persistent_state or create a new one
+        self.persistent_state = persistent_state if persistent_state else PersistentState()
+        # Set defaults for command-line options (only if not provided)
+        if not hasattr(self.opts, 'wipe_mode'):
+            self.opts.wipe_mode = '+V'
+        if not hasattr(self.opts, 'passes'):
+            self.opts.passes = 1
+        if not hasattr(self.opts, 'verify_pct'):
+            self.opts.verify_pct = 1
+        if not hasattr(self.opts, 'port_serial'):
+            self.opts.port_serial = 'Auto'
+        if not hasattr(self.opts, 'slowdown_stop'):
+            self.opts.slowdown_stop = 64
+        if not hasattr(self.opts, 'stall_timeout'):
+            self.opts.stall_timeout = 60
+        if not hasattr(self.opts, 'dense'):
+            self.opts.dense = False
         self.mounts_lines = None
         self.partitions = {}  # a dict of namespaces keyed by name
         self.wids = None
@@ -69,9 +88,6 @@ class DiskWipe:
             on_cancel=self._on_filter_cancel
         )
 
-        # Initialize persistent state
-        self.persistent_state = PersistentState()
-
     def _start_wipe(self):
         """Start the wipe job after confirmation"""
         if self.confirmation.identity and self.confirmation.identity in self.partitions:
@@ -81,7 +97,8 @@ class DiskWipe:
                 delattr(part, 'verify_failed_msg')
 
             # Get the wipe type from user's choice
-            wipe_type = self.confirmation.input_buffer.strip()
+            # ConsoleWindow already canonicalizes case, just strip the '*' recommendation marker
+            wipe_type = self.confirmation.input_buffer.strip().rstrip('*')
 
             # Check if it's a firmware wipe
             if wipe_type not in ('Zero', 'Rand'):
@@ -92,11 +109,14 @@ class DiskWipe:
                     self.win.passthrough_mode = False
                     return
 
-                # Get command args from hw_caps
-                command_args = part.hw_caps[wipe_type]
+                # Get command args for this wipe type
+                from .DrivePreChecker import DrivePreChecker
+                command_args = DrivePreChecker.get_wipe_command_args(wipe_type)
 
                 # Import firmware task classes
-                from .FirmwareWipeTask import NvmeWipeTask, SataWipeTask
+                from .FirmwareWipeTask import (NvmeWipeTask, SataWipeTask,
+                                               StandardPrecheckTask,
+                                               FirmwarePreVerifyTask, FirmwarePostVerifyTask)
 
                 # Determine task type based on device name
                 if part.name.startswith('nvme'):
@@ -105,7 +125,7 @@ class DiskWipe:
                     task_class = SataWipeTask
 
                 # Create firmware task
-                task = task_class(
+                fw_task = task_class(
                     device_path=f'/dev/{part.name}',
                     total_size=part.size_bytes,
                     opts=self.opts,
@@ -116,13 +136,39 @@ class DiskWipe:
                 # Store wipe type for logging
                 part.wipe_type = wipe_type
 
-                # Create WipeJob with single firmware task
+                # Build task list with precheck, pre/post firmware verification
+                # (Software verify is not supported for firmware wipes)
+                precheck = StandardPrecheckTask(
+                    device_path=f'/dev/{part.name}',
+                    total_size=part.size_bytes,
+                    opts=self.opts,
+                    selected_wipe_type=wipe_type,
+                    command_method=command_args
+                )
+
+                pre_verify = FirmwarePreVerifyTask(
+                    device_path=f'/dev/{part.name}',
+                    total_size=part.size_bytes,
+                    opts=self.opts
+                )
+
+                post_verify = FirmwarePostVerifyTask(
+                    device_path=f'/dev/{part.name}',
+                    total_size=part.size_bytes,
+                    opts=self.opts
+                )
+
+                tasks = [precheck, pre_verify, fw_task, post_verify]
+
+                # Create WipeJob with firmware task (and optional verify task)
                 part.job = WipeJob(
                     device_path=f'/dev/{part.name}',
                     total_size=part.size_bytes,
                     opts=self.opts,
-                    tasks=[task]
+                    tasks=tasks
                 )
+                # Firmware wipes (SATA secure erase, NVMe sanitize) write zeros
+                part.job.expected_pattern = "zeroed"
                 part.job.thread = threading.Thread(target=part.job.run_tasks)
                 part.job.thread.start()
 
@@ -152,6 +198,7 @@ class DiskWipe:
                                               part.size_bytes, opts=self.opts)
                 self.job_cnt += 1
                 self.set_state(part, to='0%')
+                part.hw_nopes, part.hw_caps = {}, {}
             finally:
                 # Restore original wipe_mode
                 self.opts.wipe_mode = old_wipe_mode
@@ -164,6 +211,14 @@ class DiskWipe:
         """Start the verify job after confirmation"""
         if self.confirmation.identity and self.confirmation.identity in self.partitions:
             part = self.partitions[self.confirmation.identity]
+
+            # Safety check: Firmware wipes have built-in verification - prevent manual verify
+            if self._is_firmware_wipe_marker(part):
+                part.mounts = ['⚠ Firmware wipes have built-in verification - standard verify not allowed']
+                self.confirmation.cancel()
+                self.win.passthrough_mode = False
+                return
+
             # Clear any previous verify failure message when starting verify
             if hasattr(part, 'verify_failed_msg'):
                 delattr(part, 'verify_failed_msg')
@@ -187,6 +242,38 @@ class DiskWipe:
             self.persistent_state.set_device_locked(ns, to == 'Blk')
 
         return result
+
+    def _is_firmware_wipe(self, part):
+        """Check if partition has an active firmware wipe job (unstoppable)."""
+        if not part.job or part.job.done:
+            return False
+        from .FirmwareWipeTask import FirmwareWipeTask
+        current_task = getattr(part.job, 'current_task', None)
+        return current_task and isinstance(current_task, FirmwareWipeTask)
+
+    def _is_firmware_wipe_marker(self, part):
+        """Check if partition's wipe marker indicates a firmware wipe.
+
+        Firmware wipes have modes like 'Crypto', 'Enhanced', 'Sanitize-Crypto', etc.
+        Software wipes have modes like 'Zero' or 'Rand'.
+        """
+        if part.state not in ('s', 'W'):
+            return False
+
+        marker = WipeJob.read_marker_buffer(part.name)
+        if not marker:
+            return False
+
+        # Check if mode is a firmware wipe (not 'Zero' or 'Rand')
+        mode = getattr(marker, 'mode', None)
+        return mode and mode not in ('Zero', 'Rand')
+
+    def _has_any_firmware_wipes(self):
+        """Check if any firmware wipes are currently running."""
+        for part in self.partitions.values():
+            if self._is_firmware_wipe(part):
+                return True
+        return False
 
     def do_key(self, key):
         """Handle keyboard input"""
@@ -253,15 +340,7 @@ class DiskWipe:
         line += ' [S]top' if self.job_cnt > 0 else ''
         line = f'{line:<20} '
         line += self.filter_bar.get_display_string(prefix=' /') or ' /'
-        # Show mode spinner with key
-        line += f' [m]ode={self.opts.wipe_mode}'
-        # Show passes spinner with key
-        line += f' [P]ass={self.opts.passes}'
-        # Show verification percentage spinner with key
-        line += f' [V]pct={self.opts.verify_pct}%'
-        line += f' [p]ort={self.opts.port_serial}'
-        # line += ' !:scan [h]ist [t]heme ?:help [q]uit'
-        line += ' [h]ist [t]heme ?:help [q]uit'
+        line += ' [r]escan [h]ist [t]heme ?:help [q]uit'
         return line[1:]
 
     def get_actions(self, part):
@@ -272,22 +351,27 @@ class DiskWipe:
             part = ctx.partition
             name = part.name
             self.pick_is_running = bool(part.job)
-            if self.test_state(part, to='STOP'):
+            # Show stop action only for non-firmware wipes
+            if self.test_state(part, to='STOP') and not self._is_firmware_wipe(part):
                 actions['s'] = 'stop'
             elif self.test_state(part, to='0%'):
                 actions['w'] = 'wipe'
-                if part.parent is None:
+                # DEL only for whole disks that are SATA or NVMe
+                if part.parent is None and part.name[:2] in ('sd', 'hd', 'nv'):
                     actions['DEL'] = 'DEL'
             # Can verify:
-            # 1. Anything with wipe markers (states 's' or 'W')
+            # 1. Anything with wipe markers (states 's' or 'W') - EXCEPT firmware wipes
             # 2. Unmarked whole disks (no parent, state '-' or '^') WITHOUT partitions that have filesystems
             # 3. Unmarked partitions without filesystems (has parent, state '-' or '^', no fstype)
             # 4. Only if verify_pct > 0
             # This prevents verifying filesystems which is nonsensical
+            # NOTE: Firmware wipes have built-in pre/post verification, so manual verify is disallowed
             verify_pct = getattr(self.opts, 'verify_pct', 0)
             if not part.job and verify_pct > 0:
                 if part.state in ('s', 'W'):
-                    actions['v'] = 'verify'
+                    # Do NOT allow verify on firmware wipes - they have built-in verification
+                    if not self._is_firmware_wipe_marker(part):
+                        actions['v'] = 'verify'
                 elif part.state in ('-', '^'):
                     # For whole disks (no parent), only allow verify if no partitions have filesystems
                     # For partitions, only allow if no filesystem
@@ -344,18 +428,47 @@ class DiskWipe:
         """ Look for wipeable disks w/o hardware info """
         if not self.dev_info:
             return
+        from .DeviceWorker import ProbeState
         for  ns in self.partitions.values():
             if ns.parent:
                 continue
-            if ns.port.startswith('USB'):
-                continue
+#           if ns.port.startswith('USB'):
+#               continue
             if ns.name[:2] not in ('nv', 'sd', 'hd'):
                 continue
-            if ns.hw_nopes or ns.hw_caps:  # already done
+            # Skip if already successfully probed (READY state) with actual results
+            # But re-probe if results are empty (unknown after wipe) or if probe FAILED
+            if ns.hw_caps_state == ProbeState.READY and (ns.hw_caps or ns.hw_nopes):
+                continue  # Already have results
+            # Device must not be actively wiping (to avoid blocking)
+            if ns.job:
                 continue
-            if self.test_state(ns, to='0%'):
-                self.dev_info.get_hw_capabilities(ns)
+            # Don't probe mounted/blocked devices
+            if ns.state in ('Mnt', 'iMnt', 'Blk', 'iBlk'):
+                continue
+            # Reset state to PENDING to force a re-probe if needed
+            # (state stays READY even after wipe clears results)
+            if not (ns.hw_caps or ns.hw_nopes):
+                ns.hw_caps_state = ProbeState.PENDING
+            # Probe any device that might be ready (s, W, -, ^, or wipeable state)
+            self.dev_info.get_hw_capabilities(ns)
 
+    def _poll_hw_caps_updates(self):
+        """Poll for hw_caps probe completion without full device refresh.
+
+        Called every 0.25 seconds in main loop to quickly show hw_caps
+        results as soon as worker threads complete probes.
+        """
+        if not self.dev_info:
+            return
+        from .DeviceWorker import ProbeState
+        # Only update devices that are still probing
+        for ns in self.partitions.values():
+            if ns.parent:
+                continue
+            # Update any device that's still PENDING or PROBING
+            if ns.hw_caps_state in (ProbeState.PENDING, ProbeState.PROBING):
+                self.dev_info.get_hw_capabilities(ns)
 
     def main_loop(self):
         """Main event loop"""
@@ -379,22 +492,24 @@ class DiskWipe:
             pick_attr=cs.A_REVERSE,  # Use reverse video for pick highlighting
             ctrl_c_terminates=False,
         )
-        lsblk_monitor = LsblkMonitor(check_interval=0.2)
-        lsblk_monitor.start()
-        print("Starting first lsblk...")
+        device_monitor = DeviceChangeMonitor(check_interval=1.0)
+        device_monitor.start()
+        print("Discovering devices...")
+        # Create persistent worker manager for hw_caps probing
+        # This is reused across device refreshes to allow probes to complete
+        from .DeviceWorker import DeviceWorkerManager
+        from .DrivePreChecker import DrivePreChecker
+        worker_manager = DeviceWorkerManager(DrivePreChecker())
         # Initialize device info and pick range before first draw
-        info = DeviceInfo(opts=self.opts, persistent_state=self.persistent_state)
-        lsblk_output = None
-        while not lsblk_output:
-            lsblk_output = lsblk_monitor.get_and_clear()
-            self.partitions = info.assemble_partitions(self.partitions, lsblk_output)
-            if lsblk_output:
-                # print(lsblk_output, '\n\n')
-                print('got ... got lsblk result')
-                if self.opts.dump_lsblk:
-                    DeviceInfo.dump(self.partitions, title="after assemble_partitions")
-                    exit(1)
-            time.sleep(0.2)
+        info = DeviceInfo(opts=self.opts, persistent_state=self.persistent_state,
+                         worker_manager=worker_manager)
+        self.partitions = info.assemble_partitions(self.partitions)
+        # Start probing hw_caps immediately instead of waiting for first 3s refresh
+        self.dev_info = info
+        self.get_hw_caps_when_needed()
+        if self.opts.dump_lsblk:
+            DeviceInfo.dump(self.partitions, title="after assemble_partitions")
+            exit(1)
 
         self.win = ConsoleWindow(opts=win_opts)
         # Initialize screen stack
@@ -403,12 +518,8 @@ class DiskWipe:
         spin = self.spin = OptionSpinner(stack=self.stack)
         spin.default_obj = self.opts
         spin.add_key('dense', 'D - dense/spaced view', vals=[False, True])
-        spin.add_key('port_serial', 'p - disk port info', vals=['Auto', 'On', 'Off'])
-        spin.add_key('slowdown_stop', 'W - stop if disk slows Nx', vals=[64, 256, 0, 4, 16])
-        spin.add_key('stall_timeout', 'T - stall timeout (sec)', vals=[60, 120, 300, 600, 0,])
-        spin.add_key('verify_pct', 'V - verification %', vals=[0, 2, 5, 10, 25, 50, 100])
-        spin.add_key('passes', 'P - wipe pass count', vals=[1, 2, 4])
-        spin.add_key('wipe_mode', 'm - wipe mode', vals=['-V', '+V'])
+        spin.add_key('hist_time_format', 'a - time format',
+                     vals=['ago+time', 'ago', 'time'], scope=LOG_ST)
 
         spin.add_key('quit', 'q,x - quit program', keys='qx', genre='action')
         spin.add_key('screen_escape', 'ESC- back one screen',
@@ -419,9 +530,10 @@ class DiskWipe:
         spin.add_key('verify', 'v - verify device', genre='action')
         spin.add_key('stop', 's - stop wipe', genre='action')
         spin.add_key('block', 'b - block/unblock disk', genre='action')
-        spin.add_key('delete_device', 'DEL - remove disk from lsblk',
+        spin.add_key('delete_device', 'DEL - remove/unbind disk from system',
                          genre='action', keys=(cs.KEY_DC))
-        spin.add_key('scan_all_devices', '! - rescan all devices', genre='action')
+        spin.add_key('scan_all_devices', 'r - rescan devices and recheck capabilities',
+                     genre='action', scope=MAIN_ST)
         spin.add_key('stop_all', 'S - stop ALL wipes', genre='action')
         spin.add_key('help', '? - show help screen', genre='action')
         spin.add_key('history', 'h - show wipe history', genre='action')
@@ -430,21 +542,23 @@ class DiskWipe:
         spin.add_key('spin_theme', 't - theme', genre='action', scope=THEME_ST)
         spin.add_key('header_mode', '_ - header style', vals=['Underline', 'Reverse', 'Off'])
         spin.add_key('expand', 'e - expand history entry', genre='action', scope=LOG_ST)
+        spin.add_key('copy', 'c - copy entry to clipboard', genre='action', scope=LOG_ST)
         spin.add_key('show_keys', 'K - show keys (demo mode)', genre='action')
-        self.opts.theme = ''
-        self.persistent_state.restore_updated_opts(self.opts)
+        # Load theme from persistent state
+        self.opts.theme = self.persistent_state.state.get('theme', '')
         Theme.set(self.opts.theme)
         self.win.set_handled_keys(self.spin.keys)
 
-        # Start background lsblk monitor
+        # Background device change monitor started above
 
-        self.get_hw_caps_when_needed()
-        self.dev_info = info
+        # self.dev_info already set during startup probe above
+        self.worker_manager = worker_manager
         pick_range = info.get_pick_range()
         self.win.set_pick_range(pick_range[0], pick_range[1])
 
 
         check_devices_mono = time.monotonic()
+        cached_worker_state = {}  # Track marker/hw_caps state to detect updates
 
         try:
             while True:
@@ -459,20 +573,44 @@ class DiskWipe:
                 # Handle actions using perform_actions
                 self.stack.perform_actions(spin)
 
-                # Check for new lsblk data from background monitor
-                lsblk_output = lsblk_monitor.get_and_clear()
+                # Poll for hw_caps completion without full device refresh (every 0.25s)
+                # This lets us show results quickly even though commands take 1-3 seconds
+                self._poll_hw_caps_updates()
+
+                # Check for device changes from background monitor
+                devices_changed = device_monitor.get_and_clear()
                 time_since_refresh = time.monotonic() - check_devices_mono
 
-                if lsblk_output or time_since_refresh > 3.0:
-                    # Refresh if: device changes detected OR periodic refresh (3s default)
-                    info = DeviceInfo(opts=self.opts, persistent_state=self.persistent_state)
-                    self.partitions = info.assemble_partitions(self.partitions, lsblk_output=lsblk_output)
-                    self.get_hw_caps_when_needed()
+                # Build current worker state for comparison
+                current_worker_state = {}
+                if self.worker_manager:
+                    for device_name, part in self.partitions.items():
+                        current_worker_state[device_name] = {
+                            'marker': part.marker,
+                            'hw_caps_state': part.hw_caps_state
+                        }
+                    # Check if worker has any updates (markers or hw_caps changes)
+                    worker_has_updates = (
+                        self.worker_manager.has_updates(cached_worker_state)
+                    )
+                else:
+                    worker_has_updates = False
+
+                if (devices_changed or worker_has_updates or
+                    time_since_refresh > 3.0):
+                    # Refresh if: device changes, worker updates, OR periodic (3s default)
+                    info = DeviceInfo(opts=self.opts, persistent_state=self.persistent_state,
+                                     worker_manager=self.worker_manager)
+                    self.partitions = info.assemble_partitions(self.partitions)
                     self.dev_info = info
                     # Update pick range to highlight NAME through SIZE fields
                     pick_range = info.get_pick_range()
                     self.win.set_pick_range(pick_range[0], pick_range[1])
+                    # Probe hw_caps for devices that need it (only once per refresh, not every draw)
+                    self.get_hw_caps_when_needed()
                     check_devices_mono = time.monotonic()
+                    # Update cached state after refresh
+                    cached_worker_state = current_worker_state.copy()
 
                 # Save any persistent state changes
                 self.persistent_state.save_updated_opts(self.opts)
@@ -481,7 +619,10 @@ class DiskWipe:
                 self.win.clear()
         finally:
             # Clean up monitor thread on exit
-            lsblk_monitor.stop()
+            device_monitor.stop()
+            # Clean up persistent worker manager
+            if hasattr(self, 'worker_manager') and self.worker_manager:
+                self.worker_manager.stop_all()
 
 class DiskWipeScreen(Screen):
     """ TBD """
@@ -505,35 +646,30 @@ class MainScreen(DiskWipeScreen):
         self.persist_port_serial = set()
 
 
-    def _port_serial_line(self, partition):
+    def _port_serial_line(self, partition, has_children=True):
         wids = self.app.wids
-        wid = wids.state if wids else 5
-        sep, key_str = '  ', ''
-        port, serial = partition.port, partition.serial
-        if partition.hw_caps or partition.hw_nopes:
-            lead = 'CAPS' if partition.hw_caps else 'ERRS'
-            infos = partition.hw_caps if partition.hw_caps else partition.hw_nopes
-            key_str = f'   Fw{lead}: ' + ','.join(list(infos.keys()))
-        return f'{"":>{wid}}{sep}│   └────── {port:<12} {serial}{key_str}'
+        sep = '  '
+        # Sanitize port/serial - some USB bridges return strings with embedded nulls
+        port = partition.port.replace('\x00', '') if partition.port else ''
+        serial = partition.serial.replace('\x00', '') if partition.serial else ''
 
-    def draw_screen(self):
-        """Draw the main device list"""
+        # Get column widths (with defaults if wids not yet initialized)
+        wid_state = wids.state if wids else 5
+
+        # Use corner └ if no children below, or vertical │ if there are children to connect to
+        connector = '│' if has_children else ' '
+
+        # Build base line: state padding + connector + port/serial
+        base = f'{"":>{wid_state}}{sep}{connector}   └────── {port:<12} {serial}'
+
+        return base
+
+    def do_job_maintenance(self):
+        """ Check all the jobs in progress and advance their state
+            appropriately.
+        """
         app = self.app
-
-        def wanted(name):
-            return not app.filter or app.filter.search(name)
-
-        app.win.set_pick_mode(True)
-        if app.opts.port_serial != 'Auto':
-            self.persist_port_serial = set() # name of disks
-        else: # if the disk goes away, clear persistence
-            for name in list(self.persist_port_serial):
-                if name not in app.partitions:
-                    self.persist_port_serial.discard(name)
-
-        # First pass: process jobs and collect visible partitions
-        visible_partitions = []
-        for name, partition in app.partitions.items():
+        for _, partition in app.partitions.items():
             partition.line = None
             if partition.job:
                 if partition.job.done:
@@ -629,6 +765,7 @@ class MainScreen(DiskWipeScreen):
                         partition.job = None
                         partition.marker_checked = False  # Reset to "dont-know" - will re-read on next scan
                         partition.marker = ''  # Clear stale marker string to avoid showing old data during re-read
+                        partition.monitor_marker = False  # Stop monitoring verify job
                     else:
                         # Wipe job completed (with or without auto-verify)
                         # Check if stopped during verify phase (after successful write)
@@ -716,8 +853,9 @@ class MainScreen(DiskWipeScreen):
                         partition.job = None
                         partition.marker_checked = False  # Reset to "dont-know" - will re-read on next scan
                         partition.marker = ''  # Clear stale marker string to avoid showing old data during re-read
+                        partition.monitor_marker = True  # Start monitoring the new marker
             if partition.job:
-                elapsed, pct, rate, until = partition.job.get_status()
+                elapsed, pct, rate, until, more_state = partition.job.get_status()
 
                 # Get task display name (Zero, Rand, Crypto, Verify, etc.)
                 task_name = ""
@@ -731,26 +869,76 @@ class MainScreen(DiskWipeScreen):
                         partition.mounts = [f'{task_name} {pct} {elapsed} -{until} {rate}']
                     else:
                         partition.mounts = [f'{task_name} {pct} {elapsed}']
+                    if more_state:
+                        partition.mounts[0] += f' {more_state}'
                 else:
                     partition.state = pct
                     # Build progress line with task name
                     progress_parts = [task_name, elapsed, f'-{until}', rate]
 
-                    # Only show slowdown/stall if job tracks these metrics
-                    # (WriteTask does, VerifyTask and FirmwareWipeTask don't)
-                    if hasattr(partition.job, 'max_slowdown_ratio') and hasattr(partition.job, 'max_stall_secs'):
+                    # Only show slowdown/stall for WriteTask (not VerifyTask or FirmwareWipeTask)
+                    from .FirmwareWipeTask import FirmwareWipeTask
+                    from .WriteTask import WriteTask
+                    current_task = partition.job.current_task
+                    if current_task and isinstance(current_task, WriteTask) and not isinstance(current_task, FirmwareWipeTask):
                         slowdown = partition.job.max_slowdown_ratio
                         stall = partition.job.max_stall_secs
                         progress_parts.extend([f'÷{slowdown}', f'𝚫{Utils.ago_str(stall)}'])
 
+                    if more_state:
+                        progress_parts.append(more_state)
+
                     partition.mounts = [' '.join(progress_parts)]
 
             if partition.parent and partition.parent in app.partitions and (
-                    app.partitions[partition.parent].state == 'Blk'):
+                    app.partitions[partition.parent].state in ('Blk', 'iBlk')):
                 continue
 
-            if wanted(name) or partition.job:
-                visible_partitions.append(partition)
+
+    def draw_screen(self):
+        """Draw the main device list"""
+        app = self.app
+
+        def wanted(name):
+            return not app.filter or app.filter.search(name)
+
+        self.do_job_maintenance()
+
+        app.win.set_pick_mode(True)
+        if app.opts.port_serial != 'Auto':
+            self.persist_port_serial = set() # name of disks
+        else: # if the disk goes away, clear persistence
+            for name in list(self.persist_port_serial):
+                if name not in app.partitions:
+                    self.persist_port_serial.discard(name)
+
+        # process jobs and collect visible partitions, sorted by disk then partition
+        visible_partitions = []
+        # Get disks sorted alphabetically
+        disks = sorted([p for p in app.partitions.values() if p.parent is None],
+                       key=lambda p: p.name)
+        for disk in disks:
+            if wanted(disk.name) or disk.job:
+                visible_partitions.append(disk)
+            # Add partitions for this disk, sorted alphabetically
+            parts = sorted([p for p in app.partitions.values() if p.parent == disk.name],
+                           key=lambda p: p.name)
+            # If disk is directly blocked, hide children and aggregate their mounts
+            if disk.state == 'Blk':
+                # Collect all mounts from children, sort with "/" first (by name/length)
+                all_mounts = []
+                for part in parts:
+                    all_mounts.extend(part.mounts)
+                # Sort: "/" first, then by name (implicitly by length since "/" is shortest)
+                all_mounts.sort(key=lambda m: (m != '/', m))
+                disk.aggregated_mounts = all_mounts
+                # Skip adding children to visible list
+                continue
+            else:
+                disk.aggregated_mounts = None
+            for part in parts:
+                if wanted(part.name) or part.job:
+                    visible_partitions.append(part)
 
         # Re-infer parent states (like 'Busy') after updating child job states
         DeviceInfo.set_all_states(app.partitions)
@@ -781,7 +969,16 @@ class MainScreen(DiskWipeScreen):
             # Create context with partition reference
             ctx = Context(genre='disk' if partition.parent is None else 'partition',
                          partition=partition)
-            app.win.add_body(partition.line, attr=attr, context=ctx)
+            # For disks, underline just the alphanumeric part of fw capability text
+            fw_ul = getattr(partition, '_fw_underline', None)
+            if fw_ul:
+                ul_start, ul_end = fw_ul
+                app.win.add_body(partition.line[:ul_start], attr=attr, context=ctx)
+                ul_attr = (attr or cs.A_NORMAL) | cs.A_UNDERLINE
+                app.win.add_body(partition.line[ul_start:ul_end], attr=ul_attr, resume=True)
+                app.win.add_body(partition.line[ul_end:], attr=attr, resume=True)
+            else:
+                app.win.add_body(partition.line, attr=attr, context=ctx)
             if partition.parent is None and app.opts.port_serial != 'Off':
                 doit = bool(app.opts.port_serial == 'On')
                 if not doit:
@@ -790,16 +987,19 @@ class MainScreen(DiskWipeScreen):
                     doit = True
                     self.persist_port_serial.add(partition.name)
                 if doit:
-                    line = self._port_serial_line(partition)
-                    app.win.add_body(line, attr=attr, context=Context(genre='DECOR'))
+                    # Check if this disk has any visible child partitions
+                    has_children = partition.name in parent_last_child
+                    line = self._port_serial_line(partition, has_children)
+                    port_attr = (attr or cs.A_NORMAL) & ~cs.A_BOLD
+                    app.win.add_body(line, attr=port_attr, context=Context(genre='DECOR'))
 
             # Show inline confirmation prompt if this is the partition being confirmed
             if app.confirmation.active and app.confirmation.identity == partition.name:
                 # Build confirmation message
                 if app.confirmation.action_type == 'wipe':
-                    msg = f'⚠️  WIPE {partition.name}'
+                    msg = f'⚠️ WIPE'
                 else:  # verify
-                    msg = f'⚠️  VERIFY {partition.name} [writes marker]'
+                    msg = f'⚠️ VERIFY [writes marker]'
 
                 # Add mode-specific prompt (base message without input)
                 if app.confirmation.mode == 'yes':
@@ -807,11 +1007,11 @@ class MainScreen(DiskWipeScreen):
                 elif app.confirmation.mode == 'identity':
                     msg += f" - Type '{partition.name}': "
                 elif app.confirmation.mode == 'choices':
-                    choices_str = ', '.join(app.confirmation.choices)
-                    msg += f" - Choose ({choices_str}): "
+                    choices_str = ','.join(app.confirmation.choices)
+                    msg += f" Choice ({choices_str}): "
 
                 # Position message at fixed column (reduced from 28 to 20)
-                msg = ' ' * 20 + msg
+                msg = ' ' * 5 + msg
 
                 # Add confirmation message base as DECOR (non-pickable)
                 app.win.add_body(msg, attr=cs.color_pair(Theme.DANGER) | cs.A_BOLD,
@@ -863,9 +1063,18 @@ class MainScreen(DiskWipeScreen):
         """Handle quit action (q or x key pressed)"""
         app = self.app
 
+        # Check for firmware wipes - cannot quit while they're running
+        if app._has_any_firmware_wipes():
+            # Show alert - cannot quit during firmware wipe
+            app.filter_bar._text = 'Cannot quit: firmware wipe running'
+            return
+
         def stop_if_idle(part):
             if part.state[-1] == '%':
                 if part.job and not part.job.done:
+                    # Skip firmware wipes - they cannot be stopped
+                    if app._is_firmware_wipe(part):
+                        return 1  # Count as running but don't stop
                     part.job.do_abort = True
             return 1 if part.job else 0
 
@@ -897,9 +1106,23 @@ class MainScreen(DiskWipeScreen):
                 if app.test_state(part, to='0%'):
                     self.clear_hotswap_marker(part)
                     # Build choices: Zero, Rand, and any firmware wipe types
+                    # Sort all by rank (worst to best) with '*' on recommended (last) one
+                    from .DrivePreChecker import DrivePreChecker
                     choices = ['Zero', 'Rand']
+                    fw_modes = []
                     if part.hw_caps:
-                        choices.extend(list(part.hw_caps.keys()))
+                        # Strip '*' from hw_caps modes (already has it from display string)
+                        fw_modes = [m.strip().rstrip('*') for m in part.hw_caps.split(',')]
+                        choices.extend(fw_modes)
+                    # Use HDD rankings (prefer software wipes) ONLY if:
+                    # 1. Device reports as rotational, AND
+                    # 2. Device has no crypto-capable firmware wipes
+                    # Note: 'Enhanced' is available on HDDs too (slow overwrite, not crypto)
+                    # Only SCrypto/Crypto/FCrypto definitively indicate SSD with crypto
+                    is_rotational = getattr(part, 'is_rotational', False)
+                    has_crypto_fw = any(m in fw_modes for m in ('SCrypto', 'Crypto', 'FCrypto'))
+                    use_hdd_ranking = is_rotational and not has_crypto_fw
+                    choices = DrivePreChecker.sort_modes_by_rank(choices, is_rotational=use_hdd_ranking)
                     app.confirmation.start(action_type='wipe',
                                identity=part.name, mode='choices', choices=choices)
                     app.win.passthrough_mode = True
@@ -913,6 +1136,12 @@ class MainScreen(DiskWipeScreen):
             # Use get_actions() to ensure we use the same logic as the header display
             _, actions = app.get_actions(part)
             if 'v' in actions:
+                # Safety check: Prevent verification on firmware wipes
+                # (Firmware wipes have built-in pre/post verification)
+                if self._is_firmware_wipe_marker(part):
+                    part.mounts = ['⚠ Firmware wipes have built-in verification - standard verify not allowed']
+                    return
+
                 self.clear_hotswap_marker(part)
                 # Check if this is an unmarked disk/partition (potential data loss risk)
                 # Whole disks (no parent) or partitions without filesystems need confirmation
@@ -934,38 +1163,119 @@ class MainScreen(DiskWipeScreen):
     def scan_all_devices_ACTION(self):
         """ Trigger a re-scan of all devices to make the appear
         quicker in the list"""
+        # Show temporary feedback
+        self.app.win.flash('Scanning devices and rechecking firmware capabilities...', duration=0.75)
+
+        # SCSI host rescan (for SATA devices)
         base_path = '/sys/class/scsi_host'
-        if not os.path.exists(base_path):
-            return
-        for host in os.listdir(base_path):
-            scan_file = os.path.join(base_path, host, 'scan')
-            if os.path.exists(scan_file):
-                try:
-                    with open(scan_file, 'w', encoding='utf-8') as f:
-                        f.write("- - -")
-                except Exception:
-                    pass
+        if os.path.exists(base_path):
+            for host in os.listdir(base_path):
+                scan_file = os.path.join(base_path, host, 'scan')
+                if os.path.exists(scan_file):
+                    try:
+                        with open(scan_file, 'w', encoding='utf-8') as f:
+                            f.write("- - -")
+                    except Exception:
+                        pass
+
+        # Rebind any unbound NVMe devices
+        self._rebind_nvme_devices()
+
+        # Reset hw_caps stickiness for all devices so they'll be re-probed
+        # This allows detecting hardware state changes after sleep/wake cycles
+        if self.app.worker_manager:
+            for partition in self.app.partitions.values():
+                # Queue worker to re-probe this device's capabilities
+                if partition.parent: # only need to do whole disks
+                    continue
+                self.app.worker_manager.request_hw_caps(partition.name)
+                # Clear cached values so UI refreshes with new probing state
+                partition.hw_caps = ''
+                partition.hw_nopes = ''
+                partition.hw_caps_state = ProbeState.PENDING
 
     def delete_device_ACTION(self):
-        """ DEL key -- Cause the OS to drop a sata device so it
-            can be replaced sooner """
+        """ DEL key -- Cause the OS to drop a SATA device or unbind an NVMe device
+            so it can be replaced sooner """
         app = self.app
         ctx = app.win.get_picked_context()
         if ctx and hasattr(ctx, 'partition'):
             part = ctx.partition
             if not part or part.parent or not app.test_state(part, to='0%'):
                 return
-            path = f"/sys/block/{part.name}/device/delete"
-            if os.path.exists(path):
-                try:
-                    with open(path, 'w', encoding='utf-8') as f:
-                        f.write("1")
-                    return True
-                except Exception:
-                    pass
+            # NVMe unbind - write PCI address to driver unbind file
+            if part.name.startswith('nvme'):
+                pci_addr = self._get_nvme_pci_address(part.name)
+                if pci_addr:
+                    unbind_path = "/sys/bus/pci/drivers/nvme/unbind"
+                    if os.path.exists(unbind_path):
+                        try:
+                            with open(unbind_path, 'w', encoding='utf-8') as f:
+                                f.write(pci_addr)
+                            return True
+                        except Exception:
+                            pass
+            # SATA/IDE delete - write 1 to device delete file
+            else:
+                path = f"/sys/block/{part.name}/device/delete"
+                if os.path.exists(path):
+                    try:
+                        with open(path, 'w', encoding='utf-8') as f:
+                            f.write("1")
+                        return True
+                    except Exception:
+                        pass
+
+    def _get_nvme_pci_address(self, device_name):
+        """Get the full PCI address for an NVMe device (e.g., '0000:01:00.0')
+
+        The sysfs path may contain multiple PCI addresses (bridges), so we need
+        the last one before /nvme/ which is the actual NVMe controller.
+        """
+        try:
+            sysfs_path = f'/sys/class/block/{device_name}'
+            if os.path.exists(sysfs_path):
+                real_path = os.path.realpath(sysfs_path)
+                # Find all PCI addresses and take the last one (the NVMe controller)
+                pci_matches = re.findall(r'(0000:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f])', real_path, re.I)
+                if pci_matches:
+                    return pci_matches[-1]
+        except Exception:
+            pass
+        return None
+
+    def _rebind_nvme_devices(self):
+        """Find and rebind any unbound NVMe devices.
+
+        Scans PCI devices for NVMe controllers (class 0x010802) that have no
+        driver bound, and attempts to bind them to the nvme driver.
+        """
+        pci_devices = '/sys/bus/pci/devices'
+        nvme_bind = '/sys/bus/pci/drivers/nvme/bind'
+        if not os.path.exists(pci_devices) or not os.path.exists(nvme_bind):
+            return
+
+        for pci_addr in os.listdir(pci_devices):
+            device_path = os.path.join(pci_devices, pci_addr)
+            # Check if this is an NVMe controller (class 0x010802)
+            class_file = os.path.join(device_path, 'class')
+            try:
+                with open(class_file, 'r', encoding='utf-8') as f:
+                    device_class = f.read().strip()
+                if device_class != '0x010802':
+                    continue
+                # Check if driver is already bound
+                driver_link = os.path.join(device_path, 'driver')
+                if os.path.exists(driver_link):
+                    continue
+                # Try to bind to nvme driver
+                with open(nvme_bind, 'w', encoding='utf-8') as f:
+                    f.write(pci_addr)
+            except Exception:
+                pass
 
     def stop_ACTION(self):
-        """Handle 's' key"""
+        """Handle 's' key - stop current wipe (but not firmware wipes)"""
         app = self.app
         if app.pick_is_running:
             ctx = app.win.get_picked_context()
@@ -973,15 +1283,21 @@ class MainScreen(DiskWipeScreen):
                 part = ctx.partition
                 if part.state[-1] == '%':
                     if part.job and not part.job.done:
+                        # Skip firmware wipes - they cannot be safely stopped
+                        if app._is_firmware_wipe(part):
+                            return
                         part.job.do_abort = True
 
 
     def stop_all_ACTION(self):
-        """Handle 'S' key"""
+        """Handle 'S' key - stop all wipes (but not firmware wipes)"""
         app = self.app
         for part in app.partitions.values():
             if part.state[-1] == '%':
                 if part.job and not part.job.done:
+                    # Skip firmware wipes - they cannot be safely stopped
+                    if app._is_firmware_wipe(part):
+                        continue
                     part.job.do_abort = True
 
     def block_ACTION(self):
@@ -1024,6 +1340,20 @@ class HelpScreen(DiskWipeScreen):
         if spinner:
             spinner.show_help_nav_keys(app.win)
             spinner.show_help_body(app.win)
+
+        # Add CLI Options section
+        app.win.add_body('Command Line Arguments:', attr=cs.A_UNDERLINE)
+        opts, wid = app.opts, 8
+        cli_options = [
+            f'--mode: . . . .  {opts.mode:<{wid}} Wipe mode',
+            f'--passes: . . .  {opts.passes:<{wid}} Passes for software wipes',
+            f'--verify-pct: .  {opts.verify_pct:<{wid}} Verification %',
+            f'--port-serial:   {opts.port_serial:<{wid}} Show port/serial/FwCAPS',
+            f'--slowdown-stop: {opts.slowdown_stop:<{wid}} Stop if disk slows',
+            f'--stall-timeout: {opts.stall_timeout:<{wid}} Stall timeout in sec',
+        ]
+        for opt in cli_options:
+            app.win.add_body(opt, attr=cs.A_DIM)
 
 
 
@@ -1087,6 +1417,15 @@ class HistoryScreen(DiskWipeScreen):
 
     def draw_screen(self):
         """Draw the history screen with structured log entries"""
+
+        def format_ago(timestamp):
+            nonlocal now_dt
+            ts = datetime.fromisoformat(timestamp)
+            delta = now_dt - ts
+            return Utils.ago_str(int(round(delta.total_seconds())))
+
+
+        now_dt = datetime.now()
         app = self.app
         win = app.win
         win.set_pick_mode(True)
@@ -1126,7 +1465,7 @@ class HistoryScreen(DiskWipeScreen):
 
         # Header
         # header_line = f'ESC:back [e]xpand [/]search {len(self.filtered_entries)}/{len(self.entries)} ({level_summary}) '
-        header_line = f'ESC:back [e]xpand [/]search {len(self.filtered_entries)}/{len(self.entries)} '
+        header_line = f'ESC:back [e]xpand [c]opy [/]search {len(self.filtered_entries)}/{len(self.entries)} '
         if search_display:
             header_line += f'/ {search_display}'
         else:
@@ -1141,8 +1480,17 @@ class HistoryScreen(DiskWipeScreen):
             # Get display summary from entry
             summary = entry.display_summary
 
-            # Format timestamp (just date and time)
-            timestamp_display = timestamp[:19]  # YYYY-MM-DD HH:MM:SS
+            # Format timestamp based on spinner setting
+            time_format = app.opts.hist_time_format 
+
+            if time_format == 'ago':
+                timestamp_display = f"{format_ago(timestamp):>6}"
+            elif time_format == 'ago+time':
+                ago = format_ago(timestamp)
+                time_str = timestamp[:19]
+                timestamp_display = f"{ago:>6} {time_str}"
+            else:  # 'time'
+                timestamp_display = timestamp[:19]  # Just the date and time part (YYYY-MM-DD HH:MM:SS)
 
             level = entry.level
 
@@ -1193,13 +1541,89 @@ class HistoryScreen(DiskWipeScreen):
             timestamp = ctx.timestamp
             # Toggle between collapsed and expanded
             current = self.expands.get(timestamp, False)
-            if current:
-                del self.expands[timestamp]  # Collapse
+            if current: # Collapsing
+                del self.expands[timestamp]
+                # Search backwards to find first context with matching timestamp
+                # This should be the header line of this entry
+                test_pos = win.pick_pos - 1
+                while test_pos >= 0:
+                    test_ctx = win.body.contexts[test_pos]
+                    if test_ctx and hasattr(test_ctx, 'timestamp') and test_ctx.timestamp == timestamp:
+                        win.pick_pos = test_pos
+                        test_pos -= 1
+                    else:
+                        return
             else:
-                self.expands[timestamp] = True  # Expand
+                # Expanding - just toggle, cursor stays where it is
+                self.expands[timestamp] = True
 
     def filter_ACTION(self):
         """'/' key - Start incremental search"""
         app = self.app
         self.search_bar.start(self.prev_filter)
         app.win.passthrough_mode = True
+
+    def copy_ACTION(self):
+        """'c' key - Copy current entry to clipboard or print to terminal"""
+        from .Utils import ClipboardHelper
+        app = self.app
+        win = app.win
+        ctx = win.get_picked_context()
+
+        if not ctx or not hasattr(ctx, 'timestamp'):
+            return
+
+        # Find the entry by timestamp
+        timestamp = ctx.timestamp
+        entry = None
+        for e in self.entries:
+            if e.timestamp == timestamp:
+                entry = e
+                break
+
+        if not entry:
+            return
+
+        # Format entry as JSON
+        entry_text = json.dumps(entry.to_dict(), indent=2)
+
+        # Try clipboard first
+        if ClipboardHelper.has_clipboard():
+            success, error = ClipboardHelper.copy(entry_text)
+            if success:
+                # Show brief success indicator - use the header context temporarily
+                # The message will be visible until next refresh
+                win.add_header(f'Copied to clipboard ({ClipboardHelper.get_method_name()})')
+            else:
+                win.add_header(f'Clipboard error: {error}')
+        else:
+            # Terminal fallback: exit curses, print, wait for input
+            self._copy_terminal_fallback(entry_text)
+
+    def _copy_terminal_fallback(self, text):
+        """Print entry to terminal when clipboard unavailable (e.g., SSH sessions)."""
+        from .Utils import ClipboardHelper
+        app = self.app
+
+        # Exit curses to use the terminal
+        ConsoleWindow.stop_curses()
+        os.system('clear; stty sane')
+
+        # Print with border
+        print('=' * 60)
+        print('LOG ENTRY (copy manually from terminal):')
+        print('=' * 60)
+        print(text)
+        print('=' * 60)
+        print(f'\nClipboard: {ClipboardHelper.get_method_name()}')
+        print('\nPress ENTER to return to dwipe...')
+
+        # Wait for user input
+        try:
+            input()
+        except EOFError:
+            pass
+
+        # Restore curses
+        ConsoleWindow.start_curses()
+        app.win.pick_pos = app.win.pick_pos  # Force position refresh

@@ -10,8 +10,6 @@ import os
 import re
 import json
 import subprocess
-import time
-import datetime
 import curses
 import traceback
 from fnmatch import fnmatch
@@ -19,22 +17,61 @@ from types import SimpleNamespace
 from console_window import Theme
 from dataclasses import asdict
 
-from .WipeJob import WipeJob
 from .Utils import Utils
 from .DrivePreChecker import DrivePreChecker
+from .DeviceWorker import DeviceWorkerManager, ProbeState
 
 
 class DeviceInfo:
     """Class to dig out the info we want from the system."""
     disk_majors = set()  # major devices that are disks
+    _discovery_cycle = 0  # Counter to prove discovery is running
 
-    def __init__(self, opts, persistent_state=None):
+    @staticmethod
+    def clean_partition_label(label):
+        """Clean up partition labels by decoding escape sequences and simplifying common labels.
+
+        Args:
+            label: Raw partition label string (may contain \x20 etc.)
+
+        Returns:
+            Cleaned up label string
+        """
+        if not label:
+            return ''
+
+        # Decode escape sequences (like \x20 for space)
+        try:
+            # Handle common escape sequences
+            cleaned = label.encode('utf-8').decode('unicode_escape')
+        except (UnicodeDecodeError, AttributeError):
+            cleaned = label
+
+        # Simplify common Windows partition labels
+        simplifications = {
+            'Basic data partition': 'MS-Data',
+            'Microsoft reserved partition': 'MS-Reserved',
+            'EFI system partition': 'EFI',
+            'EFI System Partition': 'EFI',
+        }
+
+        cleaned = simplifications.get(cleaned, cleaned)
+
+        return cleaned
+
+    def __init__(self, opts, persistent_state=None, worker_manager=None):
         self.opts = opts
         self.checker = DrivePreChecker()
         self.wids = SimpleNamespace(state=5, name=4, human=7, fstype=4, label=5)
         self.head_str = None
         self.partitions = None
         self.persistent_state = persistent_state
+        # Use provided worker_manager or create a new one
+        # Reusing allows hw_caps probing to continue across device refreshes
+        if worker_manager is not None:
+            self.worker_manager = worker_manager
+        else:
+            self.worker_manager = DeviceWorkerManager(self.checker)
 
     @staticmethod
     def _make_partition_namespace(major, name, size_bytes, dflt):
@@ -48,42 +85,51 @@ class DeviceInfo:
                                type='',        # device type (disk, part)
                                model='',       # /sys/class/block/{name}/device/vendor|model
                                size_bytes=size_bytes,  # /sys/block/{name}/...
-                               marker='',      #  persistent status
-                               marker_checked=False,  # True if we've read the marker once
+                               marker='',      # Formatted marker string from worker thread
+                               want_marker=False,  # True = ask worker thread to poll for marker
                                mounts=[],        # /proc/mounts
                                minors=[],
                                job=None,         # if zap running
                                uuid='',        # filesystem UUID or PARTUUID
                                serial='',      # disk serial number (for whole disks)
                                port='',        # port (for whole disks)
-                               hw_caps={},      # hw_wipe capabilities (for whole disks)
-                               hw_nopes={},   # hw reasons cannot do hw wipe
+                               hw_caps='',      # hw_wipe capabilities string: "Ovwr, Block, Crypto*"
+                               hw_caps_summary='',  # compact display: "ϟCrypto"
+                               hw_nopes='',   # hw_wipe issues string: "Frozen, Locked"
+                               hw_caps_state=ProbeState.PENDING,  # probe state for hw_caps
+                               is_usb=False,   # True if device is on USB bus
+                               is_rotational=False,  # True if HDD (spinning disk)
                                )
 
     def get_hw_capabilities(self, ns):
         """
         Populates and returns hardware wipe capabilities for a disk.
-        Returns cached data if already present.
+        Non-blocking: requests probe from background worker, returns cached state.
+
+        IMPORTANT: Skips probing if device has an active job to avoid blocking.
         """
-        # 1. Check if we already have cached results
-        if hasattr(ns, 'hw_caps') and (ns.hw_caps or ns.hw_nopes):
+        # 1. Check if we already have final results
+        if ns.hw_caps_state == ProbeState.READY:
             return ns.hw_caps, ns.hw_nopes
 
-        # Initialize defaults
-        ns.hw_caps, ns.hw_nopes = {}, {}
-
-        # Skip hardware checks if firmware wipes are disabled
-        if not getattr(self.opts, 'firmware_wipes', False):
+        # 2. Skip probing if device has active job (would block on SATA wipe)
+        if ns.job:
             return ns.hw_caps, ns.hw_nopes
 
-        # 4. Perform the actual Probe
-        dev_path = f"/dev/{ns.name}"
-        if ns.name.startswith('nv'):
-            result = self.checker.check_nvme_drive(dev_path)
-        elif ns.name.startswith('sd'):
-            result = self.checker.check_ata_drive(dev_path)
-        # 5. Store Results
-        ns.hw_caps, ns.hw_nopes = result.modes, result.issues
+        # 3. Request probe from worker (non-blocking)
+        self.worker_manager.request_hw_caps(ns.name)
+
+        # 4. Get current state from worker
+        hw_caps, hw_caps_summary, hw_nopes, state, is_usb, is_rotational = self.worker_manager.get_hw_caps(ns.name)
+
+        # 5. Update namespace with worker state
+        ns.hw_caps = hw_caps
+        ns.hw_caps_summary = hw_caps_summary
+        ns.hw_nopes = hw_nopes
+        ns.hw_caps_state = state
+        ns.is_usb = is_usb
+        ns.is_rotational = is_rotational
+
         return ns.hw_caps, ns.hw_nopes
 
     def _get_port_from_sysfs(self, device_name):
@@ -144,7 +190,8 @@ class DeviceInfo:
                 rv = ''
                 fullpath = f'/sys/class/block/{device_name}/device/{suffix}'
                 with open(fullpath, 'r', encoding='utf-8') as f:  # Read information
-                    rv = f.read().strip()
+                    # Sanitize: some USB bridges return strings with embedded nulls
+                    rv = f.read().strip().replace('\x00', '')
             except (FileNotFoundError, Exception):
                 pass
             return rv
@@ -152,173 +199,441 @@ class DeviceInfo:
         rv = f'{get_str(device_name, "model")}'
         return rv.strip()
 
-    def parse_lsblk(self, dflt, prev_nss=None, lsblk_output=None):
-        """Parse ls_blk for all the goodies we need
+    @staticmethod
+    def _is_rotational_device(device_name):
+        """Check if device is rotational (HDD) vs solid-state (SSD).
+
+        Reads /sys/block/<device>/queue/rotational:
+        - 1 = HDD (spinning disk)
+        - 0 = SSD (solid-state)
+
+        Returns:
+            bool: True if HDD (rotational), False if SSD or unknown
+        """
+        try:
+            # For partitions, get the parent disk name
+            parent = device_name.rstrip('0123456789')
+            if parent.endswith('p') and parent[:-1].rstrip('0123456789'):
+                # NVMe style: nvme0n1p1 -> nvme0n1
+                parent = parent[:-1]
+            if not parent:
+                parent = device_name
+
+            path = f'/sys/block/{parent}/queue/rotational'
+            with open(path, 'r', encoding='utf-8') as f:
+                return f.read().strip() == '1'
+        except (FileNotFoundError, PermissionError, OSError):
+            return False
+
+    # ========================================================================
+    # Non-blocking device discovery helpers (replacement for lsblk)
+    # ========================================================================
+
+    def _parse_proc_partitions(self):
+        """Parse /proc/partitions for basic device list (non-blocking).
+
+        Format: major minor #blocks name
+                8     0 1048576 sda
+                8     1  524288 sda1
+
+        Returns:
+            dict: {name: SimpleNamespace(major, minor, blocks, name)}
+        """
+        devices = {}
+        try:
+            with open('/proc/partitions', 'r', encoding='utf-8') as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) == 4 and parts[0].isdigit():
+                        major, minor, blocks, name = parts
+                        devices[name] = SimpleNamespace(
+                            major=int(major),
+                            minor=int(minor),
+                            blocks=int(blocks),  # In KB
+                            name=name
+                        )
+        except (FileNotFoundError, PermissionError, Exception):
+            pass
+        return devices
+
+    def _parse_proc_mounts(self):
+        """Parse /proc/mounts for mount points (non-blocking).
+
+        Format: device mountpoint fstype options dump pass
+                /dev/sda1 /boot ext4 rw,relatime 0 0
+
+        Returns:
+            dict: {device_name: {'mounts': [mountpoint1, ...], 'fstype': str}}
+        """
+        mounts = {}
+        try:
+            with open('/proc/mounts', 'r', encoding='utf-8') as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 3 and parts[0].startswith('/dev/'):
+                        device = parts[0][5:]  # Strip '/dev/'
+                        mountpoint = parts[1]
+                        fstype = parts[2]
+                        if device not in mounts:
+                            mounts[device] = {'mounts': [], 'fstype': fstype}
+                        mounts[device]['mounts'].append(mountpoint)
+        except (FileNotFoundError, PermissionError, Exception):
+            pass
+        return mounts
+
+    def _is_partition(self, name):
+        """Check if device is a partition (non-blocking).
+
+        Returns True if /sys/class/block/{name}/partition exists.
+        """
+        return os.path.exists(f'/sys/class/block/{name}/partition')
+
+    def _get_parent_from_sysfs(self, name):
+        """Find parent disk for a partition from sysfs (non-blocking).
+
+        For sda1, follows /sys/class/block/sda1 symlink and extracts parent.
+        Returns None for whole disks.
+        """
+        if not self._is_partition(name):
+            return None
+
+        try:
+            # The sysfs symlink for a partition points to a path containing the parent
+            # e.g., /sys/class/block/sda1 -> ../../devices/.../sda/sda1
+            real_path = os.path.realpath(f'/sys/class/block/{name}')
+            parent_path = os.path.dirname(real_path)
+            parent_name = os.path.basename(parent_path)
+
+            # Verify it's actually a disk (not some intermediate directory)
+            if os.path.exists(f'/sys/class/block/{parent_name}'):
+                return parent_name
+        except (OSError, Exception):
+            pass
+
+        # Fallback: strip numeric suffix (sda1 -> sda, nvme0n1p1 -> nvme0n1)
+        if name.startswith('nvme') and 'p' in name:
+            return name.rsplit('p', 1)[0]
+        elif name.startswith('mmcblk') and 'p' in name:
+            return name.rsplit('p', 1)[0]
+        else:
+            # SATA/USB: strip trailing digits
+            return name.rstrip('0123456789') or None
+
+    def _get_size_from_sysfs(self, name):
+        """Get device size in bytes from sysfs (non-blocking).
+
+        Reads /sys/class/block/{name}/size which contains sector count.
+        """
+        try:
+            with open(f'/sys/class/block/{name}/size', 'r', encoding='utf-8') as f:
+                sectors = int(f.read().strip())
+            return sectors * 512  # Convert to bytes
+        except (FileNotFoundError, ValueError, Exception):
+            return 0
+
+    def _get_serial_from_sysfs(self, name):
+        """Get device serial number from sysfs (non-blocking).
+
+        NVMe: /sys/class/block/{name}/device/serial (plain text)
+        SATA: /sys/class/block/{name}/device/vpd_pg80 (binary VPD page)
+        """
+        # Try NVMe-style path first (plain text)
+        try:
+            with open(f'/sys/class/block/{name}/device/serial', 'r', encoding='utf-8') as f:
+                # Sanitize: some USB bridges return strings with embedded nulls
+                return f.read().strip().replace('\x00', '')
+        except (FileNotFoundError, Exception):
+            pass
+
+        # Try SATA VPD page 80 (binary format)
+        try:
+            with open(f'/sys/class/block/{name}/device/vpd_pg80', 'rb') as f:
+                data = f.read()
+                if len(data) > 4:
+                    # VPD format: 00 80 00 LL [serial...] where LL is length
+                    length = data[3] if len(data) > 3 else 0
+                    # Sanitize: remove nulls that some USB bridges include
+                    serial = data[4:4+length].decode('ascii', errors='ignore').strip().replace('\x00', '')
+                    return serial
+        except (FileNotFoundError, Exception):
+            pass
+
+        return ''
+
+    def _probe_blkid(self, device_name, timeout=2.0):
+        """Get fstype, label, uuid from udev cache (instant, no subprocess).
+
+        Reads from /run/udev/data/b<major>:<minor> which is populated by udevd
+        at boot time. Falls back to empty values if cache is unavailable.
+
+        Args:
+            device_name: Device name (e.g., 'sda1')
+            timeout: Unused, kept for API compatibility
+
+        Returns:
+            dict with keys: fstype, label, uuid (empty strings if not found)
+        """
+        result = {'fstype': '', 'label': '', 'uuid': ''}
+        try:
+            # Get major:minor from sysfs
+            with open(f'/sys/class/block/{device_name}/dev') as f:
+                major_minor = f.read().strip()
+
+            # Read udev data file
+            with open(f'/run/udev/data/b{major_minor}') as f:
+                for line in f:
+                    if line.startswith('E:ID_FS_TYPE='):
+                        result['fstype'] = line.split('=', 1)[1].strip()
+                    elif line.startswith('E:ID_FS_LABEL='):
+                        result['label'] = line.split('=', 1)[1].strip()
+                    elif line.startswith('E:ID_PART_ENTRY_NAME=') and not result['label']:
+                        raw_label = line.split('=', 1)[1].strip()
+                        result['label'] = self.clean_partition_label(raw_label)
+                    elif line.startswith('E:ID_FS_UUID='):
+                        result['uuid'] = line.split('=', 1)[1].strip()
+                    elif line.startswith('E:ID_PART_ENTRY_UUID=') and not result['uuid']:
+                        result['uuid'] = line.split('=', 1)[1].strip()
+        except (FileNotFoundError, IOError, OSError):
+            pass
+        return result
+
+    def _build_dark_device_set(self, prev_nss):
+        """Build set of device names that should not be probed (have active jobs).
+
+        A device is "dark" if:
+        - It has an active job (ns.job is not None)
+        - Its parent disk has an active job
+        - Any of its child partitions has an active job
+
+        Args:
+            prev_nss: Previous device namespaces
+
+        Returns:
+            set: Device names to skip probing
+        """
+        dark = set()
+        if not prev_nss:
+            return dark
+
+        for name, ns in prev_nss.items():
+            if ns.job:
+                dark.add(name)
+                # Also mark parent as dark
+                if ns.parent:
+                    dark.add(ns.parent)
+                # Also mark all children as dark
+                for minor in getattr(ns, 'minors', []):
+                    dark.add(minor)
+
+        return dark
+
+    def discover_devices(self, dflt, prev_nss=None):
+        """Discover devices via /proc and /sys (non-blocking replacement for lsblk).
+
+        This method replaces parse_lsblk() to avoid blocking on devices with
+        active firmware wipe jobs. All /proc and /sys reads are non-blocking.
+        Only blkid (for fstype/label/uuid) may briefly block, and it's skipped
+        for "dark" devices (those with active jobs).
 
         Args:
             dflt: Default state for new devices
             prev_nss: Previous device namespaces for merging
-            lsblk_output: Optional lsblk JSON output string. If provided, uses this
-                         instead of running lsblk command. Useful for background monitoring.
+
+        Returns:
+            dict: Mapping of device name to SimpleNamespace
         """
-        def eat_one(device):
-            entry = self._make_partition_namespace(0, '', '', dflt)
-            entry.name = device.get('name', '')
-            maj_min = device.get('maj:min', (-1, -1))
-            wds = maj_min.split(':', maxsplit=1)
-            entry.major = -1
-            if len(wds) > 0:
-                entry.major = int(wds[0])
-            entry.fstype = device.get('fstype', '')
-            if entry.fstype is None:
-                entry.fstype = ''
-            entry.type = device.get('type', '')
-            entry.label = device.get('label', '')
-            if not entry.label:
-                entry.label = device.get('partlabel', '')
-            if entry.label is None:
-                entry.label = ''
-            entry.size_bytes = int(device.get('size', 0))
+        # Build dark device set from previous state
+        dark_devices = self._build_dark_device_set(prev_nss)
 
-            # Get UUID - prefer PARTUUID for partitions, UUID for filesystems
-            entry.uuid = device.get('partuuid', '') or device.get('uuid', '') or ''
-            entry.serial = device.get('serial', '') or ''
+        # Increment discovery cycle counter (proves code is running)
+        DeviceInfo._discovery_cycle += 1
 
-            mounts = device.get('mountpoints', [])
-            while len(mounts) >= 1 and mounts[0] is None:
-                del mounts[0]
-            entry.mounts = mounts
+        # Phase 1: Parse /proc for basic device list and mounts
+        proc_devices = self._parse_proc_partitions()
+        if not proc_devices:
+            return {}  # Critical failure - let caller handle
 
-            # Check if we should read the marker (3-state model: dont-know, got-marker, no-marker)
-            # Read marker ONCE when:
-            # 1. Not mounted
-            # 2. No filesystem (fstype/label empty)
-            # 3. No active job
-            # 4. Haven't checked yet (marker_checked=False)
-            has_job = prev_nss and entry.name in prev_nss and getattr(prev_nss[entry.name], 'job', None) is not None
+        mounts = self._parse_proc_mounts()
+
+        # Phase 2: Build device entries from sysfs
+        entries = {}
+        parent_map = {}  # name -> parent_name for building minors lists later
+
+        for name, proc_info in proc_devices.items():
+            # Get size from sysfs (more accurate than /proc/partitions blocks)
+            size_bytes = self._get_size_from_sysfs(name)
+            if size_bytes == 0:
+                size_bytes = proc_info.blocks * 1024  # Fallback to /proc/partitions
+
+            entry = self._make_partition_namespace(proc_info.major, name, size_bytes, dflt)
+            mount_info = mounts.get(name, {})
+            entry.mounts = mount_info.get('mounts', [])
+            if entry.mounts:
+                entry.fstype = mount_info.get('fstype', '')
+
+            # Determine if partition or disk
+            if self._is_partition(name):
+                entry.type = 'part'
+                parent_name = self._get_parent_from_sysfs(name)
+                if parent_name:
+                    entry.parent = parent_name
+                    parent_map[name] = parent_name
+            else:
+                entry.type = 'disk'
+
+            # Set mount state
+            if entry.mounts:
+                entry.state = 'Mnt'
+
+            # Check if this is a dark device
+            is_dark = name in dark_devices
+
+            # Phase 3: Conditional probing (skip for dark devices)
+            if is_dark and prev_nss and name in prev_nss:
+                # Carry forward all data from previous state
+                prev = prev_nss[name]
+                entry.fstype = prev.fstype
+                entry.label = prev.label
+                entry.uuid = prev.uuid
+                entry.serial = prev.serial
+                entry.marker = prev.marker
+                entry.hw_caps = getattr(prev, 'hw_caps', '')
+                entry.hw_caps_summary = getattr(prev, 'hw_caps_summary', '')
+                entry.hw_nopes = getattr(prev, 'hw_nopes', '')
+                entry.hw_caps_state = getattr(prev, 'hw_caps_state', ProbeState.PENDING)
+                entry.model = getattr(prev, 'model', '')
+                entry.port = getattr(prev, 'port', '')
+                entry.is_rotational = getattr(prev, 'is_rotational', False)
+            else:
+                # Non-dark device: probe for metadata
+                if entry.type == 'disk':
+                    # Disk-level info from sysfs
+                    entry.serial = self._get_serial_from_sysfs(name)
+                    entry.model = self._get_device_vendor_model(name)
+                    entry.port = self._get_port_from_sysfs(name)
+                    entry.is_rotational = self._is_rotational_device(name)
+
+                # Get fstype/label/uuid via blkid (skip only if dark device)
+                if not is_dark:
+                    blkid_info = self._probe_blkid(name)
+                    # If not mounted, use blkid fstype; if mounted, use mount fstype
+                    if not entry.mounts:
+                        entry.fstype = blkid_info['fstype']
+                    # Always get label and uuid from blkid
+                    entry.label = blkid_info['label']
+                    entry.uuid = blkid_info['uuid']
+
+            # Marker monitoring: ALWAYS update, even for dark devices
+            # This ensures markers are detected immediately after wipes
+            has_job = is_dark  # Already checked above
             has_filesystem = entry.fstype or entry.label
 
-            # Inherit marker_checked from previous scan, or False if new/changed
-            prev_had_filesystem = (prev_nss and entry.name in prev_nss and
-                                   (prev_nss[entry.name].fstype or prev_nss[entry.name].label))
-            filesystem_changed = prev_had_filesystem != bool(has_filesystem)
+            # Check if device has actual partitions even before we build minors list
+            has_child_partitions = any(parent_name == name for parent_name in parent_map.values())
 
-            if prev_nss and entry.name in prev_nss and not filesystem_changed:
-                entry.marker_checked = prev_nss[entry.name].marker_checked
+            # Marker state is now entirely managed by worker thread
+            # (no marker_checked, monitor_marker, etc. fields anymore)
 
-            # Read marker if haven't checked yet and safe to do so
-            should_read_marker = (not mounts and not has_filesystem and not has_job and
-                                  not entry.marker_checked)
+            # Determine if we should ask worker to monitor for marker
+            # For whole disks: no job, no children, not mounted
+            # For partitions: no job, no filesystem, not mounted
+            if entry.type == 'disk':
+                should_want_marker = (not has_job and not has_child_partitions and
+                                     not entry.mounts)
+            elif entry.type == 'part':
+                should_want_marker = (not has_job and not has_filesystem and
+                                     not entry.mounts)
+            else:
+                should_want_marker = False
 
-            if should_read_marker:
-                entry.marker_checked = True  # Mark as checked regardless of result
-                marker = WipeJob.read_marker_buffer(entry.name)
-                now = int(round(time.time()))
-                if (marker and marker.size_bytes == entry.size_bytes
-                        and marker.unixtime < now):
-                    # For multi-pass wipes, scrubbed_bytes can exceed size_bytes
-                    # Calculate completion percentage (capped at 100%)
-                    pct = min(100, int(round((marker.scrubbed_bytes / marker.size_bytes) * 100)))
-                    state = 'W' if pct >= 100 else 's'
-                    dt = datetime.datetime.fromtimestamp(marker.unixtime)
-                    # Add verification status prefix
-                    verify_prefix = ''
-                    verify_status = getattr(marker, 'verify_status', None)
-                    if verify_status == 'pass':
-                        verify_prefix = '✓ '
-                    elif verify_status == 'fail':
-                        verify_prefix = '✗ '
+            # Tell worker to monitor or stop monitoring
+            if self.worker_manager:
+                self.worker_manager.set_want_marker(name, should_want_marker)
+                # Request immediate marker check for faster feedback
+                if should_want_marker:
+                    self.worker_manager.request_marker_check(name)
 
-                    # Add error suffix if job failed abnormally
-                    error_suffix = ''
-                    abort_reason = getattr(marker, 'abort_reason', None)
-                    if abort_reason:
-                        error_suffix = f' Err[{abort_reason}]'
+            # Get the formatted marker string from worker (if any)
+            entry.want_marker = should_want_marker
+            if should_want_marker:
+                entry.marker = self.worker_manager.get_marker_formatted(name)
+                # Extract state from marker string format: "{prefix}{state} {pct}%"
+                # State is 'W' (wiped) or 's' (scrubbing), possibly with prefix (✓ or ✗)
+                if entry.marker:
+                    if 'W ' in entry.marker:
+                        entry.state = 'W'
+                        entry.dflt = 'W'
+                    elif 's ' in entry.marker:
+                        entry.state = 's'
+                        entry.dflt = 's'
+                else:
+                    # No marker found, reset state to default (not wiped/scrubbing)
+                    entry.state = '-'
+                    entry.dflt = '-'
+            else:
+                entry.marker = ''
+                # Not monitoring, reset to default state
+                entry.state = '-'
+                entry.dflt = '-'
 
-                    entry.marker = f'{verify_prefix}{state} {pct}% {marker.mode} {dt.strftime("%Y/%m/%d %H:%M")}{error_suffix}'
-                    entry.state = state
-                    entry.dflt = state  # Set dflt so merge logic knows this partition has a marker
+            entries[name] = entry
 
-            return entry
+        # Phase 4: Build parent-child relationships (minors lists)
+        for name, parent_name in parent_map.items():
+            if parent_name in entries:
+                entries[parent_name].minors.append(name)
+                self.disk_majors.add(entries[name].major)
+                # Propagate mount state to parent
+                if entries[name].mounts:
+                    entries[parent_name].state = 'iMnt'
 
-        # Get lsblk output - either from parameter or by running command
-        if lsblk_output:  # Non-empty string from background monitor
-            # Use provided output string
-            try:
-                parsed_data = json.loads(lsblk_output)
-            except (json.JSONDecodeError, Exception):
-                # Invalid JSON - return empty dict
-                return {}
-        else:
-            # Run the `lsblk` command and get its output in JSON format with additional columns
-            # Use timeout to prevent UI freeze if lsblk hangs on problematic devices
-            try:
-                result = subprocess.run(['lsblk', '-J', '--bytes', '-o',
-                                        'NAME,MAJ:MIN,FSTYPE,TYPE,LABEL,PARTLABEL,FSUSE%,SIZE,MOUNTPOINTS,UUID,PARTUUID,SERIAL'],
-                                       stdout=subprocess.PIPE, text=True, check=False, timeout=10.0)
-                parsed_data = json.loads(result.stdout)
-            except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception):  # pylint: disable=broad-exception-caught
-                # lsblk hung, returned bad JSON, or other error - return empty dict
-                # assemble_partitions will detect this and preserve previous state
-                return {}
-        entries = {}
+        # Phase 4b: Clear marker display and state for disks with actual partitions
+        # If a disk has partitions, the partitions take precedence over the wipe marker
+        for name, entry in entries.items():
+            if entry.minors:  # Disk has child partitions
+                entry.marker = ''  # Don't show marker when partitions exist
+                # Also clear the state if it was set to a wipe state ('W' or 's')
+                # Reset to default state '-' (unmarked)
+                if entry.state in ('W', 's'):
+                    entry.state = '-'
+                if entry.dflt in ('W', 's'):
+                    entry.dflt = '-'
 
-        # Parse each block device and its properties
-        for device in parsed_data['blockdevices']:
-            parent = eat_one(device)
-            entries[parent.name] = parent
-            for child in device.get('children', []):
-                entry = eat_one(child)
-                entries[entry.name] = entry
-                entry.parent = parent.name
-                parent.minors.append(entry.name)
-                self.disk_majors.add(entry.major)
-                if entry.mounts:
-                    entry.state = 'Mnt'
-                    parent.state = 'Mnt'
-
-
-        # Final pass: Identify disks, assign ports, and handle superfloppies
+        # Phase 5: Handle superfloppy case and clean disk rows
         final_entries = {}
         for name, entry in entries.items():
             final_entries[name] = entry
 
-            # Only process top-level physical disks
-            if entry.parent is None:
-                # Hardware Info Gathering
-                entry.model = self._get_device_vendor_model(entry.name)
-                entry.port = self._get_port_from_sysfs(entry.name)
-
-                # The Split (Superfloppy Case)
-                # If it has children, the children already hold the data.
-                # If it has NO children but HAS data, we create the '----' child.
+            # Only process top-level disks
+            if entry.parent is None and entry.type == 'disk':
+                # Superfloppy: disk with filesystem but no partitions
                 if not entry.minors and (entry.fstype or entry.label or entry.mounts):
                     v_key = f"{name}_data"
                     v_child = self._make_partition_namespace(entry.major, name, entry.size_bytes, dflt)
                     v_child.name = "----"
+                    v_child.type = 'part'
                     v_child.fstype = entry.fstype
                     v_child.label = entry.label
                     v_child.mounts = entry.mounts
                     v_child.parent = name
+                    v_child.uuid = entry.uuid
 
                     final_entries[v_key] = v_child
                     entry.minors.append(v_key)
 
-                # Clean the hardware row of data-specific strings
+                # Clean the disk row: show model instead of fstype
                 entry.fstype = entry.model if entry.model else 'DISK'
                 entry.label = ''
                 entry.mounts = []
 
-        entries = final_entries
+        return final_entries
 
-        return entries
 
     @staticmethod
     def set_one_state(nss, ns, to=None, test_to=None):
         """Optionally, update a state, and always set inferred states"""
         ready_states = ('s', 'W', '-', '^')
         job_states = ('*%', 'STOP')
-        inferred_states = ('Busy', 'Mnt',)
 
         def state_in(to, states):
             return to in states or fnmatch(to, states[0])
@@ -335,7 +650,7 @@ class DeviceInfo:
 
         if to == 'STOP' and not state_in(ns.state, job_states):
             return False
-        if to == 'Blk' and not state_in(ns.state, list(ready_states) + ['Mnt']):
+        if to == 'Blk' and not state_in(ns.state, list(ready_states) + ['Mnt', 'iMnt', 'iBlk']):
             return False
         if to == 'Unbl' and ns.state != 'Blk':
             return False
@@ -356,9 +671,14 @@ class DeviceInfo:
 
         # Here we set inferences that block starting jobs
         #  -- clearing these states will be done on the device refresh
-        if parent and state_in(ns.state, inferred_states):
-            if parent.state != 'Blk':
-                parent.state = ns.state
+        # Propagate Mnt/iMnt from child to parent as iMnt (inherited mount)
+        if parent and ns.state in ('Mnt', 'iMnt'):
+            if parent.state not in ('Blk', 'iBlk', 'Mnt'):
+                parent.state = 'iMnt'
+        # Propagate Blk/iBlk from child to parent as iBlk (inherited block)
+        if parent and ns.state in ('Blk', 'iBlk'):
+            if parent.state != 'Blk':  # Direct Blk trumps inherited
+                parent.state = 'iBlk'
         if state_in(ns.state, job_states):
             if parent:
                 parent.state = 'Busy'
@@ -368,8 +688,13 @@ class DeviceInfo:
 
     @staticmethod
     def clear_inferred_states(nss):
-        """Clear all inferred states (Busy, Mnt) so they can be re-inferred"""
-        inferred_states = ('Busy', 'Mnt')
+        """Clear all inferred states so they can be re-inferred.
+
+        Inherited states (iBlk, iMnt, Busy) are cleared.
+        Direct states (Blk, Mnt) are preserved - they're set based on
+        persistent state or actual mounts, not inheritance.
+        """
+        inferred_states = ('Busy', 'iMnt', 'iBlk')
         for ns in nss.values():
             if ns.state in inferred_states:
                 ns.state = ns.dflt
@@ -411,10 +736,10 @@ class DeviceInfo:
                 # If we can't read ro flag, skip this device to be safe
                 continue
 
-            # Exclude common virtual device prefixes as a safety net
+            # Exclude common virtual and optical device prefixes as a safety net
             # (most should already be filtered by ro check or missing sysfs)
-            virtual_prefixes = ('zram', 'loop', 'dm-', 'ram')
-            if any(name.startswith(prefix) for prefix in virtual_prefixes):
+            excluded_prefixes = ('zram', 'loop', 'dm-', 'ram', 'sr', 'scd')
+            if any(name.startswith(prefix) for prefix in excluded_prefixes):
                 continue
 
             # Include this device
@@ -484,8 +809,8 @@ class DeviceInfo:
             # Last partition of disk: rounded corner
             prefix = '└ '
         else:
-            # Regular partition: vertical line
-            prefix = '│ '
+            # Non-last partition: tee junction
+            prefix = '├ '
 
         name_str = prefix + ns.name
 
@@ -493,17 +818,69 @@ class DeviceInfo:
         emit += f'{sep}{Utils.human(ns.size_bytes):>{wids.human}}'
         emit += sep + print_str_or_dash(ns.fstype, wids.fstype)
         if ns.parent is None:
-            # Physical disk - always show thick line in LABEL field (disks don't have labels)
-            emit += sep + '━' * wids.label
-            if ns.mounts:
+            # Physical disk - show firmware capability/status centered in LABEL field
+            hw_caps = getattr(ns, 'hw_caps', '')
+            hw_nopes = getattr(ns, 'hw_nopes', '')
+            hw_summary = getattr(ns, 'hw_caps_summary', '')
+            hw_state = getattr(ns, 'hw_caps_state', ProbeState.PENDING)
+            is_usb = getattr(ns, 'is_usb', False)
+
+            fw_label = ''
+            if hw_caps:
+                fw_label = hw_summary
+            elif hw_nopes and not is_usb:
+                first_issue = hw_nopes.split(',')[0].strip()
+                fw_label = f'✗{first_issue}'
+            elif hw_state in (ProbeState.PENDING, ProbeState.PROBING):
+                if ns.state not in ('Mnt', 'iMnt', 'Blk', 'iBlk', 'Busy') and not is_usb:
+                    fw_label = '...'
+
+            if not fw_label:
+                fw_label = '---'
+
+            # Split fw_label into symbol prefix and alphanumeric text for underline rendering
+            fw_symbol = ''
+            fw_text = fw_label
+            if fw_label not in ('---', '...'):
+                for i, ch in enumerate(fw_label):
+                    if ch.isascii() and ch.isalnum():
+                        fw_symbol = fw_label[:i]
+                        fw_text = fw_label[i:]
+                        break
+
+            # Record positions so caller can underline just the alphanumeric text
+            label_start = len(emit) + len(sep)
+            centered = f'{fw_label:^{wids.label}}'
+            emit += sep + centered
+
+            if fw_symbol:
+                left_pad = (wids.label - len(fw_label)) // 2
+                ul_start = label_start + left_pad + len(fw_symbol)
+                ul_end = ul_start + len(fw_text)
+                ns._fw_underline = (ul_start, ul_end)
+            else:
+                ns._fw_underline = None
+
+            # Check for aggregated mounts (from hidden children when disk is blocked)
+            agg_mounts = getattr(ns, 'aggregated_mounts', None)
+            if agg_mounts:
+                # Show first mount + count of others (e.g., "/ + 5 more")
+                first_mount = agg_mounts[0]
+                remaining = len(agg_mounts) - 1
+                if remaining > 0:
+                    emit += f'{sep}{first_mount} + {remaining} more'
+                else:
+                    emit += f'{sep}{first_mount}'
+            elif ns.mounts:
                 # Disk has mounts - show them
                 emit += f'{sep}{",".join(ns.mounts)}'
-            elif ns.marker and ns.marker.strip():
-                # Disk has wipe status - show it
+            elif ns.marker and ns.marker.strip() and not ns.minors:
+                # Disk has wipe status - show it ONLY if no child partitions
+                # (partitions take precedence over marker)
                 emit += f'{sep}{ns.marker}'
             else:
-                # No status - show heavy line divider (start 1 char left to fill gap)
-                emit += '━' + '━' * 30
+                # No wipe status
+                emit += f'{sep}     ---'
         else:
             # Partition: show label and mount/status info
             emit += sep + print_str_or_dash(ns.label, wids.label)
@@ -517,7 +894,7 @@ class DeviceInfo:
         # Check for newly inserted flag first (hot-swapped devices should always show orange)
         if getattr(ns, 'newly_inserted', False):
             # Newly inserted device - orange/bright
-            if ns.state in ('Mnt', 'Blk'):
+            if ns.state in ('Mnt', 'iMnt', 'Blk', 'iBlk'):
                 # Dim the orange for mounted/blocked devices
                 attr = curses.color_pair(Theme.HOTSWAP) | curses.A_DIM
             else:
@@ -531,19 +908,26 @@ class DeviceInfo:
         elif ns.state == 'W':
             # Green/success color for completed wipes before this session
             attr = curses.color_pair(Theme.OLD_SUCCESS) | curses.A_BOLD
-        elif ns.state.endswith('%') and ns.state not in ('0%', '100%'):
+        elif ns.state.endswith('%') and ns.state not in ('100%',):
             # Active wipe in progress - bright cyan/blue with bold
             attr = curses.color_pair(Theme.INFO) | curses.A_BOLD
         elif ns.state == '^':
             # Newly inserted device (hot-swapped) - orange/bright
             attr = curses.color_pair(Theme.HOTSWAP) | curses.A_BOLD
-        elif ns.state in ('Mnt', 'Blk'):
+        elif ns.state in ('Mnt', 'iMnt', 'Blk', 'iBlk'):
             # Dim mounted or blocked devices
             attr = curses.A_DIM
 
         # Override with red/danger color if verify failed
         if hasattr(ns, 'verify_failed_msg') and ns.verify_failed_msg:
             attr = curses.color_pair(Theme.DANGER) | curses.A_BOLD
+
+        # Make disk lines bold
+        if ns.parent is None:
+            if attr is None:
+                attr = curses.A_BOLD
+            else:
+                attr |= curses.A_BOLD
 
         return emit, attr
 
@@ -570,10 +954,15 @@ class DeviceInfo:
                 # Preserve the "wiped this session" flag
                 if hasattr(prev_ns, 'wiped_this_session'):
                     new_ns.wiped_this_session = prev_ns.wiped_this_session
-                # Preserve marker and marker_checked (already inherited in parse_lsblk)
-                # Only preserve marker string if we haven't just read a new one
-                if hasattr(prev_ns, 'marker') and not new_ns.marker:
-                    new_ns.marker = prev_ns.marker
+                # Marker is now handled entirely by worker thread, no preservation needed
+
+                # Preserve hw_caps state - once probed, it's permanent for the device
+                prev_hw_state = getattr(prev_ns, 'hw_caps_state', ProbeState.PENDING)
+                if prev_hw_state == ProbeState.READY:
+                    new_ns.hw_caps = getattr(prev_ns, 'hw_caps', '')
+                    new_ns.hw_caps_summary = getattr(prev_ns, 'hw_caps_summary', '')
+                    new_ns.hw_nopes = getattr(prev_ns, 'hw_nopes', '')
+                    new_ns.hw_caps_state = ProbeState.READY
 
                 # Preserve verify failure message ONLY for unmarked disks
                 # Clear if: filesystem appeared OR partition now has a marker
@@ -608,8 +997,8 @@ class DeviceInfo:
                     new_ns.state = 'Blk'
                 elif new_ns.state not in ('s', 'W'):
                     new_ns.state = new_ns.dflt
-                    # Don't copy forward percentage states (like "v96%") - only persistent states
-                    if prev_ns.state not in ('s', 'W', 'Busy', 'Unbl') and not prev_ns.state.endswith('%'):
+                    # Don't copy forward percentage states or inherited states - only persistent states
+                    if prev_ns.state not in ('s', 'W', 'Busy', 'Unbl', 'iBlk', 'iMnt') and not prev_ns.state.endswith('%'):
                         new_ns.state = prev_ns.state  # re-infer these
             elif prev_ns.job:
                 # unplugged device with job..
@@ -624,20 +1013,18 @@ class DeviceInfo:
                 new_ns.newly_inserted = True  # Mark for orange color even if locked/mounted
         return nss
 
-    def assemble_partitions(self, prev_nss=None, lsblk_output=None):
+    def assemble_partitions(self, prev_nss=None):
         """Assemble and filter partitions for display
 
         Args:
             prev_nss: Previous device namespaces for merging
-            lsblk_output: Optional lsblk JSON output string from LsblkMonitor
         """
-        nss = self.parse_lsblk(dflt='^' if prev_nss else '-', prev_nss=prev_nss,
-                               lsblk_output=lsblk_output)
+        nss = self.discover_devices(dflt='^' if prev_nss else '-', prev_nss=prev_nss)
 
-        # If parse_lsblk failed (returned empty) and we have previous data, keep previous state
+        # If discover_devices failed (returned empty) and we have previous data, keep previous state
         if not nss and prev_nss:
-            # lsblk scan failed or returned no devices - preserve previous state
-            # This prevents losing devices when lsblk temporarily fails
+            # Device scan failed or returned no devices - preserve previous state
+            # This prevents losing devices when discovery temporarily fails
             # But clear temporary status messages from completed jobs
             for ns in prev_nss.values():
                 if not ns.job and ns.mounts:
@@ -648,6 +1035,9 @@ class DeviceInfo:
         nss = self.get_disk_partitions(nss)
 
         nss = self.merge_dev_infos(nss, prev_nss)
+
+        # Update device workers for background probing
+        self.worker_manager.update_devices(nss.keys())
 
         # Apply persistent blocked states
         if self.persistent_state:
@@ -660,7 +1050,13 @@ class DeviceInfo:
 
         # Clear inferred states so they can be re-computed based on current job status
         self.clear_inferred_states(nss)
-        self.set_all_states(nss)  # set inferred states
+
+        # Re-apply Mnt state for devices with mounts (cleared above, needed for set_all_states)
+        for ns in nss.values():
+            if ns.mounts:
+                ns.state = 'Mnt'
+
+        self.set_all_states(nss)  # set inferred states (propagates Mnt/Busy to parents)
 
         self.compute_field_widths(nss)
         return nss
@@ -690,8 +1086,7 @@ class DeviceInfo:
 
             # Hardware capabilities
             if disk.hw_caps:
-                caps = ', '.join(disk.hw_caps.keys())
-                print(f'│  Hardware: {caps}')
+                print(f'│  Hardware: {disk.hw_caps}')
 
             # Find and print partitions for this disk
             disk_parts = [(name, part) for name, part in partitions.items()

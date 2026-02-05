@@ -6,83 +6,48 @@
 
 | Feature | dwipe | nwipe | shred | dd |
 |---------|-------|-------|-------|-----|
+| Firmware wipes (SATA/NVMe secure erase) | ✓ | ✗ | ✗ | ✗ |
+| Software wipes (Zero, Pseudo Random) | ✓ | ✓ | ✓ | ✗ |
 | Interactive TUI | ✓ | ✓ | ✗ | ✗ |
 | Multiple simultaneous wipes | ✓ | ✗ | ✗ | ✗ |
-| Hot-swap detection | ✓ | ✗ | ✗ | ✗ |
-| Device/partition blocking | ✓ | ✗ | ✗ | ✗ |
 | Persistent wipe state | ✓ | ✗ | ✗ | ✗ |
-| Resume interrupted wipes | ✓ | ✗ | ✗ | ✗ |
+| Hot-swap detection / release | ✓ | ✗ | ✗ | ✗ |
+| Device/partition blocking | ✓ | ✗ | ✗ | ✗ |
+| Resume interrupted software wipes | ✓ | ✗ | ✗ | ✗ |
 | Wipe operation logging | ✓ | ✗ | ✗ | ✗ |
 | Mount detection/prevention | ✓ | ✓ | ✗ | ✗ |
 | Fast Statistical sampling verification | ✓ | ✗ | ✗ | ✗ |
-| Multi-pass wipe standards | ✗ | ✓ | ✓ | ✗ |
-| Full sequential verification | ✗ | ✓ | ✓ | ✓ |
-| Certificate generation | ✗ | ✓ | ✗ | ✗ |
+| Certified destruction (DoD/Gutmann standards, full verification, certificates) | ✗ | ✓ | ✗ | ✗ |
 
-> * **Modern drives are reliably wiped with one pass of zeros**; just zero once in almost all cases for best, fastest results.
-> * `dwipe` offers Multi-pass and Rand modes as "checkbox" features, but those provide no additional security on drives manufactured after 2001 (NIST SP 800-88).
+> * **Firmware wipes (SATA/NVMe) are the most complete and fastest**: Hardware-accelerated erase operates at controller level (seconds to minutes), clears all drive mappings, but requires whole-device erase with no progress reporting or visible verification.
+> * **Software wipes with one-pass zeros are sufficient**: Modern drives (post-2001) are reliably wiped with a single pass of zeros (NIST SP 800-88). Multi-pass modes are available for additional confidence but provide no additional security guarantee.
+> * **Verification uses intelligent statistical sampling**: Even 1% verification samples across the entire disk via 100 sections, providing comprehensive coverage without full sequential read.
 
-## **V3 Features** (Partly in V2.x)
+## Marquee Features
 
-> Features added since initial V2 deployment (may not be in a demo until V3).
-
-* **Port and Serial number**.  Press `p` to control port and serial number; it adds another line per disk and you may want to use it selectively. You may choose "Off" (not shown), "On" (always shown), or the default "Auto" show if the disk is in a state allowed for wiping (e.g., no mounted partitions).
-* **Fast SATA Release**. If you press `DEL` on a SATA drive in a hot-swap bay (and not mounted or otherwise busy):
-  * it will be removed from the OS managed devices, 
-  * when gone from the `dwipe` screen, you can then pull out the device, and insert another one.
-  * So, replacing the drive can take just seconds, not minutes awaiting SATA timeouts.
-* **Background device monitoring** - Faster and more efficient hot-swap detection with dedicated monitoring thread:
-  - Monitors `/sys/class/block` and `/proc/partitions` for device changes
-  - Runs `lsblk` only when changes detected (previously ran every refresh)
-  - Reduces CPU usage and improves responsiveness
-  - Faster detection of newly inserted or removed devices
-* **Lock renamed Block** - To reduce confusion, the "lock" feature is renamed.
-  - "Blocking" a partition or disk is only effective within the running app.
-  - It prevents wiping w/o first unblocking even if unmounted or otherwise it a wipeable state.
-  - It does not system level lock of any type.
-* **Hardware-based firmware wipes (EXPERIMENTAL/ALPHA)** - Full support for firmware-level secure erase operations:
-  - **⚠️ Requires `--firmware-wipes` flag to enable (disabled by default)**
-  - **NVMe Sanitize**: Crypto Erase, Block Erase, and Overwrite operations via `nvme-cli`
-  - **NVMe Format**: Secure format with optional crypto erase
-  - **SATA ATA Security Erase**: Normal and Enhanced erase modes via `hdparm`
-  - Automatic capability detection shows only supported methods for each drive
-  - Firmware wipes are much faster than software wipes (seconds to minutes vs hours)
-  - Same user interface - firmware options appear alongside Zero/Rand in wipe confirmation
-  - Progress tracking with "FW" indicator to show hardware operation in progress
-  - Persistent markers track firmware wipe completion and method used
-  - See [FIRMWARE_WIPES.md](FIRMWARE_WIPES.md) for technical details
-  - **Note**: This feature is experimental; software wipes are recommended for most users
-
-## **V2 Features**
-
-* **Statistical verification** - Automatic or on-demand verification with intelligent pattern detection:
-  - Fast-fail for zeros (fails on first non-zero byte)
-  - Statistical analysis for random data to check for evidence of randomness
-  - Smart sampling: divides disk into 100 sections, randomly samples each section to sample entire disk
-  - Unmarked disk detection: can verify disks without filesystems and auto-detect if zeros/random
-* **Configurable verification percentage** - Choose thoroughness: 0% (skip), 2%, 5%, 10%, 25%, 50%, or 100% (cycle with **V** key, persistent preference)
-* **Multi-pass wipe support** - Choose 1, 2, or 4 wipe passes with alternating patterns for improved data destruction (cycle with **P** key, persistent preference)
-* **Inline wipe confirmation** - Confirmation prompts appear below the selected device (no popup), keeping full context visible
-* **Configurable confirmation modes** - Choose your safety level: single keypress (Y/y), typed confirmation (YES/yes), or device name (cycle with **c** key)
-* **Enhanced wipe history** - Detailed log viewer (**h** key) shows wipe history with UUIDs, filesystems, labels, and percentages for stopped wipes
-* **Active wipe highlighting** - In-progress wipes displayed in bright cyan/blue with elapsed time, remaining time, and transfer speed (0-100% write, 101-200% verify)
-* **Persistent user preferences** - Theme, wipe mode (Rand/Zero/Rand+V/Zero+V), confirmation mode, verification %, and blocked devices persist across sessions (saved to `~/.config/dwipe/state.json`)
-* **Individual partition blocking** - Block individual partitions to prevent accidental wiping (previously only whole disks could be blocked)
-* **Full terminal color themes** - Complete themed color schemes with backgrounds, not just highlights (cycle with **t** key)
-* **Visual feedback improvements** - Mounted and blocked devices appear dimmed; active wipes are bright and prominent
+* **Interactive TUI with hot-swap detection** - Real-time device list updates as storage changes, newly added devices marked with **^**
+* **Hardware-accelerated firmware wipes** - Full support for firmware-level secure erase operations (NVMe Sanitize/Format, SATA ATA Security Erase) that complete in seconds to minutes instead of hours
+* **Multiple simultaneous wipes** - Start wipes on multiple devices at once with individual progress tracking and completion states
+* **Persistent state tracking** - Wipe status survives reboots; partially wiped and completed states persist on the device (can resume wipes across power cycles)
 * **Smart device identification** - Uses UUID/PARTUUID/serial numbers for stable device tracking across reconnections
-* **Screen-based navigation** - Modern screen stack architecture with help screen (**?**) and history screen (**h**)
-* **Direct I/O to Disk** - Wiping is done with direct I/O which is fast and avoid polluting your page cache. Writer threads are given lower than normal I/O priority to play nice with other apps.  This makes stopping jobs fast and certain.
-* **Improved Handling of Bad Disks.** Now detects (sometimes corrects) write failures, slowdowns, excessive no progress, and reports/aborts hopeless or hopelessly slow wipes.
+* **Safety protections** - Prevents wiping mounted devices, detects overlapping wipes, supports device blocking, inline confirmation prompts
+* **Intelligent verification with statistical sampling** - Fast verification that covers entire disk even at low percentages (1% verification samples from all 100 disk sections)
+* **Direct I/O to disk** - Fast and efficient wiping that avoids page cache pollution with automatic slowdown/stall detection and graceful abort
+* **Multiple color themes** - Terminal color themes designed for readability with context-sensitive visual feedback (mounted devices dimmed, active wipes bright)
+* **Wipe history with logging** - Detailed wipe history viewer shows timestamps, filesystems, labels, and completion percentages with persistent records
 
 ## Requirements
 - **Linux operating system** (uses `/dev/`, `/sys/`, `/proc/` interfaces)
-- **Python 3.8 or higher**
+- **Python 3.10 or higher**
 - **Root/sudo privileges** (automatically requested when you run the tool)
 - **lsblk utility** (usually pre-installed on most Linux distributions)
-- **Optional (for firmware wipes only):**
-  - `nvme-cli` - For NVMe Sanitize and Format operations
-  - `hdparm` - For SATA ATA Security Erase operations
+- **nvme-cli** - For NVMe operations (Sanitize/Format detection)
+- **hdparm** - For SATA operations (ATA Security Erase detection)
+
+**Optional (for clipboard copy in history screen):**
+- **xclip** or **xsel** - For X11 clipboard (`apt install xclip` or `xsel`)
+- **wl-clipboard** - For Wayland clipboard (`apt install wl-clipboard`)
+- SSH sessions use OSC 52 terminal escape (no extra packages needed)
 
 ## Installation
 
@@ -90,12 +55,20 @@
 * **Verify installation:** `dwipe --help`
 * **Uninstall:** `pipx uninstall dwipe`
 
-## Quick Start
+## Quick Start (please READ THIS, at least)
 1. Install `dwipe`
-2. Run `dwipe` from a terminal (`sudo` will be requested automatically)
-3. Observe the context-sensitive help on the first line
-4. Navigate with arrow keys or vi-like keys (j/k)
-5. Press **?** for full help screen
+1. Run `dwipe` from a terminal (`sudo` will be requested automatically)
+1. Observe the context-sensitive help on the first line
+1. Navigate with arrow keys or vi-like keys (j/k)
+1. Press **?** for full help screen
+1. **When you press `w` to wipe a drive,** you must type the abbreviation (e.g., `Rand`, `Zero`, `Crypto`); wipes are presented from least to most recommended, and the last one is marked with `*`. Normally, pick the last choice, but ...
+1. **Drives and the OS often lie about drive type.** Outwit them both:
+    * For spinning HDDs, **always** use `Rand` or `Zero` (interruptible, shows progress).
+    * For SSDs, **always** use firmware wipes if available (faster, reaches hidden blocks).
+1. **If a drive is 'Frozen'**, press `DEL` to detach it and, when gone, press `r` to rescan; it should come back unfrozen.
+1. **If a drive is 'Locked'**, you must unlock it manually (see "Unlock Locked Device" section below). If `dwipe` locked it, the password is `NULL`; otherwise use the password that locked it.
+1. **Hot-swap workflow for SATA drives**: `DEL` to detach, physically swap drives, then `r` to rescan (if needed).
+
 
 ## Features
 
@@ -105,11 +78,10 @@
 * **Safety protections** - Prevents wiping mounted devices, detects overlapping wipes, supports manual disk blocking
 * **Hot-swap detection** - Updates the device list when storage changes; newly added devices are marked with **^** to make them easy to spot
 * **Multiple simultaneous wipes** - Start wipes on multiple devices at once, with individual progress tracking and completion states
-* **Flexible wipe modes** - Choose between Rand, Zero, Rand+V (with auto-verify), or Zero+V (with auto-verify). Multi-pass modes alternate patterns for improved data destruction
-* **Persistent state tracking** - Wipe status survives reboots; partially wiped (**s**) and completed (**W**) states are stored on the device
+* **Flexible wipe modes** - Choose between Rand, Zero, Rand+V (with auto-verify), or Zero+V (with auto-verify)
 * **Device filtering** - Filter devices by name/pattern using regex in case of too many for one screen
 * **Stop capability** - Stop individual wipes or all wipes in progress
-* **Disk blocking** - Manually block disks to prevent accidental wipes (blocks hide all partitions)
+* **Disk blocking** - Manually block disks to prevent accidental wiping (blocks hide all partitions)
 
 
 > **Note:** `dwipe` shows file system labels, and if not available, the partition label. It is best practice to label partitions and file systems well to make selection easier.
@@ -120,11 +92,39 @@ Simply run `dwipe` from the command line without arguments: `dwipe`
 
 ### Command-Line Options
 
-- `--firmware-wipes` or `-F` - Enable experimental (alpha) firmware wipes
+**Note:** All preference options use your **last saved values** as defaults. These defaults are shown in `--help` and can be changed interactively with keyboard shortcuts. Command-line arguments override saved preferences.
+
+#### Wipe Configuration
+- `--mode {-V,+V}` - Verification mode (default: your last preference)
+  - `-V` - Wipe without automatic verification
+  - `+V` - Verify device after wipe completes
+- `--passes {1,2,4}` - Number of passes for software wipes (default: your last preference)
+  - Single pass (1) is standard for most use cases
+  - Multi-pass (2 or 4) alternates between zero and random patterns
+- `--verify-pct {1,3,10,30,100}` - Verification percentage (default: your last preference)
+  - Percentage of disk to verify after wipe (1% = quick spot-check, 100% = full verify)
+
+#### Display and Performance
+- `--dense {True,False}` - Compact view mode (default: your last preference)
+  - `True` - Compact spacing (fewer blank lines between disks)
+  - `False` - Spaced view (blank lines between disks for readability)
+- `--port-serial {Auto,On,Off}` - Disk port/serial display (default: your last preference)
+  - `Auto` - Show port/serial only for whole disks (recommended)
+  - `On` - Always show port and serial number
+  - `Off` - Never show port and serial number
+
+#### Drive Handling Tuning
+- `--slowdown-stop {0,4,16,64,256}` - Stop if disk slows down (default: your last preference, milliseconds)
+  - `0` = Disabled
+  - Other values = Check interval in milliseconds for performance degradation
+- `--stall-timeout {0,60,120,300,600}` - Stall timeout in seconds (default: your last preference)
+  - `0` = Disabled (never timeout)
+  - Other values = Stop wipe if no data transfer progress for this many seconds
+
+#### Advanced Options
+- `--firmware-wipes` or `-F` - Enable firmware wipes
   - Enables hardware-based secure erase operations (NVMe Sanitize/Format, SATA ATA Security Erase)
-  - Requires `nvme-cli` and `hdparm` tools to be installed
   - Without this flag, only software wipes (Zero/Rand) are available
-  - **Warning**: This feature is experimental and should be used with caution
 - `--dump-lsblk` - Dump parsed device information and exit (for debugging)
 - `--help` - Show help message with all available options
 
@@ -193,32 +193,93 @@ The top line shows available actions. Some are context-sensitive (only available
 | **v** | verify | Verify a wiped device or detect pattern on unmarked disk (context-sensitive) |
 | **s** | stop | Stop the selected wipe in progress (context-sensitive) |
 | **S** | Stop All | Stop all wipes in progress |
+| **DEL** | delete | Remove disk from system (whole disks only, context-sensitive) |
 | **b** | block/unblock | Block or unblock a disk to prevent accidental wiping |
+| **/** | filter | Filter devices by regex pattern (shows matching devices + all active wipes) |
+| **r** | rescan | Rescan all devices and reset hardware capabilities detection |
+| **h** | history | Show wipe history log |
+| **t** | themes | Open theme preview screen to view and change color themes |
 | **q** or **x** | quit | Quit the application (stops all wipes first) |
 | **?** | help | Show help screen with all actions and navigation keys |
-| **h** | history | Show wipe history log |
-| **/** | filter | Filter devices by regex pattern (shows matching devices + all active wipes) |
 | **ESC** | clear filter | Clear the filter and jump to top of list |
 | **ESC** | back | Return to previous screen if on nested screen |
-| **m** | mode | Cycle auto verify mode: +V (verify), -V (don't) [saved as preference] |
-| **P** | passes | Cycle wipe passes: 1, 2, or 4 (saved as preference) |
-| **V** | verify % | Cycle verification percentage: 0%, 2%, 5%, 10%, 25%, 50%, 100% (saved as preference) |
-| **D** | dense | Toggle dense/spaced view (saved as preference) |
-| **t** | themes | Open theme preview screen to view and change color themes |
+| **a** | time format | Cycle wipe history time display format (ago+time, ago, time) |
+
+### History Screen
+
+Press **h** to view the wipe history log. The history screen shows all wipe and verify operations with timestamps, device info, and results.
+
+**History screen actions:**
+- **e** - Expand/collapse entry to show full JSON details
+- **c** - Copy current entry to clipboard (see below)
+- **/** - Search/filter entries (prefix with `/` for deep JSON search)
+- **a** - Cycle time format (ago+time, ago, time)
+- **ESC** - Return to main screen
+
+**Clipboard copy methods** (detected automatically):
+| Environment | Method | Notes |
+|-------------|--------|-------|
+| SSH session | OSC 52 | Terminal escape sequence; requires terminal support (iTerm2, kitty, alacritty, Windows Terminal, tmux with `set-clipboard on`) |
+| Wayland | wl-copy | Requires `wl-clipboard` package |
+| X11 | xclip/xsel | Requires `xclip` or `xsel` package |
+| Fallback | Terminal | Exits to shell, prints entry for manual copy |
+
+> **Note:** If OSC 52 doesn't work with your terminal, the text still appears on screen for manual selection. For tmux, enable clipboard with `set -g set-clipboard on` in your `.tmux.conf`.
 
 ### Wipe Types
 
-`dwipe` supports several wipe modes.
+`dwipe` supports firmware wipes (hardware-accelerated) and software wipes. Firmware wipes require the `--firmware-wipes` or `-F` flag. Tables below list wipe methods from most desirable (Rank 1) to least.
 
-- **Zero** - Fills the device with zeros (multi-pass alternates random/zero patterns, ending on zeros)
-- **Rand** - Fills the device with random data (multi-pass alternates zero/random patterns, ending on random)
-- **Firmware wipes** - TBD
+#### NVMe Drives
 
-The `+V` suffix indicates automatic verification after wipe completion. Without `+V`, you can still manually verify by pressing **v** on a wiped device.
+| Rank | Abbrev | Official Name | Remarks |
+|------|--------|---------------|---------|
+| 1 | Crypto | Sanitize Cryptographic Erase | Fastest; erases encryption keys; instant data invalidation |
+| 2 | Block | Sanitize Block Erase | Fast; resets all blocks to deallocated state |
+| 3 | FCrypto | Format with Crypto Erase | Fast; reformats namespace with key erasure |
+| 4 | FErase | Format with User Data Erase | Fast; reformats with simple data erase; less thorough than crypto |
+| 5 | Ovwr | Sanitize Overwrite | Minutes; writes pattern to all blocks; most thorough but rarely needed |
+| 6 | Rand | Software Random Write | Fallback; writes random data via software; hours for large drives |
+| 7 | Zero | Software Zero Write | Fallback; writes zeros via software; verifiable but slower |
 
-> **Note:** Multi-pass sofware (Zero and Rand) wipes (2 or 4 passes) alternate between zero and random patterns to ensure different bit patterns physically overwrite the disk, ending on your selected mode.
+#### SATA SSDs (with crypto/sanitize features)
 
-### Resuming Stopped Wipes
+| Rank | Abbrev | Official Name | Remarks |
+|------|--------|---------------|---------|
+| 1 | SCrypto | Sanitize Cryptographic Erase | Fastest; erases encryption keys; requires SANITIZE feature |
+| 2 | Enhanced | ATA Security Erase Enhanced | Fast; vendor-specific deep erase with crypto key destruction |
+| 3 | SBlock | Sanitize Block Erase | Fast; resets blocks to factory state; requires SANITIZE feature |
+| 4 | Erase | ATA Security Erase Normal | Minutes; writes zeros to all sectors; widely supported |
+| 5 | SOverwrite | Sanitize Overwrite | Minutes; overwrites with pattern; requires SANITIZE feature |
+| 6 | Rand | Software Random Write | Fallback; can't reach wear-leveled or remapped blocks |
+| 7 | Zero | Software Zero Write | Fallback; can't reach wear-leveled or remapped blocks |
+
+#### SATA HDDs (spinning drives)
+
+| Rank | Abbrev | Official Name | Remarks |
+|------|--------|---------------|---------|
+| 1 | Rand | Software Random Write | Preferred; interruptible, resumable, shows progress |
+| 2 | Zero | Software Zero Write | Preferred; interruptible, resumable, fast verification |
+| 3 | Enhanced | ATA Security Erase Enhanced | Slow (hours); not interruptible; no progress; same result as software |
+| 4 | Erase | ATA Security Erase Normal | Slow (hours); not interruptible; no progress; same result as software |
+
+> **Note:** HDDs don't have wear leveling or hidden blocks, so software wipes are equally thorough as firmware wipes but offer better control (progress, pause/resume, interruptibility).
+
+#### Partitions and USB/Thumb Drives
+
+| Rank | Abbrev | Official Name | Remarks |
+|------|--------|---------------|---------|
+| 1 | Rand | Software Random Write | Preferred; unpredictable pattern; statistical verification |
+| 2 | Zero | Software Zero Write | Simpler; fast verification (fails on first non-zero byte) |
+
+> **Notes:**
+> - Firmware wipes show only methods supported by each drive (see FwCAPS column).
+> - Firmware wipes include automatic spotcheck verification.
+> - The `+V` suffix enables automatic verification after software wipes. Without `+V`, press **v** to verify manually.
+> - Multi-pass software wipes (2 or 4) alternate zero/random patterns, ending on your selected mode.
+> - USB drives and partitions lack firmware erase—only software wipes available.
+
+### Resuming Stopped SOFTWARE Wipes
 
 Stopped wipes (state **s**) can be resumed by pressing **w** on the device. Choose the same type of wipe or it will start over at 0% complete.
 
@@ -242,15 +303,15 @@ Stopped wipes (state **s**) can be resumed by pressing **w** on the device. Choo
 - Progress marker updated every 30 seconds, so resume works even after crashes or power loss
 - Automatic validation prevents corrupted final patterns
 
-### Verification Strategy
+### Software Wipe Verification Strategy
 
-`dwipe` uses intelligent verification with statistical analysis and fast-fail optimizations:
+Software wipes use intelligent verification with statistical analysis and fast-fail optimizations. Verification is **configurable and optional**.
 
 **Smart Sampling:**
 - Divides disk into 100 equal sections
-- Randomly samples configurable percentage (0%, 2%, 5%, 10%, 25%, 50%, 100%) from EACH section
-- Ensures complete disk coverage even with 2% verification
-- Change verification percentage with **V** key (saved as preference)
+- Randomly samples configurable percentage (1%, 3%, 10%, 30%, 100%) from EACH section
+- Ensures complete disk coverage even with 1% verification
+- Set verification percentage with `--verify-pct` command-line option (saved as preference)
 
 **Pattern Detection:**
 - **Zero verification**: Fails immediately on first non-zero byte (fast!)
@@ -273,10 +334,29 @@ Stopped wipes (state **s**) can be resumed by pressing **w** on the device. Choo
 - During verify: **vN%** shows progress (v0% to v100%)
 
 **Why statistical sampling is better than sequential:**
-- 2% verification with 100 sections provides better coverage than 2% sequential read
+- Statistical sampling with 100 sections provides better coverage than sequential read at same percentage
 - Detects problems faster (could hit bad sector in early sections)
 - Statistical analysis actually validates randomness (sequential can't do this)
 - Much faster than 100% sequential verification
+
+### Firmware Wipe Verification Strategy
+
+Firmware wipes (SATA/NVMe secure erase) use an **unconditional spotcheck verification** that is **performed automatically for all firmware wipes**. This verifies that the hardware erase command actually executed.
+
+**Spotcheck Approach:**
+- Before the wipe: Write test data blocks at three strategic locations (front, middle, tail of drive)
+- Execute the firmware erase command at the controller level
+- After the wipe: Read those three test locations and verify they no longer contain the original data
+- If any test block still contains similar data, the erase has failed and is reported
+
+**Why Spotchecks Are Effective:**
+- Proves the drive's internal erase actually processed (not just a command acknowledgment)
+- Three-location strategy (0%, 50%, 100% of drive) ensures coverage across the entire device
+- Catches firmware bugs or hardware failures that might claim success but do nothing
+- Much faster than sequential verification (only 3 blocks read instead of percentage of whole drive)
+- **Mandatory and unconditional**: No user configuration or additional verification step needed
+
+**Important Note:** Firmware wipes do not show percentage-based verification like software wipes. The spotcheck happens silently as part of the wipe operation, and success/failure is recorded in the persistent wipe state marker.
 
 ### Progress Information
 
@@ -299,7 +379,7 @@ When a device with persistent state is displayed, additional information shows:
 
 
 ### The Help Screen
-When **?** is typed, you can see the available keys and some obscure settings no seen elsewhere.
+When **?** is typed, you can see the available keys and command-line options with their current settings.
 
 ### Navigation
 
@@ -376,6 +456,25 @@ Press **ESC** from the main screen to clear the filter and return to showing all
 - **Wipe seems stuck** - Most likely due to bad disks; Direct I/O makes progress almost constant on good disks.
 
 ---
+### Firmware Wipe Considerations
+
+Firmware wipes (SATA/NVMe secure erase operations) have different characteristics than software wipes:
+
+**Frozen Drives:**
+- Firmware wipes sometimes report the drive as "Frozen" if the device is present (mounted or in use) when capabilities are detected
+- This is a drive-level security feature, not a `dwipe` limitation
+- **Solution**: Unmount the device, wait briefly (often just a few seconds of idle time is enough), then use **r** to rescan capabilities
+- The freeze state is usually temporary and clears after the device is no longer actively in use
+- If the drive remains frozen, try hot-swapping (remove and reinsert) or power-cycling the device
+
+**Device Quirks and Compatibility:**
+- Storage devices have various firmware implementations and hardware quirks that affect secure erase operations
+- Some drives may not fully support certain sanitize operations, have timing issues, or exhibit unexpected behavior
+- `dwipe` cannot guarantee that all devices will be successfully wiped—some hardware simply may not cooperate with erase commands
+- Always verify a drive after wiping (use **v** key) to confirm the erase actually completed
+- For mission-critical data destruction on quirky hardware, consider using manufacturer-specific secure erase tools as a fallback
+
+---
 ### Dealing with Bad or Failing Disks
 
 dwipe includes built-in protections for problematic storage devices:
@@ -419,7 +518,28 @@ dwipe includes built-in protections for problematic storage devices:
 *   Consider replacing the disk if errors persist
 
 Note: Some disks are fundamentally broken and cannot be reliably wiped. dwipe will protect itself and your system, but cannot fix hardware failures.
+---
+#### Recommendations for SATA Wiping over USB
+* Requirement 1: SAT (SCSI-ATA Translation) Support
 
+  * The USB bridge must be capable of "passing through" ATA commands.
+  * The Test: If the app can see the "Security" section in the drive details, the bridge supports SAT.
+
+* Requirement 2: Stable Power
+  * Firmware wipes (especially on 3.5" HDDs) draw significant peak power.
+  * The Risk: If a USB-powered "bus-only" cable is used, the voltage might sag during the wipe, causing the bridge to reset and "brick" the drive in a locked state.
+  * The Recommendation: Always use an externally powered USB dock for 3.5" drives.
+
+* Requirement 3: Command Timeout Integrity
+  * The bridge must not have an aggressive "Watchdog Timer."
+  * The Risk: Some bridges disconnect if they don't see "data" for 60 seconds. During a firmware wipe, the drive is busy internally and doesn't send data.
+  * The Recommendation: Use high-quality chipsets like ASMedia (1153E) or JMicron (JMS578).
+
+##### Unlock Locked Device
+```
+sudo hdparm --user-master u --security-unlock NULL /dev/sdX
+sudo hdparm --user-master u --security-disable NULL /dev/sdX
+```
 ---
 
 ### Contributing

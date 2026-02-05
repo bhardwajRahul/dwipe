@@ -24,14 +24,13 @@ class PersistentState:
         self.config_path = Path(config_path)
         self.state = {
             'theme': 'default',
-            'wipe_mode': '+V',  # '+V' (verify) or '-V' (no verify)
-            'passes': 1,  # 1, 2, or 4 wipe pass
-            'confirmation': 'YES',  # 'Y', 'y', 'YES', 'yes', 'device'
-            'verify_pct': 2,  # 0, 2, 5, 10, 25, 50, 100
+            'wipe_mode': '+V',  # '-V' (no verify) or '+V' (verify after wipe) [default: +V]
+            'passes': 1,  # 1, 2, or 4 wipe passes [default: 1]
+            'verify_pct': 1,  # Verification percentage: 1, 3, 10, 30, 100 [default: 1]
             'dense': False,  # True = compact view, False = blank lines between disks
-            'slowdown_stop': 16,
-            'stall_timeout': 60,
-            'port_serial': False,
+            'slowdown_stop': 64,  # Stop if disk slows (0=disabled, else ms interval) [default: 64]
+            'stall_timeout': 60,  # Stall timeout in seconds (0=disabled) [default: 60]
+            'port_serial': 'Auto',  # Show port/serial info: Auto, On, Off [default: Auto]
             'devices': {}  # device_id -> {blocked, last_seen, last_name, size_bytes}
         }
         self.dirty = False
@@ -57,12 +56,24 @@ class PersistentState:
                 setattr(opts, key, self.state[key])
 
     def load(self):
-        """Load state from disk"""
+        """Load state from disk, handling schema upgrades/downgrades"""
         if self.config_path.exists():
             try:
+                # Remember valid keys from default state
+                valid_keys = set(self.state.keys())
+
                 with open(self.config_path, 'r', encoding='utf-8') as f:
                     loaded = json.load(f)
-                    self.state.update(loaded)
+
+                    # Only load keys that exist in current schema
+                    for key in valid_keys:
+                        if key in loaded:
+                            self.state[key] = loaded[key]
+
+                    # Check for obsolete keys that need removal
+                    obsolete_keys = set(loaded.keys()) - valid_keys
+                    if obsolete_keys:
+                        self.dirty = True  # Trigger save to clean up
 
                     # Migrate old wipe_mode values to new format
                     old_wipe_mode = self.state.get('wipe_mode', '+V')

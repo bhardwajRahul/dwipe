@@ -18,6 +18,7 @@ from .Utils import Utils
 from .WipeTask import WipeTask
 from .WriteTask import WriteTask, WriteZeroTask, WriteRandTask
 from .VerifyTask import VerifyTask, VerifyZeroTask, VerifyRandTask
+from .FirmwareWipeTask import FirmwareWipeTask
 
 
 class WipeJob:
@@ -166,7 +167,7 @@ class WipeJob:
 
         ## SLOWDOWN / STALL DETECTION/ABORT FEATURE (proxied from tasks)
         ##
-        self.slowdown_stop = getattr(opts, 'slowdown_stop', 16)
+        self.slowdown_stop = getattr(opts, 'slowdown_stop', 64)
         self.stall_timeout = getattr(opts, 'stall_timeout', 60)
         self.max_slowdown_ratio = 0
         self.max_stall_secs = 0
@@ -230,6 +231,9 @@ class WipeJob:
                 self.current_task = task
                 self.current_task_index = i
 
+                # Set job reference so tasks can access shared state (e.g., for firmware verify)
+                task.job = self
+
                 # Run the task
                 task.run_task()
 
@@ -264,17 +268,22 @@ class WipeJob:
                     summary = task.get_summary_dict()
                     self.verify_result = summary.get('result', None)
 
+                    # Write marker with verify status after verification completes
+                    if not task.exception and not self.do_abort and self.verify_result:
+                        is_random = (self.expected_pattern == "random")
+                        self._write_marker_with_verify_status(is_random)
+
                 # Check for task errors (AFTER proxying state)
                 if task.exception:
-                    self.exception = task.exception
-                    # For write tasks, failure means wipe didn't succeed
-                    if isinstance(task, WriteTask):
+                    # For write tasks and firmware wipe tasks, failure is critical - set exception and break
+                    if isinstance(task, (WriteTask, FirmwareWipeTask)):
+                        self.exception = task.exception
                         # Sync abort state before breaking
                         if task.do_abort:
                             self.do_abort = True
                         break
-                    # For verify tasks, continue but record the exception
-                    # (wipe succeeded but verification failed)
+                    # For other tasks (precheck, pre-verify, post-verify), continue without setting job exception
+                    # (these are support tasks - only the actual wipe matters for job success/failure)
 
                 # Check if task was aborted (sync abort state)
                 if task.do_abort and not self.do_abort:
@@ -588,12 +597,13 @@ class WipeJob:
                 f"Completed: {percent_complete:.2f}%")
 
     def get_status(self):
-        """Get status tuple: (elapsed, percent, rate, eta)
+        """Get status tuple: (elapsed, percent, rate, eta, more_state)
 
         Returns stats for current phase only:
         - Write phase (0-100%): elapsed/rate/eta for writing
         - Flushing phase: 100% FLUSH while kernel syncs to device
         - Verify phase (v0-v100%): elapsed/rate/eta for verification only
+        - more_state: optional extra status from derived task class
         """
         # NEW: Proxy to current task if using task-based architecture
         if self.current_task is not None:
@@ -646,7 +656,7 @@ class WipeJob:
             else:
                 when_str = '0'
 
-            return Utils.ago_str(int(round(elapsed_time))), pct_str, rate_str, when_str
+            return Utils.ago_str(int(round(elapsed_time))), pct_str, rate_str, when_str, ""
         else:
             # Write phase: 0-100% (across all passes)
             written = self.total_written
@@ -683,7 +693,7 @@ class WipeJob:
             else:
                 when_str = '0'
 
-            return Utils.ago_str(int(round(elapsed_time))), pct_str, rate_str, when_str
+            return Utils.ago_str(int(round(elapsed_time))), pct_str, rate_str, when_str, ""
 
     def get_plan_dict(self, mode=None):
         """Generate plan dictionary for structured logging
@@ -763,7 +773,7 @@ class WipeJob:
 
             # Build top-level summary
             summary = {
-                "result": "stopped" if self.do_abort else "completed",
+                "result": "stopped" if self.do_abort else ("failed" if self.exception else "completed"),
                 "total_elapsed": Utils.ago_str(int(total_elapsed)),
                 "total_errors": total_errors,
                 "pct_complete": round(pct_complete, 1),
@@ -850,7 +860,7 @@ class WipeJob:
 
         # Build top-level summary
         summary = {
-            "result": "stopped" if self.do_abort else "completed",
+            "result": "stopped" if self.do_abort else ("failed" if self.exception else "completed"),
             "total_elapsed": Utils.ago_str(int(total_elapsed)),
             "total_errors": self.total_errors,
             "pct_complete": round(pct_complete, 1),
@@ -1223,8 +1233,10 @@ class WipeJob:
             # Auto-start verification if enabled and write completed successfully
             verify_pct = getattr(self.opts, 'verify_pct', 0)
             auto_verify = getattr(self.opts, 'wipe_mode', "").endswith('+V')
-            if auto_verify and verify_pct > 0 and not self.do_abort and not self.exception:
-                self.verify_partition(verify_pct)
+            if auto_verify and not self.do_abort and not self.exception:
+                # Default to 2% verification if +V mode enabled but verify_pct not set
+                actual_verify_pct = verify_pct if verify_pct > 0 else 2
+                self.verify_partition(actual_verify_pct)
                 # Write marker with verification status after verification completes
                 # Use desired_mode to determine if random or zero
                 is_random = (desired_mode == 'Rand')

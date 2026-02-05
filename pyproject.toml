@@ -4,14 +4,14 @@ build-backend = "flit_core.buildapi"
 
 [project]
 name = "dwipe"
-version = "2.0.2"
+version = "3.0.0"
 description = "A tool to wipe disks and partitions for Linux"
 authors = [
     { name = "Joe Defen", email = "joedef@google.com" }
 ]
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 keywords = ["disk", "partition", "wipe", "clean", "scrub"]
 classifiers = [
     "Programming Language :: Python :: 3",
